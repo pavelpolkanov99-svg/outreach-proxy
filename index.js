@@ -56,11 +56,13 @@ async function apolloSearch(apolloKey, endpoint, body) {
 }
 
 async function hrRequest(key, endpoint, body) {
-  const res = await httpRequest("https://api.heyreach.io/api/public" + endpoint, {
+  const url = "https://api.heyreach.io/api/public" + endpoint;
+  const res = await httpRequest(url, {
     method: body ? "POST" : "GET",
-    headers: { "X-API-KEY": key, "Content-Type": "application/json" },
+    headers: { "X-API-KEY": key, "Content-Type": "application/json", "Accept": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
+  if (!res.ok) console.log("HeyReach", endpoint, "status:", res.status, JSON.stringify(res.data).slice(0,100));
   return { ok: res.ok, data: res.data };
 }
 

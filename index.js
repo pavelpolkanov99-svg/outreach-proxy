@@ -27,11 +27,12 @@ function httpRequest(url, options = {}) {
       let data = "";
       res.on("data", chunk => data += chunk);
       res.on("end", () => {
+        const ok = res.statusCode >= 200 && res.statusCode < 300;
         try {
-          resolve({ ok: res.statusCode < 400, status: res.statusCode, data: JSON.parse(data) });
+          resolve({ ok, status: res.statusCode, data: JSON.parse(data) });
         } catch (e) {
-          console.log("Non-JSON:", url, res.statusCode, data.slice(0, 150));
-          resolve({ ok: false, status: res.statusCode, data: {} });
+          // Empty body or non-JSON — still ok if status is 2xx
+          resolve({ ok, status: res.statusCode, data: {} });
         }
       });
     });
@@ -41,12 +42,11 @@ function httpRequest(url, options = {}) {
   });
 }
 
-// Apollo uses api_key in request body, not header
-async function apolloSearch(apolloKey, endpoint, body) {
+async function apolloPost(endpoint, apolloKey, body) {
   const res = await httpRequest("https://api.apollo.io/v1" + endpoint, {
     method: "POST",
-    headers: { 
-      "Content-Type": "application/json", 
+    headers: {
+      "Content-Type": "application/json",
       "Cache-Control": "no-cache",
       "X-Api-Key": apolloKey,
     },
@@ -55,22 +55,30 @@ async function apolloSearch(apolloKey, endpoint, body) {
   return res.data;
 }
 
-async function hrRequest(key, endpoint, body) {
+async function hrPost(key, endpoint, body) {
   const url = "https://api.heyreach.io/api/public" + endpoint;
   const res = await httpRequest(url, {
-    method: body ? "POST" : "GET",
+    method: "POST",
     headers: { "X-API-KEY": key, "Content-Type": "application/json", "Accept": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
+    body: JSON.stringify(body),
   });
-  if (!res.ok) console.log("HeyReach", endpoint, "status:", res.status, JSON.stringify(res.data).slice(0,100));
-  return { ok: res.ok, data: res.data };
+  if (!res.ok) console.log("HeyReach POST", endpoint, "status:", res.status, JSON.stringify(res.data).slice(0,150));
+  return res;
+}
+
+async function hrGet(key, endpoint) {
+  const url = "https://api.heyreach.io/api/public" + endpoint;
+  const res = await httpRequest(url, {
+    method: "GET",
+    headers: { "X-API-KEY": key, "Accept": "application/json" },
+  });
+  if (!res.ok) console.log("HeyReach GET", endpoint, "status:", res.status);
+  return res;
 }
 
 function mapPerson(p, company) {
   const org = p.organization || {};
-  // Apollo returns linkedin in multiple possible fields
-  const linkedin = p.linkedin_url || p.linkedin || 
-    (p.contact && p.contact.linkedin_url) || null;
+  const linkedin = p.linkedin_url || p.linkedin || (p.contact && p.contact.linkedin_url) || null;
   const linkedinCompany = org.linkedin_url || org.linkedin || null;
   return {
     id: p.id,
@@ -87,17 +95,19 @@ function mapPerson(p, company) {
   };
 }
 
+// ── APOLLO ────────────────────────────────────────────────────────────────────
+
 app.post("/apollo/search", async (req, res) => {
   const { apolloKey, name, company } = req.body;
   try {
-    const d1 = await apolloSearch(apolloKey, "/mixed_people/api_search", {
+    const d1 = await apolloPost("/mixed_people/api_search", apolloKey, {
       q_person_name: name, q_organization_name: company, page: 1, per_page: 5,
-      person_titles: [], reveal_personal_emails: true, reveal_phone_number: false,
+      reveal_personal_emails: true,
     });
     let people = (d1 && Array.isArray(d1.people)) ? d1.people : [];
 
     if (people.length === 0 && company) {
-      const d2 = await apolloSearch(apolloKey, "/mixed_people/api_search", {
+      const d2 = await apolloPost("/mixed_people/api_search", apolloKey, {
         q_organization_name: company, page: 1, per_page: 25
       });
       const all = (d2 && Array.isArray(d2.people)) ? d2.people : [];
@@ -111,28 +121,24 @@ app.post("/apollo/search", async (req, res) => {
     }
 
     if (people.length === 0 && name) {
-      const d3 = await apolloSearch(apolloKey, "/mixed_people/api_search", {
+      const d3 = await apolloPost("/mixed_people/api_search", apolloKey, {
         q_person_name: name, page: 1, per_page: 5
       });
       people = (d3 && Array.isArray(d3.people)) ? d3.people : [];
     }
 
-    // Enrich each person by ID to get linkedin_url
+    // Enrich top results to get linkedin_url
     for (let i = 0; i < Math.min(people.length, 3); i++) {
       if (!people[i].linkedin_url && people[i].id) {
         try {
-          const enrich = await apolloSearch(apolloKey, "/people/enrich", {
-            id: people[i].id,
-            reveal_personal_emails: true,
+          const enrich = await apolloPost("/people/enrich", apolloKey, {
+            id: people[i].id, reveal_personal_emails: true,
           });
-          if (enrich && enrich.person) {
-            people[i] = { ...people[i], ...enrich.person };
-          } else if (enrich && enrich.linkedin_url) {
-            people[i] = { ...people[i], linkedin_url: enrich.linkedin_url };
-          }
-        } catch { /* enrichment optional */ }
+          if (enrich && enrich.person) people[i] = { ...people[i], ...enrich.person };
+        } catch {}
       }
     }
+
     res.json(people.map(p => mapPerson(p, company)));
   } catch (e) {
     console.error("Apollo search error:", e.message);
@@ -140,19 +146,10 @@ app.post("/apollo/search", async (req, res) => {
   }
 });
 
-app.post("/apollo/enrich", async (req, res) => {
-  const { apolloKey, id } = req.body;
-  try {
-    const d = await apolloSearch(apolloKey, "/people/enrich", { id, reveal_personal_emails: true });
-    console.log("Enrich result:", JSON.stringify(d).slice(0, 300));
-    res.json(d);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
 app.post("/apollo/match", async (req, res) => {
   const { apolloKey, linkedinUrl, name, company } = req.body;
   try {
-    const d = await apolloSearch(apolloKey, "/people/match", {
+    const d = await apolloPost("/people/match", apolloKey, {
       linkedin_url: linkedinUrl, reveal_personal_emails: true
     });
     const p = d && d.person;
@@ -175,17 +172,22 @@ app.post("/apollo/match", async (req, res) => {
   }
 });
 
+app.post("/apollo/enrich", async (req, res) => {
+  const { apolloKey, id } = req.body;
+  try {
+    const d = await apolloPost("/people/enrich", apolloKey, { id, reveal_personal_emails: true });
+    res.json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── HEYREACH ──────────────────────────────────────────────────────────────────
+
 app.post("/heyreach/check", async (req, res) => {
   const { key } = req.body;
   try {
-    console.log("Checking HeyReach key:", key ? key.slice(0,8) + "..." : "empty");
-    const res2 = await httpRequest("https://api.heyreach.io/api/public/auth/CheckApiKey", {
-      method: "GET",
-      headers: { "X-API-KEY": key, "Accept": "application/json" },
-    });
-    console.log("HeyReach check status:", res2.status, "ok:", res2.ok);
-    // HeyReach CheckApiKey returns 200 with empty body on success
-    res.json({ ok: res2.status === 200, status: res2.status });
+    const r = await hrGet(key, "/auth/CheckApiKey");
+    console.log("HeyReach check status:", r.status, "ok:", r.ok);
+    res.json({ ok: r.ok, status: r.status });
   } catch (e) {
     console.error("HeyReach check error:", e.message);
     res.status(500).json({ ok: false, error: e.message });
@@ -195,15 +197,16 @@ app.post("/heyreach/check", async (req, res) => {
 app.post("/heyreach/senders", async (req, res) => {
   const { key } = req.body;
   try {
-    const r = await hrRequest(key, "/linkedInAccount/GetAll", { offset: 0, limit: 50 });
-    res.json(r.data.items || r.data.linkedInAccounts || []);
+    const r = await hrPost(key, "/linkedInAccount/GetAll", { offset: 0, limit: 50 });
+    res.json(r.data.items || r.data.linkedInAccounts || r.data || []);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post("/heyreach/campaign/create", async (req, res) => {
   const { key, ...body } = req.body;
   try {
-    const r = await hrRequest(key, "/campaign/Create", body);
+    const r = await hrPost(key, "/campaign/Create", body);
+    console.log("Campaign create response:", JSON.stringify(r.data).slice(0, 200));
     res.json(r.data);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -211,7 +214,7 @@ app.post("/heyreach/campaign/create", async (req, res) => {
 app.post("/heyreach/campaign/addlead", async (req, res) => {
   const { key, ...body } = req.body;
   try {
-    const r = await hrRequest(key, "/campaign/AddLeads", body);
+    const r = await hrPost(key, "/campaign/AddLeads", body);
     res.json(r.data);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -219,7 +222,7 @@ app.post("/heyreach/campaign/addlead", async (req, res) => {
 app.post("/heyreach/campaigns", async (req, res) => {
   const { key } = req.body;
   try {
-    const r = await hrRequest(key, "/campaign/GetAll", { offset: 0, limit: 20 });
+    const r = await hrPost(key, "/campaign/GetAll", { offset: 0, limit: 20 });
     res.json(r.data.items || []);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -227,7 +230,7 @@ app.post("/heyreach/campaigns", async (req, res) => {
 app.post("/heyreach/campaign/leads", async (req, res) => {
   const { key, campaignId } = req.body;
   try {
-    const r = await hrRequest(key, "/campaign/GetLeads", { campaignId, offset: 0, limit: 100 });
+    const r = await hrPost(key, "/campaign/GetLeads", { campaignId, offset: 0, limit: 100 });
     res.json(r.data.items || r.data.leads || []);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

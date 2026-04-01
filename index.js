@@ -21,11 +21,9 @@ function httpRequest(url, options = {}) {
       res.on("data", chunk => data += chunk);
       res.on("end", () => {
         try {
-          const json = JSON.parse(data);
-          resolve({ ok: res.statusCode < 400, status: res.statusCode, data: json });
+          resolve({ ok: res.statusCode < 400, status: res.statusCode, data: JSON.parse(data) });
         } catch (e) {
-          // Not JSON - return empty safe object
-          console.log("Non-JSON response from", url, "status:", res.statusCode, "body:", data.slice(0, 100));
+          console.log("Non-JSON:", url, res.statusCode, data.slice(0, 150));
           resolve({ ok: false, status: res.statusCode, data: {} });
         }
       });
@@ -36,19 +34,20 @@ function httpRequest(url, options = {}) {
   });
 }
 
+// Apollo uses api_key in request body, not header
 async function apolloSearch(apolloKey, endpoint, body) {
   const res = await httpRequest("https://api.apollo.io/v1" + endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "Cache-Control": "no-cache", "X-Api-Key": apolloKey },
-    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json", "Cache-Control": "no-cache" },
+    body: JSON.stringify({ ...body, api_key: apolloKey }),
   });
   return res.data;
 }
 
-async function hrRequest(apolloKey, endpoint, body) {
+async function hrRequest(key, endpoint, body) {
   const res = await httpRequest("https://api.heyreach.io/api/public" + endpoint, {
     method: body ? "POST" : "GET",
-    headers: { "X-API-KEY": apolloKey, "Content-Type": "application/json" },
+    headers: { "X-API-KEY": key, "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
   return { ok: res.ok, data: res.data };
@@ -72,13 +71,11 @@ function mapPerson(p, company) {
 app.post("/apollo/search", async (req, res) => {
   const { apolloKey, name, company } = req.body;
   try {
-    // Level 1: name + company
     const d1 = await apolloSearch(apolloKey, "/people/search", {
       q_person_name: name, q_organization_name: company, page: 1, per_page: 5
     });
     let people = (d1 && Array.isArray(d1.people)) ? d1.people : [];
 
-    // Level 2: company only + name filter
     if (people.length === 0 && company) {
       const d2 = await apolloSearch(apolloKey, "/people/search", {
         q_organization_name: company, page: 1, per_page: 25
@@ -93,7 +90,6 @@ app.post("/apollo/search", async (req, res) => {
         .map(x => x.p);
     }
 
-    // Level 3: name only
     if (people.length === 0 && name) {
       const d3 = await apolloSearch(apolloKey, "/people/search", {
         q_person_name: name, page: 1, per_page: 5

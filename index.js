@@ -58,15 +58,17 @@ async function hrRequest(key, endpoint, body) {
 }
 
 function mapPerson(p, company) {
+  const org = p.organization || {};
   return {
     id: p.id,
     name: p.name,
     title: p.title || "—",
-    company: (p.organization && p.organization.name) || company,
+    company: org.name || company,
     location: [p.city, p.country].filter(Boolean).join(", ") || "—",
     linkedin: p.linkedin_url || null,
+    linkedinCompany: org.linkedin_url || null,
     email: p.email || null,
-    website: (p.organization && p.organization.website_url) || null,
+    website: org.website_url || null,
     phone: (p.phone_numbers && p.phone_numbers[0] && p.phone_numbers[0].sanitized_number) || null,
     hintUsed: false,
   };

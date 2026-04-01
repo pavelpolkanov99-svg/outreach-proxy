@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Outreach Agent</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Syne:wght@700;800;900&display=swap" rel="stylesheet">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #090909; font-family: 'IBM Plex Mono', monospace; color: #ddd; min-height: 100vh; }
+textarea, input { background: #0d0d0d; border: 1px solid #222; color: #ddd; border-radius: 8px; padding: 10px 12px; font-family: 'IBM Plex Mono', monospace; font-size: 13px; outline: none; transition: border-color 0.2s; width: 100%; }
+textarea:focus, input:focus { border-color: #00e5a0; }
+input[type=number] { width: 70px; }
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-thumb { background: #252525; border-radius: 2px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes fadeIn { from { opacity:0; transform:translateY(5px); } to { opacity:1; transform:none; } }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useRef } = React;
+
+const PROXY = "https://outreach-proxy-production-eb03.up.railway.app";
+
+async function api(path, body) {
+  const res = await fetch(PROXY + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  return res.json();
+}
+
+async function apolloSearch(apolloKey, name, company, linkedinHint) {
+  // Try match by LinkedIn URL first
+  if (linkedinHint) {
+    try {
+      const p = await api("/apollo/match", { apolloKey, linkedinUrl: linkedinHint, name, company });
+      if (p && !p.error && p.name) return [{ ...p, linkedin: p.linkedin || linkedinHint, hintUsed: true }];
+    } catch {}
+  }
+  // Try standard search
+  try {
+    const results = await api("/apollo/search", { apolloKey, name, company });
+    if (Array.isArray(results) && results.length > 0) {
+      // Merge linkedin hint into top result if missing
+      return results.map((r, i) => ({ ...r, linkedin: r.linkedin || (i === 0 ? linkedinHint : null) || null }));
+    }
+  } catch {}
+  // Fallback: return manual entry with available data
+  return [{
+    id: "manual_" + name,
+    name, title: "—", company, location: "—",
+    linkedin: linkedinHint || null, email: null, website: null,
+    hintUsed: !!linkedinHint, manualEntry: true,
+  }];
+}
+
+function heyreachCheckKey(key) { return api("/heyreach/check", { key }); }
+function heyreachGetSenders(key) { return api("/heyreach/senders", { key }); }
+function heyreachCreateCampaign(key, name, senderId, steps) {
+  return api("/heyreach/campaign/create", { key, name, linkedInAccountIds: senderId ? [senderId] : [], scheduleConfig: { timezone: "Europe/Paris", workDays: ["MONDAY","TUESDAY","WEDNESDAY","THURSDAY","FRIDAY"], startHour: 9, endHour: 18 }, sequenceSteps: steps });
+}
+function heyreachAddLead(key, campaignId, lead) { return api("/heyreach/campaign/addlead", { key, campaignId, leads: [lead] }); }
+function heyreachGetCampaigns(key) { return api("/heyreach/campaigns", { key }); }
+function heyreachGetLeads(key, campaignId) { return api("/heyreach/campaign/leads", { key, campaignId }); }
+
+function todayStr() { return new Date().toISOString().slice(0, 10); }
+function parseContactList(raw) {
+  return raw.trim().split("\n").filter(Boolean).map(line => {
+    // Extract LinkedIn URL first (handle https:// slashes)
+    const linkedinMatch = line.match(/(https?:\/\/[^\s,]+linkedin[^\s,]*|linkedin\.com\/in\/[^\s,]+)/i);
+    const linkedinHint = linkedinMatch ? (linkedinMatch[1].startsWith("http") ? linkedinMatch[1] : "https://" + linkedinMatch[1]) : null;
+    // Remove linkedin URL from line before splitting
+    const cleanLine = linkedinHint ? line.replace(linkedinMatch[1], "").replace(/\/+$/, "").trim() : line;
+    const parts = cleanLine.split("/").map(s => s.trim()).filter(Boolean);
+    const name = parts[0] || "", company = parts[1] || "";
+    return { key: name + "__" + company, name, company, linkedinHint };
+  }).filter(c => c.name && c.company);
+}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function Badge({ color="#888", children, small }) {
+  return <span style={{ background: color+"20", color, border:"1px solid "+color+"40", borderRadius:4, padding: small?"1px 6px":"2px 8px", fontSize: small?10:11, fontWeight:700, letterSpacing:0.8, textTransform:"uppercase", whiteSpace:"nowrap", display:"inline-block" }}>{children}</span>;
+}
+function Btn({ onClick, children, variant="primary", disabled, full, style={} }) {
+  const v = { primary:{background:"#00e5a0",color:"#080808"}, secondary:{background:"transparent",color:"#777",border:"1px solid #282828"}, ghost:{background:"transparent",color:"#555"} };
+  return <button onClick={disabled?undefined:onClick} style={{ border:"none", borderRadius:8, padding:"10px 18px", fontSize:13, fontFamily:"'IBM Plex Mono',monospace", fontWeight:600, cursor:disabled?"not-allowed":"pointer", opacity:disabled?0.35:1, width:full?"100%":undefined, ...v[variant], ...style }}>{children}</button>;
+}
+function Card({ children, style={} }) {
+  return <div style={{ background:"#111", border:"1px solid #1e1e1e", borderRadius:12, padding:18, marginBottom:10, animation:"fadeIn 0.2s ease", ...style }}>{children}</div>;
+}
+function Spinner({ color="#00e5a0", size=16 }) {
+  return <div style={{ width:size, height:size, border:"2px solid #222", borderTopColor:color, borderRadius:"50%", animation:"spin 0.75s linear infinite", flexShrink:0 }} />;
+}
+function Stepper({ step }) {
+  const steps = [{key:"settings",label:"Настройки"},{key:"input",label:"Ввод"},{key:"apollo",label:"Apollo"},{key:"sequence",label:"Sequence"},{key:"launch",label:"Запуск"},{key:"events",label:"События"}];
+  const idx = steps.findIndex(s => s.key === step);
+  return (
+    <div style={{ display:"flex", alignItems:"center", marginBottom:28 }}>
+      {steps.map((s,i) => {
+        const done=i<idx, active=i===idx;
+        return (
+          <div key={s.key} style={{ display:"flex", alignItems:"center", flex: i<steps.length-1?1:0 }}>
+            <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:4 }}>
+              <div style={{ width:26, height:26, borderRadius:"50%", background:done?"#00e5a0":active?"#080808":"#141414", border:"2px solid "+(done?"#00e5a0":active?"#00e5a0":"#252525"), color:done?"#080808":active?"#00e5a0":"#444", fontSize:10, fontWeight:800, display:"flex", alignItems:"center", justifyContent:"center" }}>{done?"✓":i+1}</div>
+              <div style={{ fontSize:9, color:active?"#00e5a0":done?"#555":"#333", letterSpacing:0.5, whiteSpace:"nowrap" }}>{s.label}</div>
+            </div>
+            {i<steps.length-1 && <div style={{ flex:1, height:1, background:done?"#00e5a040":"#1a1a1a", margin:"0 3px", marginBottom:14 }} />}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function App() {
+  const [apolloKey, setApolloKey] = useState(() => { try { return localStorage.getItem("outreach_apollo_key")||""; } catch { return ""; } });
+  const [heyreachKey, setHeyreachKey] = useState(() => { try { return localStorage.getItem("outreach_heyreach_key")||""; } catch { return ""; } });
+  const [verifying, setVerifying] = useState(false);
+  const [step, setStep] = useState("settings");
+  const [activeTab, setActiveTab] = useState("workflow");
+  const [rawInput, setRawInput] = useState("");
+  const [contacts, setContacts] = useState([]);
+  const [apolloLoading, setApolloLoading] = useState(false);
+  const [apolloResults, setApolloResults] = useState({});
+  const [apolloProgress, setApolloProgress] = useState(0);
+  const [selected, setSelected] = useState({});
+  const [seqType, setSeqType] = useState("connect_note");
+  const [noteText, setNoteText] = useState("Hi {{FIRSTNAME}}, came across {{COMPANY_NAME}} and thought it would be great to connect — we're building something relevant in the stablecoin clearing space.");
+  const [followupDays, setFollowupDays] = useState(5);
+  const [followupText, setFollowupText] = useState("Hi {{FIRSTNAME}}, following up on my previous message. Would love to explore potential synergies between RemiDe and {{COMPANY_NAME}}.");
+  const [campaignName, setCampaignName] = useState(todayStr());
+  const [launching, setLaunching] = useState(false);
+  const [launchLog, setLaunchLog] = useState([]);
+  const [launchDone, setLaunchDone] = useState(false);
+  const [exportData, setExportData] = useState(null);
+  const [events, setEvents] = useState([]);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [eventActions, setEventActions] = useState({});
+  const [manualEdits, setManualEdits] = useState({}); // {key_id: {title, email, linkedin}}
+  const [history, setHistory] = useState([]);
+  const [toasts, setToasts] = useState([]);
+  const toastId = useRef(0);
+
+  function toast(msg, type="ok") {
+    const id = ++toastId.current;
+    setToasts(t => [...t, {id,msg,type}]);
+    setTimeout(() => setToasts(t => t.filter(x => x.id!==id)), 4000);
+  }
+  function log(msg, type="info") { setLaunchLog(l => [...l, {msg,type,ts:new Date().toLocaleTimeString()}]); }
+
+  async function verifyKeys() {
+    if (!apolloKey.trim()||!heyreachKey.trim()) { toast("Введи оба ключа","error"); return; }
+    setVerifying(true);
+    try {
+      const res = await heyreachCheckKey(heyreachKey.trim());
+      if (res?.ok) {
+        setCampaignName(todayStr()); setStep("input");
+        try { localStorage.setItem("outreach_apollo_key",apolloKey.trim()); localStorage.setItem("outreach_heyreach_key",heyreachKey.trim()); } catch {}
+        toast("Подключено! Ключи сохранены.");
+      } else { toast("HeyReach ключ неверный","error"); }
+    } catch(e) { toast("Ошибка: "+e.message,"error"); }
+    setVerifying(false);
+  }
+
+  async function runApollo() {
+    const parsed = parseContactList(rawInput);
+    if (!parsed.length) { toast("Список пустой","error"); return; }
+    setContacts(parsed); setStep("apollo"); setApolloLoading(true); setApolloResults({}); setSelected({}); setApolloProgress(0);
+    for (let i=0;i<parsed.length;i++) {
+      const c = parsed[i];
+      try {
+        const found = await apolloSearch(apolloKey.trim(), c.name, c.company, c.linkedinHint);
+        setApolloResults(r => ({...r, [c.key]: found}));
+        if (found.length === 1) setSelected(s => ({...s, [c.key]: found[0].id}));
+      } catch { setApolloResults(r => ({...r, [c.key]:[]})); }
+      setApolloProgress(i+1);
+      await sleep(500);
+    }
+    setApolloLoading(false);
+  }
+
+  async function launchCampaign() {
+    setStep("launch"); setLaunching(true); setLaunchLog([]); setLaunchDone(false); setExportData(null);
+    const approved = contacts.filter(c => selected[c.key]&&(apolloResults[c.key]||[]).length>0).map(c => {
+    const baseProfile = apolloResults[c.key].find(o=>o.id===selected[c.key]);
+    const edits = manualEdits[c.key+"_"+selected[c.key]] || {};
+    const profile = { ...baseProfile, title: edits.title || baseProfile.title, email: edits.email || baseProfile.email, linkedin: edits.linkedin || baseProfile.linkedin };
+    return {contact:c, profile};
+  }).filter(x=>x.profile);
+    log("Запускаем для "+approved.length+" контактов...");
+    let senderId = null;
+    try {
+      const senders = await heyreachGetSenders(heyreachKey.trim());
+      const anton = senders.find(a=>(a.name||a.email||"").toLowerCase().includes("anton"));
+      const sender = anton||senders[0];
+      if (sender) { senderId=sender.id; log("Отправитель: "+(sender.name||sender.email)); }
+    } catch(e) { log("Ошибка отправителей: "+e.message,"error"); }
+    const seqSteps = [];
+    if (seqType!=="connect_followup") seqSteps.push({type:"CONNECTION_REQUEST",message:noteText});
+    else seqSteps.push({type:"CONNECTION_REQUEST"});
+    if (seqType==="connect_followup"||seqType==="connect_note_followup") seqSteps.push({type:"MESSAGE",message:followupText,delayDays:Number(followupDays)});
+    let campaignId = null;
+    try {
+      log("Создаём кампанию \""+campaignName+"\"...");
+      const camp = await heyreachCreateCampaign(heyreachKey.trim(), campaignName, senderId, seqSteps);
+      campaignId = camp?.id;
+      if (campaignId) log("✓ Кампания создана (ID: "+campaignId+")");
+      else log("Не получили ID: "+JSON.stringify(camp),"error");
+    } catch(e) { log("Ошибка кампании: "+e.message,"error"); }
+    const results = [];
+    for (const {contact,profile} of approved) {
+      if (!profile?.linkedin) { log("✗ "+profile?.name+" — нет LinkedIn","error"); results.push({contact,profile,status:"no_linkedin"}); continue; }
+      try {
+        const url = profile.linkedin.startsWith("http")?profile.linkedin:"https://"+profile.linkedin;
+        await heyreachAddLead(heyreachKey.trim(), campaignId, { profileUrl:url, firstName:(profile.name||contact.name).split(" ")[0], lastName:(profile.name||contact.name).split(" ").slice(1).join(" "), companyName:contact.company, currentPosition:profile.title||"" });
+        log("✓ "+profile.name+" добавлен"); results.push({contact,profile,status:"ok"});
+      } catch(e) { log("✗ "+(profile?.name||contact.name)+": "+e.message,"error"); results.push({contact,profile,status:"error"}); }
+      await sleep(400);
+    }
+    const companies = {};
+    results.forEach(r => {
+      const key = r.contact.company;
+      if (!companies[key]) companies[key]={name:r.profile?.company||r.contact.company,website:r.profile?.website||"—",tag:campaignName,stage:"Connection/cold email sent",people:[]};
+      companies[key].people.push({name:r.profile?.name||r.contact.name,title:r.profile?.title||"—",linkedin:r.profile?.linkedin||r.contact.linkedinHint||"—",email:r.profile?.email||"—",status:r.status});
+    });
+    setExportData(Object.values(companies));
+    const okCount = results.filter(r=>r.status==="ok").length;
+    log("Готово: "+okCount+"/"+approved.length+" лидов добавлено");
+    setHistory(h=>[{date:todayStr(),campaignName,total:approved.length,added:okCount,failed:results.length-okCount},...h]);
+    setLaunchDone(true); setLaunching(false);
+    toast(okCount+" лидов добавлено в HeyReach");
+  }
+
+  async function loadEvents() {
+    setEventsLoading(true);
+    const allEvents = [];
+    try {
+      const campaigns = await heyreachGetCampaigns(heyreachKey.trim());
+      for (const camp of campaigns.slice(0,5)) {
+        try {
+          const leads = await heyreachGetLeads(heyreachKey.trim(), camp.id);
+          leads.forEach(l => {
+            if (l.status==="REPLIED"||l.status==="CONNECTED") {
+              allEvents.push({ id:camp.id+"_"+(l.id||l.profileUrl), name:[l.firstName,l.lastName].filter(Boolean).join(" ")||"—", company:camp.name, event:l.status==="REPLIED"?"MESSAGE_REPLY":"CONNECTION_ACCEPTED", newStage:l.status==="REPLIED"?"initial discussions":"Connection/cold email sent" });
+            }
+          });
+        } catch {}
+        await sleep(300);
+      }
+    } catch(e) { toast("Ошибка событий: "+e.message,"error"); }
+    setEvents(allEvents);
+    if (!allEvents.length) toast("Новых событий нет");
+    setEventsLoading(false);
+  }
+
+  function exportCSV() {
+    if (!exportData) return;
+    const rows=[["Company","Website","Tag","Stage","Person","Title","LinkedIn","Email"]];
+    exportData.forEach(co=>co.people.forEach(p=>rows.push([co.name,co.website,co.tag,co.stage,p.name,p.title,p.linkedin,p.email])));
+    const csv=rows.map(r=>r.map(v=>'"'+(v||"").replace(/"/g,'""')+'"').join(",")).join("\n");
+    const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([csv],{type:"text/csv"})); a.download="outreach_"+todayStr()+".csv"; a.click();
+    toast("CSV скачан");
+  }
+
+  const approvedCount = contacts.filter(c=>selected[c.key]&&(apolloResults[c.key]||[]).length>0).length;
+  const notFoundCount = contacts.filter(c=>apolloResults[c.key]!==undefined&&apolloResults[c.key].length===0).length;
+  const firstApproved = contacts.find(c=>selected[c.key]);
+  const previewProfile = firstApproved?(apolloResults[firstApproved.key]||[]).find(o=>o.id===selected[firstApproved.key]):null;
+
+  return (
+    <div style={{ minHeight:"100vh", background:"#090909", fontFamily:"'IBM Plex Mono',monospace", color:"#ddd" }}>
+      <div style={{ borderBottom:"1px solid #151515", padding:"14px 24px", display:"flex", alignItems:"center", gap:14, position:"sticky", top:0, background:"#090909", zIndex:20 }}>
+        <div style={{ width:32, height:32, borderRadius:8, background:"linear-gradient(135deg,#00e5a0,#0055ff)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:15 }}>⚡</div>
+        <div>
+          <div style={{ fontFamily:"'Syne',sans-serif", fontWeight:900, fontSize:16, color:"#fff", letterSpacing:-0.5 }}>Outreach Agent</div>
+          <div style={{ fontSize:9, color:"#333", letterSpacing:1.5 }}>APOLLO · HEYREACH · NOTION EXPORT</div>
+        </div>
+        <div style={{ marginLeft:"auto", display:"flex", gap:4 }}>
+          {["workflow","history"].map(t=>(
+            <button key={t} onClick={()=>setActiveTab(t)} style={{ background:activeTab===t?"#161616":"transparent", border:"1px solid "+(activeTab===t?"#252525":"transparent"), color:activeTab===t?"#ccc":"#444", borderRadius:6, padding:"5px 12px", fontSize:11, fontFamily:"'IBM Plex Mono',monospace", cursor:"pointer" }}>
+              {t==="workflow"?"Воркфлоу":"История ("+history.length+")"}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ maxWidth:660, margin:"0 auto", padding:"24px 16px 60px" }}>
+        {activeTab==="history" && (
+          <div>
+            <div style={{ color:"#444", fontSize:10, letterSpacing:2, marginBottom:14 }}>ИСТОРИЯ ЗАПУСКОВ</div>
+            {!history.length?<Card><div style={{ textAlign:"center", color:"#333", padding:32 }}>Нет запусков</div></Card>:history.map((h,i)=>(
+              <Card key={i}>
+                <div style={{ display:"flex", alignItems:"center", gap:12 }}>
+                  <div style={{ flex:1 }}>
+                    <div style={{ fontWeight:700, color:"#fff", marginBottom:4 }}>{h.date} · {h.campaignName}</div>
+                    <div style={{ fontSize:12, color:"#555", display:"flex", gap:14 }}>
+                      <span>Всего: <span style={{color:"#ccc"}}>{h.total}</span></span>
+                      <span>Добавлено: <span style={{color:"#00e5a0"}}>{h.added}</span></span>
+                      {h.failed>0&&<span>Ошибок: <span style={{color:"#ff6060"}}>{h.failed}</span></span>}
+                    </div>
+                  </div>
+                  <div style={{ width:44, height:44, borderRadius:"50%", border:"2px solid #00e5a030", background:"#0d1a10", display:"flex", alignItems:"center", justifyContent:"center", fontSize:12, color:"#00e5a0", fontWeight:800 }}>{Math.round(h.added/h.total*100)}%</div>
+                </div>
+              </Card>
+            ))}
+          </div>
+        )}
+
+        {activeTab==="workflow" && (
+          <div>
+            <Stepper step={step} />
+
+            {step==="settings" && (
+              <div style={{animation:"fadeIn 0.2s ease"}}>
+                <div style={{color:"#444",fontSize:10,letterSpacing:2,marginBottom:14}}>ШАГ 1 — API КЛЮЧИ</div>
+                <Card>
+                  <div style={{color:"#555",fontSize:11,marginBottom:8}}>Apollo API Key</div>
+                  <input type="password" placeholder="dx5oKDEQ..." value={apolloKey} onChange={e=>setApolloKey(e.target.value)} style={{marginBottom:14}} />
+                  <div style={{color:"#555",fontSize:11,marginBottom:8}}>HeyReach API Key</div>
+                  <input type="password" placeholder="lCct+mRI1..." value={heyreachKey} onChange={e=>setHeyreachKey(e.target.value)} style={{marginBottom:16}} />
+                  <Btn full onClick={verifyKeys} disabled={verifying}>{verifying?"Проверяем...":"Подключить →"}</Btn>
+                </Card>
+                <div style={{display:"flex",justifyContent:"space-between",marginTop:10}}>
+                  <div style={{color:apolloKey&&heyreachKey?"#00e5a050":"#2a2a2a",fontSize:11}}>{apolloKey&&heyreachKey?"✓ Ключи сохранены":"Ключи сохранятся после подключения"}</div>
+                  {apolloKey&&heyreachKey&&<button onClick={()=>{try{localStorage.removeItem("outreach_apollo_key");localStorage.removeItem("outreach_heyreach_key");}catch{}setApolloKey("");setHeyreachKey("");}} style={{background:"none",border:"none",color:"#333",fontSize:11,cursor:"pointer",fontFamily:"'IBM Plex Mono',monospace"}}>Очистить</button>}
+                </div>
+              </div>
+            )}
+
+            {step==="input" && (
+              <div style={{animation:"fadeIn 0.2s ease"}}>
+                <div style={{color:"#444",fontSize:10,letterSpacing:2,marginBottom:14}}>ШАГ 2 — СПИСОК КОНТАКТОВ</div>
+                <Card>
+                  <div style={{color:"#555",fontSize:11,marginBottom:8}}>Формат: <span style={{color:"#00e5a0"}}>Full Name / Company</span> или <span style={{color:"#4a90e2"}}>Full Name / Company / linkedin.com/in/slug</span></div>
+                  <textarea rows={9} value={rawInput} onChange={e=>setRawInput(e.target.value)} placeholder={"John Smith / Stripe\nAnna Müller / Deutsche Bank / linkedin.com/in/anna-muller"} style={{resize:"vertical",lineHeight:1.8,marginBottom:12}} />
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{color:"#383838",fontSize:11}}>{rawInput.trim().split("\n").filter(Boolean).length} контактов</span>
+                    <Btn onClick={runApollo}>Запустить Apollo →</Btn>
+                  </div>
+                </Card>
+              </div>
+            )}
+
+            {step==="apollo" && (
+              <div style={{animation:"fadeIn 0.2s ease"}}>
+                <div style={{color:"#444",fontSize:10,letterSpacing:2,marginBottom:14}}>ШАГ 3 — РЕЗУЛЬТАТЫ APOLLO</div>
+                {apolloLoading&&(
+                  <Card style={{display:"flex",alignItems:"center",gap:12,color:"#555",fontSize:13}}>
+                    <Spinner /><span>Ищем профили... {apolloProgress}/{contacts.length}</span>
+                    <div style={{flex:1,height:2,background:"#1a1a1a",borderRadius:1,overflow:"hidden"}}>
+                      <div style={{height:"100%",background:"#00e5a0",width:(apolloProgress/contacts.length*100)+"%",transition:"width 0.3s"}} />
+                    </div>
+                  </Card>
+                )}
+                {!apolloLoading&&Object.keys(apolloResults).length>0&&(
+                  <div>
+                    <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:14}}>
+                      <Badge color="#00e5a0">{Object.values(apolloResults).filter(r=>r.length>0).length} найдено</Badge>
+                      {notFoundCount>0&&<Badge color="#ff6060">{notFoundCount} не найдено</Badge>}
+                      <Badge color="#f5a020">Выбери профиль вручную</Badge>
+                    </div>
+                    {contacts.map(c=>{
+                      const opts=apolloResults[c.key]; if(!opts) return null;
+                      const notFound=opts.length===0, sel=selected[c.key];
+                      return (
+                        <Card key={c.key} style={{borderColor:notFound?"#1a0808":sel?"#00e5a018":"#1e1e1e"}}>
+                          <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:notFound?0:12}}>
+                            <div>
+                              <div style={{fontWeight:700,color:notFound?"#444":"#fff",fontSize:14}}>{c.name}</div>
+                              <div style={{fontSize:11,color:"#444",marginTop:2}}>{c.company}</div>
+                              {c.linkedinHint&&<div style={{fontSize:10,color:"#4a90e260",marginTop:3}}>🔗 <a href={c.linkedinHint} target="_blank" style={{color:"#4a90e280",textDecoration:"underline"}}>{c.linkedinHint}</a></div>}
+                            </div>
+                            {notFound?<Badge color="#ff6060">Не найден</Badge>:<Badge color={sel?"#00e5a0":"#f5a020"}>{sel?"✓ Выбран":opts.length+(opts.length===1?" вариант":" варианта")}</Badge>}
+                          </div>
+                          {!notFound&&opts.map(opt=>(
+                            <div key={opt.id} onClick={()=>setSelected(s=>({...s,[c.key]:opt.id}))} style={{ padding:"12px 14px", borderRadius:8, marginBottom:6, cursor:"pointer", border:"1px solid "+(sel===opt.id?"#00e5a0":"#1a1a1a"), background:sel===opt.id?"#00e5a008":"#0d0d0d" }}>
+                              <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+                                <div style={{width:16,height:16,borderRadius:"50%",flexShrink:0,marginTop:3,border:"2px solid "+(sel===opt.id?"#00e5a0":"#333"),background:sel===opt.id?"#00e5a0":"transparent"}} />
+                                <div style={{flex:1,minWidth:0}} onClick={e=>e.stopPropagation()}>
+                                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                                    <div style={{fontSize:13,color:"#fff",fontWeight:600}}>{opt.name}</div>
+                                    {opt.manualEntry&&<span style={{fontSize:9,background:"#f5a02020",color:"#f5a020",border:"1px solid #f5a02040",borderRadius:3,padding:"1px 5px"}}>ручной ввод</span>}
+                                    {opt.hintUsed&&!opt.manualEntry&&<span style={{fontSize:9,background:"#4a90e220",color:"#4a90e2",border:"1px solid #4a90e240",borderRadius:3,padding:"1px 5px"}}>LinkedIn hint</span>}
+                                  </div>
+                                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"6px 12px",marginBottom:6}}>
+                                    <div>
+                                      <div style={{fontSize:9,color:"#444",marginBottom:2}}>ДОЛЖНОСТЬ</div>
+                                      <input value={(manualEdits[c.key+"_"+opt.id]?.title ?? opt.title) === "—" ? "" : (manualEdits[c.key+"_"+opt.id]?.title ?? opt.title ?? "")} onChange={e=>setManualEdits(m=>({...m,[c.key+"_"+opt.id]:{...(m[c.key+"_"+opt.id]||{}),title:e.target.value}}))} placeholder="Head of Partnerships" style={{fontSize:11,padding:"4px 8px",background:"#111",border:"1px solid #2a2a2a",color:"#ddd",borderRadius:4,width:"100%"}} onClick={e=>e.stopPropagation()} />
+                                    </div>
+                                    <div>
+                                      <div style={{fontSize:9,color:"#444",marginBottom:2}}>КОМПАНИЯ</div>
+                                      <div style={{fontSize:11,color:"#888",padding:"5px 0"}}>{opt.company}</div>
+                                    </div>
+                                    <div>
+                                      <div style={{fontSize:9,color:"#444",marginBottom:2}}>EMAIL</div>
+                                      <input value={manualEdits[c.key+"_"+opt.id]?.email ?? opt.email ?? ""} onChange={e=>setManualEdits(m=>({...m,[c.key+"_"+opt.id]:{...(m[c.key+"_"+opt.id]||{}),email:e.target.value}}))} placeholder="name@company.com" style={{fontSize:11,padding:"4px 8px",background:"#111",border:"1px solid #2a2a2a",color:"#ddd",borderRadius:4,width:"100%"}} onClick={e=>e.stopPropagation()} />
+                                    </div>
+                                    <div>
+                                      <div style={{fontSize:9,color:"#444",marginBottom:2}}>LINKEDIN</div>
+                                      <input value={manualEdits[c.key+"_"+opt.id]?.linkedin !== undefined ? manualEdits[c.key+"_"+opt.id].linkedin : (opt.linkedin && opt.linkedin.length > 10 ? opt.linkedin : (c.linkedinHint || ""))} onChange={e=>setManualEdits(m=>({...m,[c.key+"_"+opt.id]:{...(m[c.key+"_"+opt.id]||{}),linkedin:e.target.value}}))} placeholder="linkedin.com/in/..." style={{fontSize:11,padding:"4px 8px",background:"#111",border:"1px solid #2a2a2a",color:"#ddd",borderRadius:4,width:"100%"}} onClick={e=>e.stopPropagation()} />
+                                    </div>
+                                  </div>
+                                  {opt.website&&<div style={{fontSize:10,color:"#555",marginTop:2}}>🌐 {opt.website}</div>}
+                                  {opt.location&&opt.location!=="—"&&<div style={{fontSize:10,color:"#555",marginTop:2}}>📍 {opt.location}</div>}
+                                </div>
+                              </div>
+                            </div>
+                          ))}
+                        </Card>
+                      );
+                    })}
+                    <div style={{display:"flex",gap:8,marginTop:8}}>
+                      <Btn variant="secondary" onClick={()=>setStep("input")}>← Назад</Btn>
+                      <Btn full onClick={()=>setStep("sequence")} disabled={approvedCount===0}>✓ Подтвердить {approvedCount} контактов →</Btn>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {step==="sequence" && (
+              <div style={{animation:"fadeIn 0.2s ease"}}>
+                <div style={{color:"#444",fontSize:10,letterSpacing:2,marginBottom:14}}>ШАГ 4 — SEQUENCE</div>
+                <Card>
+                  <div style={{color:"#555",fontSize:11,marginBottom:8}}>Название кампании</div>
+                  <input value={campaignName} onChange={e=>setCampaignName(e.target.value)} style={{marginBottom:16}} />
+                  <div style={{color:"#555",fontSize:11,marginBottom:10}}>Тип sequence</div>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:16}}>
+                    {[{val:"connect_note",label:"Коннект + Note"},{val:"connect_followup",label:"Коннект + Follow-up"},{val:"connect_note_followup",label:"Коннект + Note + Follow-up"}].map(opt=>(
+                      <button key={opt.val} onClick={()=>setSeqType(opt.val)} style={{ padding:"7px 12px", borderRadius:6, fontSize:11, cursor:"pointer", fontFamily:"'IBM Plex Mono',monospace", fontWeight:600, background:seqType===opt.val?"#00e5a0":"#0d0d0d", color:seqType===opt.val?"#080808":"#555", border:"1px solid "+(seqType===opt.val?"#00e5a0":"#1e1e1e") }}>{opt.label}</button>
+                    ))}
+                  </div>
+                  {seqType!=="connect_followup"&&(
+                    <div>
+                      <div style={{color:"#555",fontSize:11,marginBottom:8}}>Note · <span style={{color:"#383838"}}>{"{{FIRSTNAME}}"} {"{{COMPANY_NAME}}"}</span></div>
+                      <textarea rows={4} value={noteText} onChange={e=>setNoteText(e.target.value)} style={{resize:"vertical",marginBottom:16}} />
+                    </div>
+                  )}
+                  {(seqType==="connect_followup"||seqType==="connect_note_followup")&&(
+                    <div>
+                      <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:8}}>
+                        <div style={{color:"#555",fontSize:11}}>Follow-up через</div>
+                        <input type="number" value={followupDays} onChange={e=>setFollowupDays(e.target.value)} style={{width:60}} />
+                        <div style={{color:"#555",fontSize:11}}>дней</div>
+                      </div>
+                      <textarea rows={4} value={followupText} onChange={e=>setFollowupText(e.target.value)} style={{resize:"vertical"}} />
+                    </div>
+                  )}
+                </Card>
+                {previewProfile&&(
+                  <Card style={{borderColor:"#0d1f10",background:"#090f0a"}}>
+                    <div style={{color:"#00e5a0",fontSize:10,letterSpacing:2,marginBottom:10}}>PREVIEW · {previewProfile.name}</div>
+                    {seqType!=="connect_followup"&&<div style={{fontSize:12,color:"#888",lineHeight:1.8,marginBottom:8}}>{noteText.replace(/\{\{FIRSTNAME\}\}/g,(previewProfile.name||"").split(" ")[0]).replace(/\{\{COMPANY_NAME\}\}/g,firstApproved?.company||"")}</div>}
+                    {(seqType==="connect_followup"||seqType==="connect_note_followup")&&<div style={{fontSize:11,color:"#555",lineHeight:1.8,borderTop:"1px solid #141414",paddingTop:8}}><span style={{color:"#333"}}>↳ +{followupDays} дней: </span>{followupText.replace(/\{\{FIRSTNAME\}\}/g,(previewProfile.name||"").split(" ")[0]).replace(/\{\{COMPANY_NAME\}\}/g,firstApproved?.company||"")}</div>}
+                  </Card>
+                )}
+                <div style={{display:"flex",gap:8}}>
+                  <Btn variant="secondary" onClick={()=>setStep("apollo")}>← Назад</Btn>
+                  <Btn full onClick={launchCampaign}>🚀 Запустить для {approvedCount} контактов →</Btn>
+                </div>
+              </div>
+            )}
+
+            {step==="launch" && (
+              <div style={{animation:"fadeIn 0.2s ease"}}>
+                <div style={{color:"#444",fontSize:10,letterSpacing:2,marginBottom:14}}>ШАГ 5 — ЗАПУСК</div>
+                <Card>
+                  <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+                    <div style={{fontSize:16}}>⚡</div>
+                    <div style={{flex:1,fontWeight:700,color:"#fff"}}>HeyReach · {campaignName}</div>
+                    {launching&&<Spinner />}
+                    {launchDone&&<span style={{color:"#00e5a0"}}>✓</span>}
+                  </div>
+                  <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                    {launchLog.map((l,i)=><div key={i} style={{fontSize:11,color:l.type==="error"?"#ff6060":l.type==="warn"?"#f5a020":"#555"}}><span style={{color:"#2a2a2a"}}>{l.ts} </span>{l.msg}</div>)}
+                  </div>
+                </Card>
+                {launchDone&&exportData&&(
+                  <div>
+                    <div style={{color:"#444",fontSize:10,letterSpacing:2,margin:"20px 0 12px"}}>ДАННЫЕ ДЛЯ NOTION CRM</div>
+                    {exportData.map((co,i)=>(
+                      <Card key={i} style={{borderColor:"#1a1f1a"}}>
+                        <div style={{marginBottom:10}}>
+                          <div style={{fontWeight:700,color:"#fff",fontSize:14,marginBottom:4}}>{co.name}</div>
+                          <div style={{display:"flex",gap:10,flexWrap:"wrap"}}>
+                            <span style={{fontSize:11,color:"#555"}}>Website: <span style={{color:"#aaa"}}>{co.website}</span></span>
+                            <span style={{fontSize:11,color:"#555"}}>Tag: <span style={{color:"#00e5a0"}}>{co.tag}</span></span>
+                            <Badge color="#4a90e2">{co.stage}</Badge>
+                          </div>
+                        </div>
+                        {co.people.map((p,j)=>(
+                          <div key={j} style={{padding:"8px 10px",background:"#0d0d0d",borderRadius:6,marginBottom:4,fontSize:11}}>
+                            <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                              <span style={{color:"#ddd",fontWeight:600}}>{p.name}</span>
+                              <span style={{color:"#555"}}>·</span>
+                              <span style={{color:"#888"}}>{p.title}</span>
+                              {p.status!=="ok"&&<Badge color="#ff6060" small>не добавлен</Badge>}
+                            </div>
+                            {p.linkedin!=="—"&&<a href={p.linkedin.startsWith("http")?p.linkedin:"https://"+p.linkedin} target="_blank" rel="noopener noreferrer" style={{color:"#4a90e2",marginTop:3,display:"block",fontSize:11,textDecoration:"underline"}}>🔗 {p.linkedin}</a>}
+                            {p.email!=="—"&&<div style={{color:"#00e5a070",marginTop:2}}>✉ {p.email}</div>}
+                          </div>
+                        ))}
+                      </Card>
+                    ))}
+                    <div style={{display:"flex",gap:8,marginTop:4}}>
+                      <Btn variant="secondary" onClick={exportCSV} style={{flex:1}}>⬇ CSV для Notion</Btn>
+                      <Btn onClick={()=>{setStep("events");loadEvents();}} style={{flex:1}}>Мониторинг →</Btn>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {step==="events" && (
+              <div style={{animation:"fadeIn 0.2s ease"}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+                  <div style={{color:"#444",fontSize:10,letterSpacing:2}}>ШАГ 6 — СОБЫТИЯ</div>
+                  <Btn variant="secondary" onClick={loadEvents} style={{fontSize:11,padding:"6px 10px"}}>{eventsLoading?"...":"↻ Обновить"}</Btn>
+                </div>
+                {eventsLoading?<Card style={{display:"flex",alignItems:"center",gap:12,color:"#555",fontSize:13}}><Spinner />Загружаем события...</Card>
+                :events.length===0?<Card><div style={{textAlign:"center",color:"#333",padding:28,fontSize:13}}>📭 Новых событий нет</div></Card>
+                :events.map(e=>{
+                  const action=eventActions[e.id], isReply=e.event==="MESSAGE_REPLY";
+                  return (
+                    <Card key={e.id} style={{opacity:action?0.65:1}}>
+                      <div style={{display:"flex",gap:10,alignItems:"flex-start"}}>
+                        <div style={{fontSize:18}}>{isReply?"💬":"🤝"}</div>
+                        <div style={{flex:1}}>
+                          <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap",marginBottom:5}}>
+                            <span style={{fontWeight:700,color:"#fff"}}>{e.name}</span>
+                            <span style={{color:"#444"}}>·</span>
+                            <span style={{color:"#777",fontSize:12}}>{e.company}</span>
+                            <Badge color={isReply?"#00e5a0":"#4a90e2"}>{isReply?"Ответил":"Принял коннект"}</Badge>
+                          </div>
+                          <div style={{fontSize:11,color:"#383838",marginBottom:10}}>Новый статус: <span style={{color:"#aaa"}}>{e.newStage}</span></div>
+                          {!action&&(
+                            <div style={{display:"flex",gap:6}}>
+                              <Btn onClick={()=>{setEventActions(a=>({...a,[e.id]:"approved"}));toast("→ "+e.newStage);}} style={{fontSize:11,padding:"7px 14px"}}>✓ Обновить статус</Btn>
+                              <Btn variant="secondary" onClick={()=>setEventActions(a=>({...a,[e.id]:"skipped"}))} style={{fontSize:11,padding:"7px 10px"}}>Пропустить</Btn>
+                            </div>
+                          )}
+                          {action==="approved"&&<div style={{fontSize:11,color:"#00e5a0"}}>✓ Зафиксировано</div>}
+                          {action==="skipped"&&<div style={{fontSize:11,color:"#333"}}>— Пропущено</div>}
+                        </div>
+                      </div>
+                    </Card>
+                  );
+                })}
+                <div style={{marginTop:16}}>
+                  <Btn variant="secondary" full onClick={()=>{setStep("input");setRawInput("");setContacts([]);setApolloResults({});setSelected({});setLaunchDone(false);setLaunchLog([]);setExportData(null);setEvents([]);setEventActions({});setCampaignName(todayStr());}}>+ Новый запуск</Btn>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div style={{position:"fixed",bottom:24,right:24,zIndex:999,display:"flex",flexDirection:"column",gap:8}}>
+        {toasts.map(t=>(
+          <div key={t.id} style={{background:t.type==="error"?"#1a0808":"#081a10",border:"1px solid "+(t.type==="error"?"#ff606040":"#00e5a040"),color:t.type==="error"?"#ff6060":"#00e5a0",borderRadius:8,padding:"11px 16px",fontSize:12,boxShadow:"0 8px 24px #0008",fontFamily:"'IBM Plex Mono',monospace",maxWidth:320}}>
+            {t.type==="error"?"✗ ":"✓ "}{t.msg}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

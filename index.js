@@ -198,7 +198,9 @@ app.post("/heyreach/senders", async (req, res) => {
   const { key } = req.body;
   try {
     const r = await hrPost(key, "/linkedInAccount/GetAll", { offset: 0, limit: 50 });
-    res.json(r.data.items || r.data.linkedInAccounts || r.data || []);
+    console.log("Senders raw:", JSON.stringify(r.data).slice(0, 300));
+    const senders = r.data.items || r.data.linkedInAccounts || r.data.data || (Array.isArray(r.data) ? r.data : []);
+    res.json(senders);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

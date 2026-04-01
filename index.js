@@ -5,7 +5,13 @@ const https = require("https");
 const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static(__dirname));
+app.use(express.static(__dirname, {
+  etag: false,
+  lastModified: false,
+  setHeaders: (res) => {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  }
+}));
 app.get("/", (req, res) => res.sendFile(__dirname + "/outreach-agent.html"));
 
 function httpRequest(url, options = {}) {
@@ -109,19 +115,21 @@ app.post("/apollo/search", async (req, res) => {
       people = (d3 && Array.isArray(d3.people)) ? d3.people : [];
     }
 
-    // Try to enrich top result to get linkedin URL
-    if (people.length > 0 && !people[0].linkedin_url) {
-      try {
-        const enriched = await apolloSearch(apolloKey, "/people/match", {
-          first_name: (people[0].first_name || (people[0].name || "").split(" ")[0]),
-          last_name: (people[0].last_name || (people[0].name || "").split(" ").slice(1).join(" ")),
-          organization_name: people[0].organization ? people[0].organization.name : company,
-          reveal_personal_emails: true,
-        });
-        if (enriched && enriched.person && enriched.person.linkedin_url) {
-          people[0] = { ...people[0], linkedin_url: enriched.person.linkedin_url };
-        }
-      } catch { /* enrichment optional */ }
+    // Enrich each person by ID to get linkedin_url
+    for (let i = 0; i < Math.min(people.length, 3); i++) {
+      if (!people[i].linkedin_url && people[i].id) {
+        try {
+          const enrich = await apolloSearch(apolloKey, "/people/enrich", {
+            id: people[i].id,
+            reveal_personal_emails: true,
+          });
+          if (enrich && enrich.person) {
+            people[i] = { ...people[i], ...enrich.person };
+          } else if (enrich && enrich.linkedin_url) {
+            people[i] = { ...people[i], linkedin_url: enrich.linkedin_url };
+          }
+        } catch { /* enrichment optional */ }
+      }
     }
     res.json(people.map(p => mapPerson(p, company)));
   } catch (e) {

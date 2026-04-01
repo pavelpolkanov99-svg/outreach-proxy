@@ -133,8 +133,11 @@ app.post("/apollo/match", async (req, res) => {
 app.post("/heyreach/check", async (req, res) => {
   const { key } = req.body;
   try {
-    const r = await hrRequest(key, "/auth/CheckApiKey");
-    res.json({ ok: r.ok });
+    const res2 = await httpRequest("https://api.heyreach.io/api/public/auth/CheckApiKey", {
+      method: "GET",
+      headers: { "X-API-KEY": key },
+    });
+    res.json({ ok: res2.ok });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 

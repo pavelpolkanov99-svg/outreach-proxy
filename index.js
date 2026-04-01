@@ -1,10 +1,14 @@
 const express = require("express");
 const cors = require("cors");
 const https = require("https");
+const path = require("path");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Serve the HTML app
+app.use(express.static(path.join(__dirname, "public")));
 
 function request(url, options = {}) {
   return new Promise((resolve, reject) => {
@@ -67,17 +71,17 @@ function mapPerson(p, company) {
   };
 }
 
-// Apollo search - smart fallback
+// Apollo search - 3 level fallback
 app.post("/apollo/search", async (req, res) => {
   const { apolloKey, name, company } = req.body;
   try {
-    // Try 1: name + company together
+    // Level 1: name + company
     const data1 = await apolloPost("/people/search", apolloKey, {
       q_person_name: name, q_organization_name: company, page: 1, per_page: 5
     });
     let people = data1.people || [];
 
-    // Try 2: if no results, search by company only and filter by name
+    // Level 2: company only, filter by name
     if (people.length === 0) {
       const data2 = await apolloPost("/people/search", apolloKey, {
         q_organization_name: company, page: 1, per_page: 25
@@ -92,7 +96,7 @@ app.post("/apollo/search", async (req, res) => {
       people = scored.slice(0, 5).map(x => x.p);
     }
 
-    // Try 3: name only search if still empty
+    // Level 3: name only
     if (people.length === 0) {
       const data3 = await apolloPost("/people/search", apolloKey, {
         q_person_name: name, page: 1, per_page: 5
@@ -160,8 +164,6 @@ app.post("/heyreach/campaign/leads", async (req, res) => {
   try { const data = await hrPost("/campaign/GetLeads", key, { campaignId, offset: 0, limit: 100 }); res.json(data.items || data.leads || []); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
-
-app.get("/", (req, res) => res.json({ status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Proxy running on port " + PORT));

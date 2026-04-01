@@ -139,7 +139,8 @@ app.post("/heyreach/check", async (req, res) => {
       headers: { "X-API-KEY": key, "Accept": "application/json" },
     });
     console.log("HeyReach check status:", res2.status, "ok:", res2.ok);
-    res.json({ ok: res2.ok, status: res2.status });
+    // HeyReach CheckApiKey returns 200 with empty body on success
+    res.json({ ok: res2.status === 200, status: res2.status });
   } catch (e) {
     console.error("HeyReach check error:", e.message);
     res.status(500).json({ ok: false, error: e.message });

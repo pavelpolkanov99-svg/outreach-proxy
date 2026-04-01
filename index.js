@@ -38,8 +38,12 @@ function httpRequest(url, options = {}) {
 async function apolloSearch(apolloKey, endpoint, body) {
   const res = await httpRequest("https://api.apollo.io/v1" + endpoint, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "Cache-Control": "no-cache" },
-    body: JSON.stringify({ ...body, api_key: apolloKey }),
+    headers: { 
+      "Content-Type": "application/json", 
+      "Cache-Control": "no-cache",
+      "X-Api-Key": apolloKey,
+    },
+    body: JSON.stringify(body),
   });
   return res.data;
 }
@@ -71,13 +75,13 @@ function mapPerson(p, company) {
 app.post("/apollo/search", async (req, res) => {
   const { apolloKey, name, company } = req.body;
   try {
-    const d1 = await apolloSearch(apolloKey, "/people/search", {
+    const d1 = await apolloSearch(apolloKey, "/mixed_people/api_search", {
       q_person_name: name, q_organization_name: company, page: 1, per_page: 5
     });
     let people = (d1 && Array.isArray(d1.people)) ? d1.people : [];
 
     if (people.length === 0 && company) {
-      const d2 = await apolloSearch(apolloKey, "/people/search", {
+      const d2 = await apolloSearch(apolloKey, "/mixed_people/api_search", {
         q_organization_name: company, page: 1, per_page: 25
       });
       const all = (d2 && Array.isArray(d2.people)) ? d2.people : [];
@@ -91,7 +95,7 @@ app.post("/apollo/search", async (req, res) => {
     }
 
     if (people.length === 0 && name) {
-      const d3 = await apolloSearch(apolloKey, "/people/search", {
+      const d3 = await apolloSearch(apolloKey, "/mixed_people/api_search", {
         q_person_name: name, page: 1, per_page: 5
       });
       people = (d3 && Array.isArray(d3.people)) ? d3.people : [];

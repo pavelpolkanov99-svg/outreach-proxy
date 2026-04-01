@@ -60,16 +60,20 @@ async function hrRequest(key, endpoint, body) {
 
 function mapPerson(p, company) {
   const org = p.organization || {};
+  // Apollo returns linkedin in multiple possible fields
+  const linkedin = p.linkedin_url || p.linkedin || 
+    (p.contact && p.contact.linkedin_url) || null;
+  const linkedinCompany = org.linkedin_url || org.linkedin || null;
   return {
     id: p.id,
     name: p.name,
     title: p.title || "—",
     company: org.name || company,
     location: [p.city, p.country].filter(Boolean).join(", ") || "—",
-    linkedin: p.linkedin_url || null,
-    linkedinCompany: org.linkedin_url || null,
-    email: p.email || null,
-    website: org.website_url || null,
+    linkedin,
+    linkedinCompany,
+    email: p.email || (p.contact && p.contact.email) || null,
+    website: org.website_url || org.primary_domain || null,
     phone: (p.phone_numbers && p.phone_numbers[0] && p.phone_numbers[0].sanitized_number) || null,
     hintUsed: false,
   };
@@ -79,7 +83,8 @@ app.post("/apollo/search", async (req, res) => {
   const { apolloKey, name, company } = req.body;
   try {
     const d1 = await apolloSearch(apolloKey, "/mixed_people/api_search", {
-      q_person_name: name, q_organization_name: company, page: 1, per_page: 5
+      q_person_name: name, q_organization_name: company, page: 1, per_page: 5,
+      person_titles: [], reveal_personal_emails: true, reveal_phone_number: false,
     });
     let people = (d1 && Array.isArray(d1.people)) ? d1.people : [];
 
@@ -104,6 +109,20 @@ app.post("/apollo/search", async (req, res) => {
       people = (d3 && Array.isArray(d3.people)) ? d3.people : [];
     }
 
+    // Try to enrich top result to get linkedin URL
+    if (people.length > 0 && !people[0].linkedin_url) {
+      try {
+        const enriched = await apolloSearch(apolloKey, "/people/match", {
+          first_name: (people[0].first_name || (people[0].name || "").split(" ")[0]),
+          last_name: (people[0].last_name || (people[0].name || "").split(" ").slice(1).join(" ")),
+          organization_name: people[0].organization ? people[0].organization.name : company,
+          reveal_personal_emails: true,
+        });
+        if (enriched && enriched.person && enriched.person.linkedin_url) {
+          people[0] = { ...people[0], linkedin_url: enriched.person.linkedin_url };
+        }
+      } catch { /* enrichment optional */ }
+    }
     res.json(people.map(p => mapPerson(p, company)));
   } catch (e) {
     console.error("Apollo search error:", e.message);

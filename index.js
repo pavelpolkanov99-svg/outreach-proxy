@@ -8,7 +8,7 @@ app.use(cors());
 app.use(express.json());
 
 // Serve the HTML app
-app.use(express.static(path.join(__dirname, "public")));
+app.use(express.static(__dirname));
 
 function request(url, options = {}) {
   return new Promise((resolve, reject) => {

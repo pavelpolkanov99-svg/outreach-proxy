@@ -138,6 +138,15 @@ app.post("/apollo/search", async (req, res) => {
   }
 });
 
+app.post("/apollo/enrich", async (req, res) => {
+  const { apolloKey, id } = req.body;
+  try {
+    const d = await apolloSearch(apolloKey, "/people/enrich", { id, reveal_personal_emails: true });
+    console.log("Enrich result:", JSON.stringify(d).slice(0, 300));
+    res.json(d);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post("/apollo/match", async (req, res) => {
   const { apolloKey, linkedinUrl, name, company } = req.body;
   try {

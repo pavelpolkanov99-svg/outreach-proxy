@@ -98,6 +98,24 @@ app.post("/apollo/match", async (req, res) => {
 });
 
 // ── Health check ─────────────────────────────────────────────────────────────
+// POST /heyreach/proxy — generic HeyReach REST proxy
+// Body: { hrKey, path, payload }
+app.post("/heyreach/proxy", async (req, res) => {
+  const { hrKey, path, payload } = req.body;
+  if (!hrKey || !path) return res.status(400).json({ error: "hrKey and path required" });
+  try {
+    const r = await axios.post(
+      `https://api.heyreach.io/api/public${path}`,
+      payload || {},
+      { headers: { "X-API-KEY": hrKey, "Content-Type": "application/json" }, timeout: 20000 }
+    );
+    res.json(r.data);
+  } catch (err) {
+    console.error("[/heyreach/proxy]", path, err.response?.status, err.message);
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
 app.get("/health", (_, res) => res.json({ ok: true }));
 app.get("/", (_, res) => res.json({ service: "outreach-proxy", status: "ok" }));
 

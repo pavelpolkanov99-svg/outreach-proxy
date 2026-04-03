@@ -7,7 +7,7 @@ app.use(express.json());
 // ── CORS — allow requests from Claude artifacts and any browser ──────────────
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
   
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, Cache-Control");
   if (req.method === "OPTIONS") return res.sendStatus(200);
@@ -26,16 +26,13 @@ app.post("/apollo/search", async (req, res) => {
   try {
     const r = await axios.post(
       "https://api.apollo.io/api/v1/mixed_people/search",
-      {
-        api_key: apolloKey,
-        q_person_name: name,
+      { q_person_name: name,
         q_organization_name: company || undefined,
         page: 1,
         per_page: 5,
       },
-      { headers: { "Content-Type": "application/json" }, timeout: 15000 }
+      { headers: { "Content-Type": "application/json", "X-Api-Key": apolloKey }, timeout: 15000 }
     );
-
     const people = (r.data?.people || []).map((p) => ({
       id: p.id,
       name: p.name,
@@ -67,15 +64,12 @@ app.post("/apollo/match", async (req, res) => {
   try {
     const r = await axios.post(
       "https://api.apollo.io/api/v1/people/match",
-      {
-        api_key: apolloKey,
-        linkedin_url: linkedinUrl || undefined,
+      { linkedin_url: linkedinUrl || undefined,
         name: name || undefined,
         organization_name: company || undefined,
       },
-      { headers: { "Content-Type": "application/json" }, timeout: 15000 }
+      { headers: { "Content-Type": "application/json", "X-Api-Key": apolloKey }, timeout: 15000 }
     );
-
     const p = r.data?.person;
     if (!p) return res.json(null);
 

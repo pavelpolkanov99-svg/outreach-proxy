@@ -25,7 +25,7 @@ app.post("/apollo/search", async (req, res) => {
 
   try {
     const r = await axios.post(
-      "https://api.apollo.io/api/v1/mixed_people/search",
+      "https://api.apollo.io/api/v1/mixed_people/api_search",
       { q_person_name: name,
         q_organization_name: company || undefined,
         page: 1,

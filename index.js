@@ -103,7 +103,3 @@ app.get("/", (_, res) => res.json({ service: "outreach-proxy", status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
-"dependencies": {
-  "express": "^4.18.0",
-  "axios": "^1.7.2"
-}

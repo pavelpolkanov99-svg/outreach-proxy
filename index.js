@@ -14,6 +14,10 @@ app.use((req, res, next) => {
 });
 
 // ── Notion config ─────────────────────────────────────────────────────────────
+// CRM Companies fields: "Company name" (title), "Stage" (status), "Website" (url),
+//   "Discovery Card" (url), "Company description" (rich_text), "People" (relation)
+// CRM People fields: "Name" (title), "Role" (rich_text), "LinkedIn" (url),
+//   "Email" (email), "Company" (relation)
 const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const NOTION_VERSION = "2022-06-28";
 const NOTION_COMPANIES_DB = "f9b59c5b05fa4df18f9569479633fd74";
@@ -98,7 +102,6 @@ app.post("/heyreach/proxy", async (req, res) => {
 });
 
 // ── Notion: GET /notion/db-schema ────────────────────────────────────────────
-// Returns property names + types for both CRM databases
 app.get("/notion/db-schema", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   try {
@@ -115,14 +118,16 @@ app.get("/notion/db-schema", async (req, res) => {
 });
 
 // ── Notion: POST /notion/upsert-lead ─────────────────────────────────────────
-// Upserts lead into CRM Companies + CRM People (with relation)
+// Upserts lead into CRM Companies + CRM People with bidirectional relation
 // Body: { firstName, lastName, title, company, companyWebsite, companyLinkedin,
-//         linkedin, email, location, campaign, status }
+//         companyDescription, linkedin, email, status }
+// Valid statuses: "Connection Sent", "Initial Discussion"
 app.post("/notion/upsert-lead", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   const {
-    firstName, lastName, title, company, companyWebsite, companyLinkedin,
-    linkedin, email, location, campaign, status = "Connection Sent"
+    firstName, lastName, title, company,
+    companyWebsite, companyLinkedin, companyDescription,
+    linkedin, email, status = "Connection Sent"
   } = req.body;
 
   try {
@@ -131,19 +136,21 @@ app.post("/notion/upsert-lead", async (req, res) => {
     if (company) {
       const searchCompany = await axios.post(
         `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
-        { filter: { property: "Name", title: { equals: company } }, page_size: 1 },
+        { filter: { property: "Company name", title: { equals: company } }, page_size: 1 },
         { headers: notionHeaders() }
       );
+
       if (searchCompany.data.results.length > 0) {
         companyPageId = searchCompany.data.results[0].id;
       } else {
         const companyProps = {
-          "Name": { title: [{ text: { content: company } }] },
-          "Status": { status: { name: status } },
+          "Company name": { title: [{ text: { content: company } }] },
+          "Stage": { status: { name: status } },
         };
         if (companyWebsite) companyProps["Website"] = { url: companyWebsite };
-        if (companyLinkedin) companyProps["LinkedIn"] = { url: companyLinkedin };
-        if (campaign) companyProps["Campaign"] = { rich_text: [{ text: { content: campaign } }] };
+        if (companyLinkedin) companyProps["Discovery Card"] = { url: companyLinkedin };
+        if (companyDescription) companyProps["Company description"] = { rich_text: [{ text: { content: companyDescription } }] };
+
         const newCompany = await axios.post(
           "https://api.notion.com/v1/pages",
           { parent: { database_id: NOTION_COMPANIES_DB }, properties: companyProps },
@@ -158,10 +165,9 @@ app.post("/notion/upsert-lead", async (req, res) => {
     const personProps = {
       "Name": { title: [{ text: { content: fullName } }] },
     };
-    if (title) personProps["Position"] = { rich_text: [{ text: { content: title } }] };
+    if (title) personProps["Role"] = { rich_text: [{ text: { content: title } }] };
     if (linkedin) personProps["LinkedIn"] = { url: linkedin };
     if (email) personProps["Email"] = { email: email };
-    if (location) personProps["Location"] = { rich_text: [{ text: { content: location } }] };
     if (companyPageId) personProps["Company"] = { relation: [{ id: companyPageId }] };
 
     const searchPerson = await axios.post(
@@ -195,7 +201,7 @@ app.post("/notion/upsert-lead", async (req, res) => {
 });
 
 // ── Notion: POST /notion/update-status ───────────────────────────────────────
-// Updates Status field on CRM Companies record by company name
+// Updates Stage on CRM Companies by company name
 // Body: { company, status }
 // Valid statuses: "Connection Sent", "Initial Discussion"
 app.post("/notion/update-status", async (req, res) => {
@@ -205,14 +211,14 @@ app.post("/notion/update-status", async (req, res) => {
   try {
     const search = await axios.post(
       `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
-      { filter: { property: "Name", title: { equals: company } }, page_size: 1 },
+      { filter: { property: "Company name", title: { equals: company } }, page_size: 1 },
       { headers: notionHeaders() }
     );
     if (search.data.results.length === 0) return res.status(404).json({ error: "Company not found in CRM" });
     const pageId = search.data.results[0].id;
     await axios.patch(
       `https://api.notion.com/v1/pages/${pageId}`,
-      { properties: { "Status": { status: { name: status } } } },
+      { properties: { "Stage": { status: { name: status } } } },
       { headers: notionHeaders() }
     );
     res.json({ ok: true, pageId });

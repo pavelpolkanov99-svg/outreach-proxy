@@ -4,97 +4,83 @@ const app = express();
 
 app.use(express.json());
 
-// ── CORS — allow requests from Claude artifacts and any browser ──────────────
+// ── CORS ─────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-  
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, Cache-Control");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
 
-// ── Apollo search: POST /apollo/search ──────────────────────────────────────
-// Body: { apolloKey, name, company }
+// ── Notion config ─────────────────────────────────────────────────────────────
+const NOTION_TOKEN = process.env.NOTION_TOKEN;
+const NOTION_VERSION = "2022-06-28";
+const NOTION_COMPANIES_DB = "f9b59c5b05fa4df18f9569479633fd74";
+const NOTION_PEOPLE_DB = "f36b2a0f0ab241cebbdbd1d0874a55be";
+
+function notionHeaders() {
+  return {
+    "Authorization": `Bearer ${NOTION_TOKEN}`,
+    "Notion-Version": NOTION_VERSION,
+    "Content-Type": "application/json",
+  };
+}
+
+// ── Apollo search: POST /apollo/search ───────────────────────────────────────
 app.post("/apollo/search", async (req, res) => {
   const { apolloKey, name, company } = req.body;
   if (!apolloKey) return res.status(400).json({ error: "apolloKey required" });
-
-  const [firstName, ...lastParts] = (name || "").trim().split(" ");
-  const lastName = lastParts.join(" ");
-
   try {
     const r = await axios.post(
       "https://api.apollo.io/api/v1/mixed_people/api_search",
-      { q_person_name: name,
-        q_organization_name: company || undefined,
-        page: 1,
-        per_page: 5,
-      },
+      { q_keywords: name + (company ? " " + company : ""), page: 1, per_page: 5 },
       { headers: { "Content-Type": "application/json", "X-Api-Key": apolloKey }, timeout: 15000 }
     );
     const people = (r.data?.people || []).map((p) => ({
-      id: p.id,
-      name: p.name,
-      firstName: p.first_name,
-      lastName: p.last_name,
-      title: p.title,
-      company: p.organization_name || p.organization?.name,
+      id: p.id, name: p.name, firstName: p.first_name, lastName: p.last_name,
+      title: p.title, company: p.organization_name || p.organization?.name,
+      companyWebsite: p.organization?.website_url,
+      companyLinkedin: p.organization?.linkedin_url,
+      companyDescription: (p.organization?.short_description || "").slice(0, 150),
       location: [p.city, p.country].filter(Boolean).join(", "),
-      linkedin: p.linkedin_url,
-      email: p.email,
-      website: p.organization?.website_url,
+      linkedin: p.linkedin_url, email: p.email,
     }));
-
     res.json(people);
   } catch (err) {
     console.error("[/apollo/search]", err.response?.status, err.message);
-    res.status(err.response?.status || 500).json({
-      error: err.response?.data?.error || err.message,
-    });
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.error || err.message });
   }
 });
 
-// ── Apollo enrich by LinkedIn URL: POST /apollo/match ───────────────────────
-// Body: { apolloKey, linkedinUrl, name, company }
+// ── Apollo enrich: POST /apollo/match ────────────────────────────────────────
 app.post("/apollo/match", async (req, res) => {
-  const { apolloKey, linkedinUrl, name, company } = req.body;
+  const { apolloKey, firstName, lastName, organizationName, domain, linkedinUrl } = req.body;
   if (!apolloKey) return res.status(400).json({ error: "apolloKey required" });
-
   try {
     const r = await axios.post(
       "https://api.apollo.io/api/v1/people/match",
-      { linkedin_url: linkedinUrl || undefined,
-        name: name || undefined,
-        organization_name: company || undefined,
-      },
+      { first_name: firstName, last_name: lastName, organization_name: organizationName, domain, linkedin_url: linkedinUrl },
       { headers: { "Content-Type": "application/json", "X-Api-Key": apolloKey }, timeout: 15000 }
     );
     const p = r.data?.person;
     if (!p) return res.json(null);
-
     res.json({
-      id: p.id,
-      name: p.name,
-      firstName: p.first_name,
-      lastName: p.last_name,
-      title: p.title,
-      company: p.organization_name || p.organization?.name,
+      id: p.id, name: p.name, firstName: p.first_name, lastName: p.last_name,
+      title: p.title, company: p.organization_name || p.organization?.name,
+      companyWebsite: p.organization?.website_url,
+      companyLinkedin: p.organization?.linkedin_url,
+      companyDescription: (p.organization?.short_description || "").slice(0, 150),
       location: [p.city, p.country].filter(Boolean).join(", "),
-      linkedin: p.linkedin_url,
-      email: p.email,
+      linkedin: p.linkedin_url, email: p.email,
     });
   } catch (err) {
     console.error("[/apollo/match]", err.response?.status, err.message);
-    res.status(err.response?.status || 500).json({
-      error: err.response?.data?.error || err.message,
-    });
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.error || err.message });
   }
 });
 
-// ── Health check ─────────────────────────────────────────────────────────────
-// POST /heyreach/proxy — generic HeyReach REST proxy
-// Body: { hrKey, path, payload }
+// ── HeyReach proxy: POST /heyreach/proxy ─────────────────────────────────────
 app.post("/heyreach/proxy", async (req, res) => {
   const { hrKey, path, payload } = req.body;
   if (!hrKey || !path) return res.status(400).json({ error: "hrKey and path required" });
@@ -111,7 +97,133 @@ app.post("/heyreach/proxy", async (req, res) => {
   }
 });
 
-app.get("/health", (_, res) => res.json({ ok: true }));
+// ── Notion: GET /notion/db-schema ────────────────────────────────────────────
+// Returns property names + types for both CRM databases
+app.get("/notion/db-schema", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+  try {
+    const [companies, people] = await Promise.all([
+      axios.get(`https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}`, { headers: notionHeaders() }),
+      axios.get(`https://api.notion.com/v1/databases/${NOTION_PEOPLE_DB}`, { headers: notionHeaders() }),
+    ]);
+    const extract = (db) => Object.entries(db.data.properties).map(([name, prop]) => ({ name, type: prop.type }));
+    res.json({ companies: extract(companies), people: extract(people) });
+  } catch (err) {
+    console.error("[/notion/db-schema]", err.response?.status, err.message);
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+// ── Notion: POST /notion/upsert-lead ─────────────────────────────────────────
+// Upserts lead into CRM Companies + CRM People (with relation)
+// Body: { firstName, lastName, title, company, companyWebsite, companyLinkedin,
+//         linkedin, email, location, campaign, status }
+app.post("/notion/upsert-lead", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+  const {
+    firstName, lastName, title, company, companyWebsite, companyLinkedin,
+    linkedin, email, location, campaign, status = "Connection Sent"
+  } = req.body;
+
+  try {
+    // 1. Find or create company in CRM Companies
+    let companyPageId = null;
+    if (company) {
+      const searchCompany = await axios.post(
+        `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+        { filter: { property: "Name", title: { equals: company } }, page_size: 1 },
+        { headers: notionHeaders() }
+      );
+      if (searchCompany.data.results.length > 0) {
+        companyPageId = searchCompany.data.results[0].id;
+      } else {
+        const companyProps = {
+          "Name": { title: [{ text: { content: company } }] },
+          "Status": { status: { name: status } },
+        };
+        if (companyWebsite) companyProps["Website"] = { url: companyWebsite };
+        if (companyLinkedin) companyProps["LinkedIn"] = { url: companyLinkedin };
+        if (campaign) companyProps["Campaign"] = { rich_text: [{ text: { content: campaign } }] };
+        const newCompany = await axios.post(
+          "https://api.notion.com/v1/pages",
+          { parent: { database_id: NOTION_COMPANIES_DB }, properties: companyProps },
+          { headers: notionHeaders() }
+        );
+        companyPageId = newCompany.data.id;
+      }
+    }
+
+    // 2. Find or create person in CRM People
+    const fullName = [firstName, lastName].filter(Boolean).join(" ");
+    const personProps = {
+      "Name": { title: [{ text: { content: fullName } }] },
+    };
+    if (title) personProps["Position"] = { rich_text: [{ text: { content: title } }] };
+    if (linkedin) personProps["LinkedIn"] = { url: linkedin };
+    if (email) personProps["Email"] = { email: email };
+    if (location) personProps["Location"] = { rich_text: [{ text: { content: location } }] };
+    if (companyPageId) personProps["Company"] = { relation: [{ id: companyPageId }] };
+
+    const searchPerson = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_PEOPLE_DB}/query`,
+      { filter: { property: "Name", title: { equals: fullName } }, page_size: 1 },
+      { headers: notionHeaders() }
+    );
+
+    let personPageId = null;
+    if (searchPerson.data.results.length > 0) {
+      personPageId = searchPerson.data.results[0].id;
+      await axios.patch(
+        `https://api.notion.com/v1/pages/${personPageId}`,
+        { properties: personProps },
+        { headers: notionHeaders() }
+      );
+    } else {
+      const newPerson = await axios.post(
+        "https://api.notion.com/v1/pages",
+        { parent: { database_id: NOTION_PEOPLE_DB }, properties: personProps },
+        { headers: notionHeaders() }
+      );
+      personPageId = newPerson.data.id;
+    }
+
+    res.json({ ok: true, companyPageId, personPageId });
+  } catch (err) {
+    console.error("[/notion/upsert-lead]", err.response?.status, JSON.stringify(err.response?.data));
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+// ── Notion: POST /notion/update-status ───────────────────────────────────────
+// Updates Status field on CRM Companies record by company name
+// Body: { company, status }
+// Valid statuses: "Connection Sent", "Initial Discussion"
+app.post("/notion/update-status", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+  const { company, status } = req.body;
+  if (!company || !status) return res.status(400).json({ error: "company and status required" });
+  try {
+    const search = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+      { filter: { property: "Name", title: { equals: company } }, page_size: 1 },
+      { headers: notionHeaders() }
+    );
+    if (search.data.results.length === 0) return res.status(404).json({ error: "Company not found in CRM" });
+    const pageId = search.data.results[0].id;
+    await axios.patch(
+      `https://api.notion.com/v1/pages/${pageId}`,
+      { properties: { "Status": { status: { name: status } } } },
+      { headers: notionHeaders() }
+    );
+    res.json({ ok: true, pageId });
+  } catch (err) {
+    console.error("[/notion/update-status]", err.response?.status, err.message);
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+// ── Health ────────────────────────────────────────────────────────────────────
+app.get("/health", (_, res) => res.json({ ok: true, notion: !!NOTION_TOKEN }));
 app.get("/", (_, res) => res.json({ service: "outreach-proxy", status: "ok" }));
 
 const PORT = process.env.PORT || 3000;

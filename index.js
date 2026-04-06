@@ -461,6 +461,78 @@ app.post("/parallel/insight/start", async (req, res) => {
   }
 });
 
+
+// ── HeyReach Webhooks → Notion ────────────────────────────────────────────────
+// Receives CONNECTION_REQUEST_ACCEPTED and MESSAGE_REPLY_RECEIVED events
+// and updates Stage in Notion CRM Companies accordingly
+//
+// HeyReach webhook payload shape (both events):
+// {
+//   eventType: "CONNECTION_REQUEST_ACCEPTED" | "MESSAGE_REPLY_RECEIVED",
+//   campaignId: 123456,
+//   lead: {
+//     firstName, lastName, companyName, profileUrl, emailAddress, position
+//   }
+// }
+app.post("/webhook/heyreach", async (req, res) => {
+  // Always return 200 immediately so HeyReach doesn't retry
+  res.json({ ok: true });
+
+  const { eventType, lead, campaignId } = req.body || {};
+  if (!eventType || !lead) return;
+
+  const company = lead.companyName;
+  if (!company) return;
+
+  console.log(`[webhook] ${eventType} — ${lead.firstName} ${lead.lastName} @ ${company}`);
+
+  try {
+    let newStatus = null;
+
+    if (eventType === "CONNECTION_REQUEST_ACCEPTED") {
+      newStatus = "Initial Discussion";
+    } else if (eventType === "MESSAGE_REPLY_RECEIVED") {
+      newStatus = "Initial Discussion";
+    }
+
+    if (!newStatus || !NOTION_TOKEN) return;
+
+    // Find company in CRM Companies and update Stage
+    const search = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+      { filter: { property: "Company name", title: { equals: company } }, page_size: 1 },
+      { headers: notionHeaders() }
+    );
+
+    if (search.data.results.length === 0) {
+      console.log(`[webhook] Company not found in Notion: ${company}`);
+      return;
+    }
+
+    const pageId = search.data.results[0].id;
+    await axios.patch(
+      `https://api.notion.com/v1/pages/${pageId}`,
+      { properties: { "Stage": { status: { name: newStatus } } } },
+      { headers: notionHeaders() }
+    );
+
+    // Also update Notes with event info
+    const note = eventType === "CONNECTION_REQUEST_ACCEPTED"
+      ? `✅ Connection accepted by ${lead.firstName} ${lead.lastName} (Campaign ID: ${campaignId})`
+      : `💬 Reply received from ${lead.firstName} ${lead.lastName} (Campaign ID: ${campaignId})`;
+
+    await axios.patch(
+      `https://api.notion.com/v1/pages/${pageId}`,
+      { properties: { "Notes": { rich_text: [{ text: { content: note } }] } } },
+      { headers: notionHeaders() }
+    );
+
+    console.log(`[webhook] Notion updated: ${company} → ${newStatus}`);
+  } catch (err) {
+    console.error("[webhook] Notion update failed:", err.response?.data?.message || err.message);
+  }
+});
+
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({ ok: true, notion: !!NOTION_TOKEN, parallel: !!PARALLEL_KEY }));
 app.get("/", (_, res) => res.json({ service: "outreach-proxy", status: "ok" }));

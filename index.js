@@ -344,18 +344,35 @@ app.post("/parallel/research/start", async (req, res) => {
 
 // ── Parallel: GET /parallel/result/:taskId ───────────────────────────────────
 // Poll result of any Parallel task. Call until done=true.
+// When done=true, fetches outputs automatically.
 app.get("/parallel/result/:taskId", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
+  const { taskId } = req.params;
   try {
     const r = await axios.get(
-      `https://api.parallel.ai/v1/tasks/runs/${req.params.taskId}`,
+      `https://api.parallel.ai/v1/tasks/runs/${taskId}`,
       { headers: parallelHeaders(), timeout: 15000 }
     );
     const status = r.data?.status;
     const done = status === "completed" || status === "succeeded";
     const failed = status === "failed" || status === "error";
-    res.json({ ok: true, taskId: req.params.taskId, status, done, failed,
-      output: done ? (r.data.output || r.data.result || r.data) : null });
+
+    let output = null;
+    if (done) {
+      // Fetch outputs from dedicated endpoint
+      try {
+        const outRes = await axios.get(
+          `https://api.parallel.ai/v1/tasks/runs/${taskId}/outputs`,
+          { headers: parallelHeaders(), timeout: 15000 }
+        );
+        output = outRes.data;
+      } catch {
+        // Fallback: output may be inline
+        output = r.data.output || r.data.result || r.data;
+      }
+    }
+
+    res.json({ ok: true, taskId, status, done, failed, output });
   } catch (err) {
     console.error("[/parallel/result]", err.response?.status, err.message);
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });

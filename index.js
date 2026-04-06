@@ -533,6 +533,109 @@ app.post("/webhook/heyreach", async (req, res) => {
   }
 });
 
+
+// ── Parallel: POST /parallel/score ───────────────────────────────────────────
+// Two-tier scoring: runs lite for all, then base only for P1 (score >= 7.5)
+// Body: { company, domain, clientScore? }
+// clientScore: pre-calculated weighted score (optional). If provided and >= 7.5,
+// skips lite and goes straight to base.
+// Returns: { taskId, tier, company } immediately (async)
+app.post("/parallel/score", async (req, res) => {
+  if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
+  const { company, domain, clientScore } = req.body;
+  if (!company) return res.status(400).json({ error: "company required" });
+
+  // If score already provided and is P1 — go straight to base
+  const processor = (clientScore !== undefined && clientScore >= 7.5) ? "base" : "lite";
+  const tier = processor === "base" ? "P1-deep" : "P2-quick";
+
+  try {
+    const r = await axios.post(
+      "https://api.parallel.ai/v1/tasks/runs",
+      {
+        input: buildResearchQuery(company, domain),
+        processor,
+        task_spec: {
+          output_schema: {
+            type: "json",
+            json_schema: {
+              type: "object",
+              properties: {
+                axis1_xborder_core: { type: "string" },
+                axis2_ramp: { type: "string" },
+                axis3_stablecoin_alignment: { type: "string" },
+                axis4_corridors: { type: "string" },
+                axis5_network_role: { type: "string" },
+                axis6_licenses: { type: "string" },
+                axis7_b2b_scale: { type: "string" },
+                axis8_competitive: { type: "string" },
+                hard_kill: { type: "string" },
+                strategic_signal: { type: "string" },
+                sources: { type: "array", items: { type: "string" } }
+              }
+            }
+          }
+        }
+      },
+      { headers: parallelHeaders(), timeout: 15000 }
+    );
+    const taskId = r.data?.run_id || r.data?.id;
+    if (!taskId) return res.status(500).json({ error: "No task ID", raw: r.data });
+    res.json({ ok: true, taskId, company, processor, tier, status: r.data?.status });
+  } catch (err) {
+    console.error("[/parallel/score]", err.response?.status, err.message);
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+// ── Parallel: POST /parallel/upgrade ─────────────────────────────────────────
+// Upgrades a P1 lead from lite to base research after initial scoring confirms P1
+// Body: { company, domain }
+app.post("/parallel/upgrade", async (req, res) => {
+  if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
+  const { company, domain } = req.body;
+  if (!company) return res.status(400).json({ error: "company required" });
+
+  try {
+    const r = await axios.post(
+      "https://api.parallel.ai/v1/tasks/runs",
+      {
+        input: buildResearchQuery(company, domain),
+        processor: "base",
+        task_spec: {
+          output_schema: {
+            type: "json",
+            json_schema: {
+              type: "object",
+              properties: {
+                axis1_xborder_core: { type: "string" },
+                axis2_ramp: { type: "string" },
+                axis3_stablecoin_alignment: { type: "string" },
+                axis4_corridors: { type: "string" },
+                axis5_network_role: { type: "string" },
+                axis6_licenses: { type: "string" },
+                axis7_b2b_scale: { type: "string" },
+                axis8_competitive: { type: "string" },
+                hard_kill: { type: "string" },
+                strategic_signal: { type: "string" },
+                outreach_insight: { type: "string" },
+                sources: { type: "array", items: { type: "string" } }
+              }
+            }
+          }
+        }
+      },
+      { headers: parallelHeaders(), timeout: 15000 }
+    );
+    const taskId = r.data?.run_id || r.data?.id;
+    if (!taskId) return res.status(500).json({ error: "No task ID" });
+    res.json({ ok: true, taskId, company, processor: "base", tier: "P1-deep", status: r.data?.status });
+  } catch (err) {
+    console.error("[/parallel/upgrade]", err.response?.status, err.message);
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({ ok: true, notion: !!NOTION_TOKEN, parallel: !!PARALLEL_KEY }));
 app.get("/", (_, res) => res.json({ service: "outreach-proxy", status: "ok" }));

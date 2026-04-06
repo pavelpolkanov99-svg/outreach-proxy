@@ -308,15 +308,29 @@ function parallelHeaders() {
 // ── Parallel helpers ─────────────────────────────────────────────────────────
 function buildResearchQuery(company, domain) {
   return [
-    `Research the company "${company}"${domain ? ` (${domain})` : ""} for B2B fintech partnership qualification.`,
-    `Find and summarize:`,
-    `1. Recent funding rounds or M&A activity (last 12 months)`,
-    `2. Active job postings related to: payments, cross-border transfers, stablecoins, treasury, compliance`,
-    `3. Any public statements, press releases, or news about stablecoin adoption, crypto payments, or USDC/USDT usage`,
-    `4. Their core business model — do they move money cross-border for businesses?`,
-    `5. Regulatory licenses mentioned (EMI, PI, MSB, VASP, MiCA, PSD2)`,
-    `6. Geographic corridors they operate in`,
-    `Return a structured summary with sections: funding, hiring_signals, stablecoin_signals, business_model, licenses, corridors, sources`,
+    `You are a B2B fintech analyst qualifying "${company}"${domain ? ` (${domain})` : ""} as a potential client or partner for RemiDe — a Stablecoin Clearing Network for licensed financial institutions.`,
+    `RemiDe enables compliant cross-border stablecoin settlements (USDC/USDT/EURC) between licensed FIs.`,
+    `Research this company and answer ONLY the following scoring questions. For each, provide a factual answer with source URL. If not found, say NOT FOUND.`,
+
+    `AXIS 1 — Cross-Border Payments Core: Does this company process cross-border B2B payments as a core business? Any volume or corridor data?`,
+
+    `AXIS 2 — On/Off Ramp: Do they convert between fiat and stablecoins/crypto? Any USDC/USDT/EURC ramp infrastructure?`,
+
+    `AXIS 3 — Stablecoin Alignment: Any public stablecoin activity in last 12 months? Pilots, integrations, announcements, partnerships with Circle/Tether/Paxos?`,
+
+    `AXIS 4 — Corridors: Which geographic corridors do they operate in? (e.g. EU→APAC, US→LATAM, etc.)`,
+
+    `AXIS 5 — Network Role: Are they likely an Originating FI (sends payments), Destination FI (receives), or Beneficiary FI (both)?`,
+
+    `AXIS 6 — Regulatory Licenses: What licenses do they hold? (EMI, PI, MSB, VASP, MiCA CASP, PSD2, banking license, etc.) Which jurisdictions?`,
+
+    `AXIS 7 — B2B Scale: Do they serve businesses (not retail)? Any employee count, revenue, or transaction volume signals?`,
+
+    `AXIS 8 — Competitive Proximity: Are they a potential competitor to RemiDe (building their own stablecoin clearing)? Or clearly a client/partner?`,
+
+    `HARD KILL CHECK: Is this company ONLY doing: RWA tokenization, DeFi without KYC, custody/trading only, consulting, payroll, retail on-ramp widget, or compliance SaaS? If yes, say HARD KILL and why.`,
+
+    `STRATEGIC SIGNAL: Any recent signal (last 12 months) suggesting urgency — new funding, hiring payments/crypto roles, regulatory approval, expansion announcement?`,
   ].join(" ");
 }
 
@@ -339,12 +353,16 @@ app.post("/parallel/research/start", async (req, res) => {
             json_schema: {
               type: "object",
               properties: {
-                funding: { type: "string" },
-                hiring_signals: { type: "string" },
-                stablecoin_signals: { type: "string" },
-                business_model: { type: "string" },
-                licenses: { type: "string" },
-                corridors: { type: "string" },
+                axis1_xborder_core: { type: "string" },
+                axis2_ramp: { type: "string" },
+                axis3_stablecoin_alignment: { type: "string" },
+                axis4_corridors: { type: "string" },
+                axis5_network_role: { type: "string" },
+                axis6_licenses: { type: "string" },
+                axis7_b2b_scale: { type: "string" },
+                axis8_competitive: { type: "string" },
+                hard_kill: { type: "string" },
+                strategic_signal: { type: "string" },
                 sources: { type: "array", items: { type: "string" } }
               }
             }

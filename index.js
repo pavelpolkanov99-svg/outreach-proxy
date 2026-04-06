@@ -330,7 +330,27 @@ app.post("/parallel/research/start", async (req, res) => {
   try {
     const r = await axios.post(
       "https://api.parallel.ai/v1/tasks/runs",
-      { input: buildResearchQuery(company, domain), processor },
+      {
+        input: buildResearchQuery(company, domain),
+        processor,
+        task_spec: {
+          output_schema: {
+            type: "json",
+            json_schema: {
+              type: "object",
+              properties: {
+                funding: { type: "string" },
+                hiring_signals: { type: "string" },
+                stablecoin_signals: { type: "string" },
+                business_model: { type: "string" },
+                licenses: { type: "string" },
+                corridors: { type: "string" },
+                sources: { type: "array", items: { type: "string" } }
+              }
+            }
+          }
+        }
+      },
       { headers: parallelHeaders(), timeout: 15000 }
     );
     const taskId = r.data?.run_id || r.data?.id;
@@ -349,26 +369,26 @@ app.get("/parallel/result/:taskId", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
   const { taskId } = req.params;
   try {
-    const r = await axios.get(
+    // Get status
+    const statusRes = await axios.get(
       `https://api.parallel.ai/v1/tasks/runs/${taskId}`,
       { headers: parallelHeaders(), timeout: 15000 }
     );
-    const status = r.data?.status;
+    const status = statusRes.data?.status;
     const done = status === "completed" || status === "succeeded";
     const failed = status === "failed" || status === "error";
 
     let output = null;
     if (done) {
-      // Fetch outputs from dedicated endpoint
+      // Fetch result from /result endpoint
       try {
-        const outRes = await axios.get(
-          `https://api.parallel.ai/v1/tasks/runs/${taskId}/outputs`,
+        const resultRes = await axios.get(
+          `https://api.parallel.ai/v1/tasks/runs/${taskId}/result`,
           { headers: parallelHeaders(), timeout: 15000 }
         );
-        output = outRes.data;
+        output = resultRes.data;
       } catch {
-        // Fallback: output may be inline
-        output = r.data.output || r.data.result || r.data;
+        output = statusRes.data;
       }
     }
 

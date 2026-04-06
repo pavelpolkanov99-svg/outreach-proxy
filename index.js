@@ -305,17 +305,9 @@ function parallelHeaders() {
   };
 }
 
-// ── Parallel: POST /parallel/research ────────────────────────────────────────
-// Deep research on a company for BD scoring context
-// Body: { company, domain?, processor? }
-// processor: "lite" | "base" | "core" | "ultra" (default: "base")
-// Returns: funding signals, job postings, stablecoin mentions, news, ICP signals
-app.post("/parallel/research", async (req, res) => {
-  if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
-  const { company, domain, processor = "base" } = req.body;
-  if (!company) return res.status(400).json({ error: "company required" });
-
-  const query = [
+// ── Parallel helpers ─────────────────────────────────────────────────────────
+function buildResearchQuery(company, domain) {
+  return [
     `Research the company "${company}"${domain ? ` (${domain})` : ""} for B2B fintech partnership qualification.`,
     `Find and summarize:`,
     `1. Recent funding rounds or M&A activity (last 12 months)`,
@@ -324,107 +316,77 @@ app.post("/parallel/research", async (req, res) => {
     `4. Their core business model — do they move money cross-border for businesses?`,
     `5. Regulatory licenses mentioned (EMI, PI, MSB, VASP, MiCA, PSD2)`,
     `6. Geographic corridors they operate in`,
-    `Return structured JSON with keys: funding, hiring_signals, stablecoin_signals, business_model, licenses, corridors, sources`,
+    `Return a structured summary with sections: funding, hiring_signals, stablecoin_signals, business_model, licenses, corridors, sources`,
   ].join(" ");
+}
 
+// ── Parallel: POST /parallel/research/start ──────────────────────────────────
+// Starts async research task. Returns taskId immediately (no timeout issues).
+// Body: { company, domain?, processor? }  processor default: "lite"
+app.post("/parallel/research/start", async (req, res) => {
+  if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
+  const { company, domain, processor = "lite" } = req.body;
+  if (!company) return res.status(400).json({ error: "company required" });
   try {
-    // Create task
-    const createRes = await axios.post(
+    const r = await axios.post(
       "https://api.parallel.ai/v1/tasks/runs",
-      { input: query, processor },
-      { headers: parallelHeaders(), timeout: 10000 }
+      { input: buildResearchQuery(company, domain), processor },
+      { headers: parallelHeaders(), timeout: 15000 }
     );
-
-    const taskId = createRes.data?.run_id || createRes.data?.id;
-    if (!taskId) return res.status(500).json({ error: "No task ID returned", raw: createRes.data });
-
-    // Poll for result (max 60 seconds)
-    let result = null;
-    for (let i = 0; i < 20; i++) {
-      await new Promise(r => setTimeout(r, 3000));
-      const pollRes = await axios.get(
-        `https://api.parallel.ai/v1/tasks/runs/${taskId}`,
-        { headers: parallelHeaders(), timeout: 10000 }
-      );
-      const status = pollRes.data?.status;
-      if (status === "completed" || status === "succeeded") {
-        result = pollRes.data;
-        break;
-      }
-      if (status === "failed" || status === "error") {
-        return res.status(500).json({ error: "Parallel task failed", raw: pollRes.data });
-      }
-    }
-
-    if (!result) return res.status(504).json({ error: "Parallel task timed out (60s)" });
-
-    res.json({
-      ok: true,
-      company,
-      taskId,
-      processor,
-      output: result.output || result.result || result,
-    });
+    const taskId = r.data?.run_id || r.data?.id;
+    if (!taskId) return res.status(500).json({ error: "No task ID", raw: r.data });
+    res.json({ ok: true, taskId, company, processor, status: r.data?.status });
   } catch (err) {
-    console.error("[/parallel/research]", err.response?.status, err.message);
+    console.error("[/parallel/research/start]", err.response?.status, err.message);
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
   }
 });
 
-// ── Parallel: POST /parallel/enrich-insight ──────────────────────────────────
-// Quick search for outreach personalization insight
+// ── Parallel: GET /parallel/result/:taskId ───────────────────────────────────
+// Poll result of any Parallel task. Call until done=true.
+app.get("/parallel/result/:taskId", async (req, res) => {
+  if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
+  try {
+    const r = await axios.get(
+      `https://api.parallel.ai/v1/tasks/runs/${req.params.taskId}`,
+      { headers: parallelHeaders(), timeout: 15000 }
+    );
+    const status = r.data?.status;
+    const done = status === "completed" || status === "succeeded";
+    const failed = status === "failed" || status === "error";
+    res.json({ ok: true, taskId: req.params.taskId, status, done, failed,
+      output: done ? (r.data.output || r.data.result || r.data) : null });
+  } catch (err) {
+    console.error("[/parallel/result]", err.response?.status, err.message);
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+// ── Parallel: POST /parallel/insight/start ───────────────────────────────────
+// Quick outreach personalization insight. Async, returns taskId immediately.
 // Body: { company, person?, topic? }
-// Returns: recent news/signal suitable for personalized outreach note
-app.post("/parallel/enrich-insight", async (req, res) => {
+app.post("/parallel/insight/start", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
   const { company, person, topic } = req.body;
   if (!company) return res.status(400).json({ error: "company required" });
-
   const query = [
-    `Find 1-2 recent and specific facts about "${company}"`,
+    `Find 1-2 recent specific facts about "${company}"`,
     person ? `or their employee "${person}"` : "",
-    `that would be relevant for a personalized B2B outreach message from a stablecoin payments company.`,
+    `relevant for a personalized B2B outreach from a stablecoin payments company.`,
     topic ? `Focus on: ${topic}.` : `Focus on: recent product launches, funding, expansion, payments strategy, stablecoin activity.`,
-    `Return a single short sentence (max 20 words) that could be used as a conversation opener. Be specific, not generic.`,
+    `Return one short sentence (max 20 words) usable as a conversation opener. Be specific, not generic.`,
   ].filter(Boolean).join(" ");
-
   try {
-    const createRes = await axios.post(
+    const r = await axios.post(
       "https://api.parallel.ai/v1/tasks/runs",
       { input: query, processor: "lite" },
-      { headers: parallelHeaders(), timeout: 10000 }
+      { headers: parallelHeaders(), timeout: 15000 }
     );
-
-    const taskId = createRes.data?.run_id || createRes.data?.id;
-    if (!taskId) return res.status(500).json({ error: "No task ID returned" });
-
-    // Poll max 30 seconds for quick insight
-    let result = null;
-    for (let i = 0; i < 10; i++) {
-      await new Promise(r => setTimeout(r, 3000));
-      const pollRes = await axios.get(
-        `https://api.parallel.ai/v1/tasks/runs/${taskId}`,
-        { headers: parallelHeaders(), timeout: 10000 }
-      );
-      const status = pollRes.data?.status;
-      if (status === "completed" || status === "succeeded") {
-        result = pollRes.data;
-        break;
-      }
-      if (status === "failed" || status === "error") {
-        return res.status(500).json({ error: "Parallel task failed" });
-      }
-    }
-
-    if (!result) return res.status(504).json({ error: "Timeout" });
-
-    res.json({
-      ok: true,
-      company,
-      insight: result.output || result.result || result,
-    });
+    const taskId = r.data?.run_id || r.data?.id;
+    if (!taskId) return res.status(500).json({ error: "No task ID" });
+    res.json({ ok: true, taskId, company, status: r.data?.status });
   } catch (err) {
-    console.error("[/parallel/enrich-insight]", err.response?.status, err.message);
+    console.error("[/parallel/insight/start]", err.response?.status, err.message);
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
   }
 });

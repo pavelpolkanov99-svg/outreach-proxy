@@ -335,7 +335,7 @@ app.post("/parallel/research", async (req, res) => {
       { headers: parallelHeaders(), timeout: 10000 }
     );
 
-    const taskId = createRes.data?.id;
+    const taskId = createRes.data?.run_id || createRes.data?.id;
     if (!taskId) return res.status(500).json({ error: "No task ID returned", raw: createRes.data });
 
     // Poll for result (max 60 seconds)
@@ -395,7 +395,7 @@ app.post("/parallel/enrich-insight", async (req, res) => {
       { headers: parallelHeaders(), timeout: 10000 }
     );
 
-    const taskId = createRes.data?.id;
+    const taskId = createRes.data?.run_id || createRes.data?.id;
     if (!taskId) return res.status(500).json({ error: "No task ID returned" });
 
     // Poll max 30 seconds for quick insight

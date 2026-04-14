@@ -260,7 +260,6 @@ app.post("/notion/update-tags", async (req, res) => {
 });
 
 // ── Notion: POST /notion/search-company ──────────────────────────────────────
-// Used by Beeper sync — finds company in Notion CRM by name (exact then contains)
 app.post("/notion/search-company", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   const { name } = req.body;
@@ -286,6 +285,98 @@ app.post("/notion/search-company", async (req, res) => {
       name: page.properties["Company name"]?.title?.[0]?.text?.content || name,
       stage: page.properties["Stage"]?.status?.name,
     });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+// ── Notion: POST /notion/append-note ─────────────────────────────────────────
+// Appends a timestamped note to the Notes field of a company or person page.
+// Finds the page by name (exact match, then contains fallback for companies).
+// Body: { name, note, db? }
+//   name  — company name (db=companies) or person name (db=people)
+//   note  — text to append
+//   db    — "companies" (default) | "people"
+//
+// Behaviour:
+//   1. Finds the page in the target DB
+//   2. Reads the existing Notes rich_text value
+//   3. Appends "\n---\n{note}" to the existing content (preserves history)
+//   4. Writes the combined text back (Notion rich_text max 2000 chars — we truncate from the front if needed)
+app.post("/notion/append-note", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+  const { name, note, db = "companies" } = req.body;
+  if (!name || !note) return res.status(400).json({ error: "name and note required" });
+
+  const dbId = db === "companies" ? NOTION_COMPANIES_DB : NOTION_PEOPLE_DB;
+  const titleField = db === "companies" ? "Company name" : "Name";
+
+  try {
+    // 1. Find page — exact match first, then contains fallback (companies only)
+    let search = await axios.post(
+      `https://api.notion.com/v1/databases/${dbId}/query`,
+      { filter: { property: titleField, title: { equals: name } }, page_size: 1 },
+      { headers: notionHeaders() }
+    );
+    if (search.data.results.length === 0 && db === "companies") {
+      search = await axios.post(
+        `https://api.notion.com/v1/databases/${dbId}/query`,
+        { filter: { property: titleField, title: { contains: name.split(" ")[0] } }, page_size: 1 },
+        { headers: notionHeaders() }
+      );
+    }
+    if (search.data.results.length === 0) {
+      return res.status(404).json({ error: `${name} not found in ${db} DB` });
+    }
+
+    const page = search.data.results[0];
+    const pageId = page.id;
+    const resolvedName = page.properties[titleField]?.title?.[0]?.text?.content || name;
+
+    // 2. Read existing Notes value
+    const existing = (page.properties?.Notes?.rich_text || [])
+      .map(rt => rt.plain_text || rt.text?.content || "")
+      .join("");
+
+    // 3. Build combined text — separator between old and new
+    const separator = existing ? "\n---\n" : "";
+    let combined = existing + separator + note;
+
+    // 4. Notion rich_text property max = 2000 chars — trim from the front if over
+    if (combined.length > 2000) {
+      combined = combined.slice(combined.length - 2000);
+    }
+
+    // 5. Write back
+    await axios.patch(
+      `https://api.notion.com/v1/pages/${pageId}`,
+      { properties: { "Notes": { rich_text: [{ text: { content: combined } }] } } },
+      { headers: notionHeaders() }
+    );
+
+    res.json({ ok: true, pageId, resolvedName, noteLength: note.length, totalLength: combined.length });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+// ── Notion: POST /notion/query ────────────────────────────────────────────────
+// Generic DB query — used by email sync (Sinker) and other internal tools.
+// Body: { db_id, filter?, sorts?, page_size? }
+app.post("/notion/query", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+  const { db_id, filter, sorts, page_size = 20 } = req.body;
+  if (!db_id) return res.status(400).json({ error: "db_id required" });
+  try {
+    const payload = { page_size };
+    if (filter) payload.filter = filter;
+    if (sorts) payload.sorts = sorts;
+    const r = await axios.post(
+      `https://api.notion.com/v1/databases/${db_id}/query`,
+      payload,
+      { headers: notionHeaders() }
+    );
+    res.json(r.data);
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
   }
@@ -481,22 +572,6 @@ app.post("/webhook/heyreach", async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 // BEEPER INTEGRATION
 // ══════════════════════════════════════════════════════════════════════════════
-// Env vars required:
-//   BEEPER_URL   — ngrok tunnel to localhost:23373 (https://xxx.ngrok.io)
-//   BEEPER_TOKEN — token from Beeper Settings → Developers → Approved connections
-//
-// Supported networks: whatsapp, telegram, linkedin
-//
-// Endpoints:
-//   GET  /beeper/health           — проверка соединения
-//   GET  /beeper/chats            — список чатов (?network=whatsapp|telegram|linkedin)
-//   GET  /beeper/messages         — сообщения чата (?chatId=..., ?limit=20)
-//   POST /beeper/send             — отправить сообщение { chatId, text }
-//   POST /beeper/search           — поиск по истории { query }
-//   POST /beeper/sync-chats       — синк групп WA+TG → Notion CRM по company name
-//   POST /beeper/sync-linkedin    — синк LinkedIn DM → Notion People (по имени контакта)
-// ══════════════════════════════════════════════════════════════════════════════
-
 const BEEPER_URL = process.env.BEEPER_URL || "http://localhost:23373";
 const BEEPER_TOKEN = process.env.BEEPER_TOKEN;
 
@@ -508,19 +583,16 @@ function beeperHeaders() {
   };
 }
 
-// Fuzzy match: chatName contains significant word from targetName
 function fuzzyMatch(chatName, targetName) {
   if (!chatName || !targetName) return false;
   const chat = chatName.toLowerCase().trim();
   const target = targetName.toLowerCase().trim();
   if (chat === target) return true;
   if (chat.includes(target) || target.includes(chat)) return true;
-  // Word overlap: any significant word (>3 chars)
   const words = target.split(/[\s,.|&-]+/).filter(w => w.length > 3);
   return words.some(w => chat.includes(w));
 }
 
-// Format messages for Notion Notes
 function formatMessages(items, limit = 10) {
   return (items || [])
     .slice(0, limit)
@@ -535,7 +607,6 @@ function formatMessages(items, limit = 10) {
     .join("\n");
 }
 
-// GET /beeper/health
 app.get("/beeper/health", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   try {
@@ -546,8 +617,6 @@ app.get("/beeper/health", async (req, res) => {
   }
 });
 
-// GET /beeper/chats?network=whatsapp&limit=50
-// network: whatsapp | telegram | linkedin | (empty = all)
 app.get("/beeper/chats", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   const { network, limit = 50 } = req.query;
@@ -560,7 +629,7 @@ app.get("/beeper/chats", async (req, res) => {
       chats: items.map(c => ({
         id: c.id,
         name: c.title,
-        type: c.type,          // single | group
+        type: c.type,
         network: c.accountID,
         participants: c.participants?.items?.length || 0,
       }))
@@ -570,7 +639,6 @@ app.get("/beeper/chats", async (req, res) => {
   }
 });
 
-// GET /beeper/messages?chatId=...&limit=20
 app.get("/beeper/messages", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   const { chatId, limit = 20 } = req.query;
@@ -592,7 +660,6 @@ app.get("/beeper/messages", async (req, res) => {
   }
 });
 
-// POST /beeper/send  { chatId, text }
 app.post("/beeper/send", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   const { chatId, text } = req.body;
@@ -609,7 +676,6 @@ app.post("/beeper/send", async (req, res) => {
   }
 });
 
-// POST /beeper/search  { query }
 app.post("/beeper/search", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   const { query } = req.body;
@@ -625,24 +691,16 @@ app.post("/beeper/search", async (req, res) => {
   }
 });
 
-// POST /beeper/sync-chats
-// Syncs WA + Telegram GROUP chats → Notion CRM Companies
-// Body: { networks: ["whatsapp","telegram"], msgLimit: 10 }
 app.post("/beeper/sync-chats", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
-
   const { networks = ["whatsapp", "telegram"], msgLimit = 10 } = req.body;
-
   try {
-    // 1. Get all chats
     const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=100`, { headers: beeperHeaders(), timeout: 10000 });
     const groups = (chatsRes.data?.items || []).filter(c =>
       networks.some(n => c.accountID && c.accountID.includes(n)) && c.type === "group"
     );
     console.log(`[beeper/sync-chats] Found ${groups.length} groups (${networks.join(", ")})`);
-
-    // 2. Get all Notion companies
     const notionRes = await axios.post(
       `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
       { page_size: 100 },
@@ -653,20 +711,12 @@ app.post("/beeper/sync-chats", async (req, res) => {
       name: p.properties["Company name"]?.title?.[0]?.text?.content || "",
       stage: p.properties["Stage"]?.status?.name,
     })).filter(c => c.name);
-
-    // 3. Match and sync
     const results = [];
     for (const group of groups) {
       const chatName = group.title || "";
       const networkLabel = networks.find(n => group.accountID?.includes(n))?.toUpperCase() || "MSG";
       const match = companies.find(c => fuzzyMatch(chatName, c.name));
-
-      if (!match) {
-        results.push({ chat: chatName, network: networkLabel, status: "no_match" });
-        continue;
-      }
-
-      // Get last N messages
+      if (!match) { results.push({ chat: chatName, network: networkLabel, status: "no_match" }); continue; }
       let msgText = "";
       try {
         const msgsRes = await axios.get(
@@ -677,8 +727,6 @@ app.post("/beeper/sync-chats", async (req, res) => {
       } catch (e) {
         console.error(`[beeper/sync-chats] Messages fetch failed for ${chatName}:`, e.message);
       }
-
-      // Update Notion Notes
       const noteContent = `📱 ${networkLabel} Group: ${chatName}\n🕐 Synced: ${new Date().toLocaleDateString("en-GB")}\n\n${msgText}`;
       try {
         await axios.patch(
@@ -692,34 +740,22 @@ app.post("/beeper/sync-chats", async (req, res) => {
         results.push({ chat: chatName, network: networkLabel, company: match.name, status: "notion_error", error: e.message });
       }
     }
-
     const synced = results.filter(r => r.status === "synced").length;
     const noMatch = results.filter(r => r.status === "no_match").length;
     res.json({ ok: true, synced, noMatch, total: groups.length, results });
-
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.message });
   }
 });
 
-// POST /beeper/sync-linkedin
-// Syncs LinkedIn DM conversations → Notion CRM People (matches by contact name)
-// Body: { msgLimit: 10 }
 app.post("/beeper/sync-linkedin", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
-
   const { msgLimit = 10 } = req.body;
-
   try {
-    // 1. Get all LinkedIn chats (single = DM)
     const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=100`, { headers: beeperHeaders(), timeout: 10000 });
-    const liChats = (chatsRes.data?.items || []).filter(c =>
-      c.accountID === "linkedin" && c.type === "single"
-    );
+    const liChats = (chatsRes.data?.items || []).filter(c => c.accountID === "linkedin" && c.type === "single");
     console.log(`[beeper/sync-linkedin] Found ${liChats.length} LinkedIn DMs`);
-
-    // 2. Get all Notion people
     const notionRes = await axios.post(
       `https://api.notion.com/v1/databases/${NOTION_PEOPLE_DB}/query`,
       { page_size: 100 },
@@ -729,19 +765,11 @@ app.post("/beeper/sync-linkedin", async (req, res) => {
       id: p.id,
       name: p.properties["Name"]?.title?.[0]?.text?.content || "",
     })).filter(p => p.name);
-
-    // 3. Match by contact name and sync
     const results = [];
     for (const chat of liChats) {
       const chatName = chat.title || "";
       const match = people.find(p => fuzzyMatch(chatName, p.name));
-
-      if (!match) {
-        results.push({ chat: chatName, status: "no_match" });
-        continue;
-      }
-
-      // Get last N messages
+      if (!match) { results.push({ chat: chatName, status: "no_match" }); continue; }
       let msgText = "";
       try {
         const msgsRes = await axios.get(
@@ -752,8 +780,6 @@ app.post("/beeper/sync-linkedin", async (req, res) => {
       } catch (e) {
         console.error(`[beeper/sync-linkedin] Messages fetch failed for ${chatName}:`, e.message);
       }
-
-      // Update Notion People Notes
       const noteContent = `💼 LinkedIn DM: ${chatName}\n🕐 Synced: ${new Date().toLocaleDateString("en-GB")}\n\n${msgText}`;
       try {
         await axios.patch(
@@ -767,11 +793,9 @@ app.post("/beeper/sync-linkedin", async (req, res) => {
         results.push({ chat: chatName, person: match.name, status: "notion_error", error: e.message });
       }
     }
-
     const synced = results.filter(r => r.status === "synced").length;
     const noMatch = results.filter(r => r.status === "no_match").length;
     res.json({ ok: true, synced, noMatch, total: liChats.length, results });
-
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.message });
   }
@@ -784,7 +808,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper: !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.0", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.1", status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));

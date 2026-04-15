@@ -1009,6 +1009,132 @@ app.get("/beeper/mcp-tools", async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// BEEPER CONVENIENCE ENDPOINTS — для чтения прямо из Claude без curl
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /beeper/inbox?network=tg&limit=10
+// Последние N активных чатов с последним сообщением каждого
+app.get("/beeper/inbox", async (req, res) => {
+  if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
+  const { network = "all", limit = 10 } = req.query;
+  try {
+    const accountIDs = network === "tg" ? ["telegram"]
+      : network === "wa" ? null   // both WA accounts
+      : network === "li" ? ["linkedin"]
+      : undefined;
+
+    const rpcBody = {
+      jsonrpc: "2.0", id: Date.now(),
+      method: "tools/call",
+      params: {
+        name: "search_chats",
+        arguments: {
+          ...(accountIDs ? { accountIDs } : {}),
+          limit: parseInt(limit),
+          inbox: "primary",
+        }
+      }
+    };
+    const r = await axios.post(`${BEEPER_URL}/v0/mcp`, rpcBody, { headers: beeperMcpHeaders(), timeout: 15000, responseType: "text" });
+    const result = parseMcpSse(r.data);
+    const text = result?.content?.[0]?.text || "";
+
+    // Parse chat IDs from MCP text response
+    const chatMatches = [...text.matchAll(/chatID: ([^\s\)]+)/g)];
+    const chatIDs = chatMatches.map(m => m[1]);
+
+    // Fetch last message for each
+    const chats = await Promise.all(chatIDs.map(async chatID => {
+      const chatName = text.match(new RegExp(`## ([^\\n]+) \\(chatID: ${chatID.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))?.[1] || chatID;
+      let lastMsg = "";
+      try {
+        const msgRpc = {
+          jsonrpc: "2.0", id: Date.now(),
+          method: "tools/call",
+          params: { name: "list_messages", arguments: { chatID } }
+        };
+        const mr = await axios.post(`${BEEPER_URL}/v0/mcp`, msgRpc, { headers: beeperMcpHeaders(), timeout: 15000, responseType: "text" });
+        const msgResult = parseMcpSse(mr.data);
+        const msgText = msgResult?.content?.[0]?.text || "";
+        // Parse first item from JSON in text
+        try {
+          const parsed = JSON.parse(msgText);
+          const first = parsed.items?.[0];
+          if (first) {
+            const t = new Date(first.timestamp).toLocaleString("ru-RU");
+            const dir = first.isSender ? "→" : "←";
+            lastMsg = `[${t}] ${dir} ${first.senderName}: ${first.text || "[медиа]"}`;
+          }
+        } catch (_) {
+          lastMsg = msgText.slice(0, 100);
+        }
+      } catch (_) {}
+      return { chatID, chatName, lastMsg };
+    }));
+
+    res.json({ ok: true, network, count: chats.length, chats });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /beeper/chat?name=OpenPayd&limit=50
+// Вся переписка с конкретным контактом/компанией по имени
+app.get("/beeper/chat", async (req, res) => {
+  if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
+  const { name, limit = 50 } = req.query;
+  if (!name) return res.status(400).json({ error: "name required" });
+  try {
+    // 1. Find chat by name
+    const searchRpc = {
+      jsonrpc: "2.0", id: Date.now(),
+      method: "tools/call",
+      params: { name: "search", arguments: { query: name } }
+    };
+    const sr = await axios.post(`${BEEPER_URL}/v0/mcp`, searchRpc, { headers: beeperMcpHeaders(), timeout: 15000, responseType: "text" });
+    const searchResult = parseMcpSse(sr.data);
+    const searchText = searchResult?.content?.[0]?.text || "";
+
+    // Extract chatIDs from search results
+    const chatMatches = [...searchText.matchAll(/chatID: ([^\s\)]+)/g)];
+    if (chatMatches.length === 0) return res.json({ ok: false, error: `Чат "${name}" не найден` });
+
+    // 2. Get messages for each found chat
+    const results = await Promise.all(chatMatches.slice(0, 3).map(async m => {
+      const chatID = m[1];
+      const chatName = searchText.match(new RegExp(`## ([^\\n]+) \\(chatID: ${chatID.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))?.[1] || chatID;
+
+      const msgRpc = {
+        jsonrpc: "2.0", id: Date.now(),
+        method: "tools/call",
+        params: { name: "list_messages", arguments: { chatID } }
+      };
+      const mr = await axios.post(`${BEEPER_URL}/v0/mcp`, msgRpc, { headers: beeperMcpHeaders(), timeout: 30000, responseType: "text" });
+      const msgResult = parseMcpSse(mr.data);
+      const msgText = msgResult?.content?.[0]?.text || "";
+
+      let messages = [];
+      try {
+        const parsed = JSON.parse(msgText);
+        messages = (parsed.items || []).slice(0, parseInt(limit)).map(m => ({
+          time: new Date(m.timestamp).toLocaleString("ru-RU"),
+          sender: m.senderName,
+          text: m.text || "[медиа]",
+          isSender: m.isSender,
+          isUnread: m.isUnread,
+        }));
+      } catch (_) {}
+
+      return { chatID, chatName, messageCount: messages.length, messages };
+    }));
+
+    res.json({ ok: true, query: name, chats: results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── node-cron: auto warm-cache weekdays 09:00 EET ─────────────────────────────
 if (BEEPER_TOKEN) {
   cron.schedule("0 9 * * 1-5", async () => {
@@ -1036,7 +1162,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.6", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.7", status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));

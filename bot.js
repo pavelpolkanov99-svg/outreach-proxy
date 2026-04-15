@@ -6,7 +6,7 @@ const BOT_TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY         = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
 const APOLLO_KEY    = process.env.APOLLO_KEY || "mtztHHOhq1AMUNUGPGQ-4A";
 const HR_KEY        = process.env.HEYREACH_KEY || "GBkojH0WLisB1tYtBSBoNSGRQxNE7eFi6Td5eZIq5JY=";
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const ANTHROPIC_KEY = (process.env.ANTHROPIC_API_KEY || "").trim() || null;
 
 // Whitelist — только Паша и Антон
 const ALLOWED_USERS = (process.env.ALLOWED_USERS || "")
@@ -114,7 +114,11 @@ async function askClaude(userMessage, contextData = "") {
       },
       timeout: 30000,
     }
-  );
+  ).catch(err => {
+    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    console.error("[claude] API error:", detail);
+    throw new Error("Claude API: " + detail);
+  });
   return r.data?.content?.[0]?.text || null;
 }
 

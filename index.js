@@ -1162,7 +1162,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.9", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.9.1", status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
@@ -1300,12 +1300,18 @@ async function runBeeperSync(opts = {}) {
   const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=${limit}`,
     { headers: beeperHeaders(), timeout: 15000 });
   const allChats = chatsRes.data?.items || [];
+  // Beeper /v1/chats fields: id, title/name, accountID, lastActivityAt (may be null)
+  // Filter by lastActivityAt if available, otherwise include all
   const sinceDate = since ? new Date(since) : null;
-  const filtered = sinceDate
-    ? allChats.filter(c => c.lastActivityAt && new Date(c.lastActivityAt) > sinceDate)
-    : allChats;
+  const filtered = allChats.filter(c => {
+    if (!sinceDate) return true;
+    // Try both field names Beeper might use
+    const ts = c.lastActivityAt || c.lastActivity || c.updatedAt || c.timestamp;
+    if (!ts) return true; // no timestamp = always include
+    return new Date(ts) > sinceDate;
+  });
 
-  console.log(`[sync] ${filtered.length} chats to sync (since=${since || "all"})`);
+  console.log(`[sync] ${allChats.length} total chats, ${filtered.length} to sync (since=${since || "all"})`);
 
   for (const c of filtered) {
     try {

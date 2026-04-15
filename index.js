@@ -371,17 +371,17 @@ const parallelTaskSpec = {
     json_schema: {
       type: "object",
       properties: {
-        axis1_xborder_core:        { type: "string" },
-        axis2_ramp:                { type: "string" },
-        axis3_stablecoin_alignment:{ type: "string" },
-        axis4_corridors:           { type: "string" },
-        axis5_network_role:        { type: "string" },
-        axis6_licenses:            { type: "string" },
-        axis7_b2b_scale:           { type: "string" },
-        axis8_competitive:         { type: "string" },
-        hard_kill:                 { type: "string" },
-        strategic_signal:          { type: "string" },
-        sources:                   { type: "array", items: { type: "string" } },
+        axis1_xborder_core:         { type: "string" },
+        axis2_ramp:                 { type: "string" },
+        axis3_stablecoin_alignment: { type: "string" },
+        axis4_corridors:            { type: "string" },
+        axis5_network_role:         { type: "string" },
+        axis6_licenses:             { type: "string" },
+        axis7_b2b_scale:            { type: "string" },
+        axis8_competitive:          { type: "string" },
+        hard_kill:                  { type: "string" },
+        strategic_signal:           { type: "string" },
+        sources:                    { type: "array", items: { type: "string" } },
       }
     }
   }
@@ -540,23 +540,34 @@ function beeperHeaders() {
   };
 }
 
-function fuzzyMatch(chatName, targetName) {
-  if (!chatName || !targetName) return false;
-  const chat   = chatName.toLowerCase().trim();
-  const target = targetName.toLowerCase().trim();
-  if (chat === target) return true;
-  if (chat.includes(target) || target.includes(chat)) return true;
-  const words = target.split(/[\s,.|&-]+/).filter(w => w.length > 3);
-  return words.some(w => chat.includes(w));
+// Checks if accountID belongs to WhatsApp (handles "whatsapp" and "local-whatsapp_ba_...")
+function isWhatsApp(id) { return id && id.includes("whatsapp"); }
+function isTelegram(id) { return id === "telegram"; }
+function isLinkedIn(id) { return id === "linkedin"; }
+
+function netLabel(id) {
+  if (isWhatsApp(id)) return "WA";
+  if (isTelegram(id)) return "TG";
+  if (isLinkedIn(id)) return "LI";
+  return id || "?";
 }
 
-function formatMessages(items, limit = 10) {
-  return (items || [])
+function fuzzyMatch(chatName, targetName) {
+  if (!chatName || !targetName) return false;
+  const a = chatName.toLowerCase().trim();
+  const b = targetName.toLowerCase().trim();
+  if (a === b || a.includes(b) || b.includes(a)) return true;
+  const words = b.split(/[\s,.|&<>x\-]+/).filter(w => w.length > 3);
+  return words.some(w => a.includes(w));
+}
+
+function formatMessages(items = [], limit = 9999) {
+  return items
     .slice(0, limit)
     .reverse()
     .map(m => {
-      const time   = m.timestamp ? new Date(m.timestamp).toLocaleDateString("en-GB") : "?";
-      const sender = m.sender?.fullName || m.sender?.displayName || "?";
+      const time   = m.timestamp ? new Date(m.timestamp).toLocaleString("ru-RU") : "?";
+      const sender = m.sender?.fullName || m.sender?.displayName || m.sender?.id || "?";
       const text   = m.content?.text || m.content?.body || "";
       return text ? `[${time}] ${sender}: ${text}` : null;
     })
@@ -564,28 +575,44 @@ function formatMessages(items, limit = 10) {
     .join("\n");
 }
 
+// ── GET /beeper/health ────────────────────────────────────────────────────────
 app.get("/beeper/health", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   try {
     const r = await axios.get(`${BEEPER_URL}/v1/info`, { headers: beeperHeaders(), timeout: 5000 });
     res.json({ ok: true, beeper: r.data?.app, mcp: r.data?.server?.mcp_enabled, url: BEEPER_URL });
   } catch (err) {
-    res.status(503).json({ ok: false, error: err.message, hint: "Is Beeper Desktop running? Is BEEPER_URL correct?" });
+    res.status(503).json({ ok: false, error: err.message });
   }
 });
 
+// ── GET /beeper/chats — список всех чатов, все сети, без лимитов ──────────────
+// Query params: network (wa|tg|li|all), type (group|single|all), limit (default 500)
 app.get("/beeper/chats", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
-  const { network, limit = 50 } = req.query;
+  const { network = "all", type = "all", limit = 500 } = req.query;
   try {
-    const r = await axios.get(`${BEEPER_URL}/v1/chats?limit=${limit}`, { headers: beeperHeaders(), timeout: 10000 });
+    const r = await axios.get(`${BEEPER_URL}/v1/chats?limit=${limit}`, { headers: beeperHeaders(), timeout: 15000 });
     let items = r.data?.items || [];
-    if (network) items = items.filter(c => c.accountID && c.accountID.includes(network));
+
+    // Filter by network
+    if (network === "wa")   items = items.filter(c => isWhatsApp(c.accountID));
+    else if (network === "tg") items = items.filter(c => isTelegram(c.accountID));
+    else if (network === "li") items = items.filter(c => isLinkedIn(c.accountID));
+
+    // Filter by type
+    if (type === "group")  items = items.filter(c => c.type === "group");
+    else if (type === "single") items = items.filter(c => c.type === "single");
+
     res.json({
       total: items.length,
       chats: items.map(c => ({
-        id: c.id, name: c.title, type: c.type,
-        network: c.accountID, participants: c.participants?.items?.length || 0,
+        id: c.id,
+        name: c.title || c.name || "",
+        type: c.type,
+        network: netLabel(c.accountID),
+        accountID: c.accountID,
+        lastMessageAt: c.lastMessageAt || c.lastActivityAt || null,
       }))
     });
   } catch (err) {
@@ -593,27 +620,149 @@ app.get("/beeper/chats", async (req, res) => {
   }
 });
 
-app.get("/beeper/messages", async (req, res) => {
+// ── GET /beeper/recent — последние N активных чатов ───────────────────────────
+// Query params: limit (default 10), network (wa|tg|li|all)
+app.get("/beeper/recent", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
-  const { chatId, limit = 20 } = req.query;
-  if (!chatId) return res.status(400).json({ error: "chatId required" });
+  const { limit = 10, network = "all" } = req.query;
   try {
-    const r = await axios.get(
-      `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(chatId)}&limit=${limit}`,
-      { headers: beeperHeaders(), timeout: 10000 }
-    );
-    const msgs = (r.data?.items || []).map(m => ({
-      id: m.id,
-      sender: m.sender?.fullName || m.sender?.displayName || m.sender?.id,
-      text: m.content?.text || m.content?.body || "",
-      time: m.timestamp,
+    const r = await axios.get(`${BEEPER_URL}/v1/chats?limit=500`, { headers: beeperHeaders(), timeout: 15000 });
+    let items = r.data?.items || [];
+
+    if (network === "wa")   items = items.filter(c => isWhatsApp(c.accountID));
+    else if (network === "tg") items = items.filter(c => isTelegram(c.accountID));
+    else if (network === "li") items = items.filter(c => isLinkedIn(c.accountID));
+
+    // Sort by last activity and take top N
+    items = items
+      .sort((a, b) => new Date(b.lastMessageAt || 0) - new Date(a.lastMessageAt || 0))
+      .slice(0, parseInt(limit));
+
+    // For each — fetch last message preview
+    const result = await Promise.all(items.map(async c => {
+      let lastMsg = "";
+      try {
+        const mr = await axios.get(
+          `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(c.id)}&limit=1`,
+          { headers: beeperHeaders(), timeout: 5000 }
+        );
+        const m = (mr.data?.items || [])[0];
+        if (m) {
+          const sender = m.sender?.fullName || m.sender?.displayName || "?";
+          const text   = m.content?.text || m.content?.body || "";
+          const time   = m.timestamp ? new Date(m.timestamp).toLocaleString("ru-RU") : "";
+          lastMsg = `[${time}] ${sender}: ${text}`;
+        }
+      } catch (_) {}
+      return {
+        id: c.id,
+        name: c.title || c.name || "",
+        type: c.type,
+        network: netLabel(c.accountID),
+        lastMessage: lastMsg,
+      };
     }));
-    res.json({ messages: msgs });
+
+    res.json({ total: result.length, chats: result });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.message });
   }
 });
 
+// ── GET /beeper/messages — все сообщения из конкретного чата ──────────────────
+// Query params: chatId (required), limit (default 9999 = all)
+app.get("/beeper/messages", async (req, res) => {
+  if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
+  const { chatId, limit = 9999 } = req.query;
+  if (!chatId) return res.status(400).json({ error: "chatId required" });
+  try {
+    const r = await axios.get(
+      `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(chatId)}&limit=${limit}`,
+      { headers: beeperHeaders(), timeout: 30000 }
+    );
+    const items = r.data?.items || [];
+    const messages = items.map(m => ({
+      id: m.id,
+      sender: m.sender?.fullName || m.sender?.displayName || m.sender?.id || "?",
+      text: m.content?.text || m.content?.body || "",
+      time: m.timestamp ? new Date(m.timestamp).toLocaleString("ru-RU") : "?",
+    })).filter(m => m.text);
+    res.json({ chatId, total: messages.length, messages });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.message });
+  }
+});
+
+// ── POST /beeper/find-chat — найти чат по имени/компании ─────────────────────
+// Body: { name: "OpenPayd" }  → ищет fuzzy match по всем сетям
+app.post("/beeper/find-chat", async (req, res) => {
+  if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: "name required" });
+  try {
+    const r = await axios.get(`${BEEPER_URL}/v1/chats?limit=500`, { headers: beeperHeaders(), timeout: 15000 });
+    const items = r.data?.items || [];
+    const matches = items.filter(c => fuzzyMatch(c.title || c.name || "", name));
+    res.json({
+      query: name,
+      found: matches.length,
+      chats: matches.map(c => ({
+        id: c.id,
+        name: c.title || c.name || "",
+        type: c.type,
+        network: netLabel(c.accountID),
+        accountID: c.accountID,
+      }))
+    });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.message });
+  }
+});
+
+// ── POST /beeper/get-conversation — найти чат + вернуть ВСЕ сообщения ─────────
+// Body: { name: "OpenPayd", limit: 9999 }
+// Это главный endpoint для "покажи переписку с X"
+app.post("/beeper/get-conversation", async (req, res) => {
+  if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
+  const { name, limit = 9999 } = req.body;
+  if (!name) return res.status(400).json({ error: "name required" });
+  try {
+    // 1. Find chats
+    const r = await axios.get(`${BEEPER_URL}/v1/chats?limit=500`, { headers: beeperHeaders(), timeout: 15000 });
+    const items = r.data?.items || [];
+    const matches = items.filter(c => fuzzyMatch(c.title || c.name || "", name));
+    if (matches.length === 0) return res.json({ ok: false, error: `No chats found matching "${name}"` });
+
+    // 2. Fetch messages for each match
+    const results = await Promise.all(matches.map(async c => {
+      const mr = await axios.get(
+        `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(c.id)}&limit=${limit}`,
+        { headers: beeperHeaders(), timeout: 30000 }
+      );
+      const msgs = (mr.data?.items || [])
+        .map(m => ({
+          sender: m.sender?.fullName || m.sender?.displayName || m.sender?.id || "?",
+          text: m.content?.text || m.content?.body || "",
+          time: m.timestamp ? new Date(m.timestamp).toLocaleString("ru-RU") : "?",
+        }))
+        .filter(m => m.text)
+        .reverse();
+      return {
+        chatName: c.title || c.name || "",
+        network: netLabel(c.accountID),
+        type: c.type,
+        messageCount: msgs.length,
+        messages: msgs,
+      };
+    }));
+
+    res.json({ ok: true, query: name, chats: results });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.message });
+  }
+});
+
+// ── POST /beeper/send ─────────────────────────────────────────────────────────
 app.post("/beeper/send", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   const { chatId, text } = req.body;
@@ -630,13 +779,14 @@ app.post("/beeper/send", async (req, res) => {
   }
 });
 
+// ── POST /beeper/search — поиск по всей истории ───────────────────────────────
 app.post("/beeper/search", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   const { query } = req.body;
   if (!query) return res.status(400).json({ error: "query required" });
   try {
     const r = await axios.get(
-      `${BEEPER_URL}/v1/messages/search?q=${encodeURIComponent(query)}&limit=20`,
+      `${BEEPER_URL}/v1/messages/search?q=${encodeURIComponent(query)}&limit=50`,
       { headers: beeperHeaders(), timeout: 10000 }
     );
     res.json(r.data);
@@ -645,19 +795,19 @@ app.post("/beeper/search", async (req, res) => {
   }
 });
 
-// ── Beeper: POST /beeper/warm-cache ──────────────────────────────────────────
+// ── POST /beeper/warm-cache ───────────────────────────────────────────────────
 app.post("/beeper/warm-cache", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   const { depth = 200 } = req.body;
   try {
-    const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=100`, { headers: beeperHeaders(), timeout: 15000 });
+    const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=500`, { headers: beeperHeaders(), timeout: 15000 });
     const chats = chatsRes.data?.items || [];
-    console.log(`[beeper/warm-cache] Warming ${chats.length} chats, depth=${depth}`);
+    console.log(`[warm-cache] Warming ${chats.length} chats, depth=${depth}`);
     let warmed = 0, failed = 0;
-    for (const chat of chats) {
+    for (const c of chats) {
       try {
         await axios.get(
-          `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(chat.id)}&limit=${depth}`,
+          `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(c.id)}&limit=${depth}`,
           { headers: beeperHeaders(), timeout: 15000 }
         );
         warmed++;
@@ -669,141 +819,142 @@ app.post("/beeper/warm-cache", async (req, res) => {
   }
 });
 
-// ── Beeper: POST /beeper/sync-chats (WA + TG groups → Notion Companies) ──────
+// ── POST /beeper/sync-chats → Notion Companies ────────────────────────────────
 app.post("/beeper/sync-chats", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
-  const { networks = ["whatsapp", "telegram"], msgLimit = 10 } = req.body;
+  const { msgLimit = 10 } = req.body;
   try {
-    const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=100`, { headers: beeperHeaders(), timeout: 10000 });
-    const groups = (chatsRes.data?.items || []).filter(c =>
-      networks.some(n => c.accountID && c.accountID.includes(n)) && c.type === "group"
-    );
-    console.log(`[beeper/sync-chats] Found ${groups.length} groups (${networks.join(", ")})`);
+    const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=500`, { headers: beeperHeaders(), timeout: 15000 });
+    const allChats = chatsRes.data?.items || [];
+    const relevant = allChats.filter(c => isWhatsApp(c.accountID) || isTelegram(c.accountID));
+    console.log(`[sync-chats] ${relevant.length} WA+TG chats out of ${allChats.length} total`);
+
     const notionRes = await axios.post(
       `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
-      { page_size: 100 },
-      { headers: notionHeaders() }
+      { page_size: 200 }, { headers: notionHeaders() }
     );
     const companies = notionRes.data.results.map(p => ({
       id: p.id,
       name: p.properties["Company name"]?.title?.[0]?.text?.content || "",
-      stage: p.properties["Stage"]?.status?.name,
     })).filter(c => c.name);
+
+    const seen = new Set();
     const results = [];
-    for (const group of groups) {
-      const chatName    = group.title || "";
-      const networkLabel = networks.find(n => group.accountID?.includes(n))?.toUpperCase() || "MSG";
-      const match = companies.find(c => fuzzyMatch(chatName, c.name));
-      if (!match) { results.push({ chat: chatName, network: networkLabel, status: "no_match" }); continue; }
+
+    for (const chat of relevant) {
+      const chatName = chat.title || chat.name || "";
+      const label    = netLabel(chat.accountID);
+      const match    = companies.find(c => fuzzyMatch(chatName, c.name));
+      if (!match) { results.push({ chat: chatName, network: label, status: "no_match" }); continue; }
+      if (seen.has(match.id)) { results.push({ chat: chatName, network: label, company: match.name, status: "duplicate" }); continue; }
+      seen.add(match.id);
+
       let msgText = "";
       try {
-        const msgsRes = await axios.get(
-          `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(group.id)}&limit=${msgLimit}`,
+        const mr = await axios.get(
+          `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(chat.id)}&limit=${msgLimit}`,
           { headers: beeperHeaders(), timeout: 10000 }
         );
-        msgText = formatMessages(msgsRes.data?.items, msgLimit);
-      } catch (e) {
-        console.error(`[beeper/sync-chats] Messages fetch failed for ${chatName}:`, e.message);
-      }
-      const noteContent = `📱 ${networkLabel} Group: ${chatName}\n🕐 Synced: ${new Date().toLocaleDateString("en-GB")}\n\n${msgText}`;
+        msgText = formatMessages(mr.data?.items, msgLimit);
+      } catch (e) { console.error(`[sync-chats] msg fetch failed for ${chatName}:`, e.message); }
+
+      const note = `📱 ${label} ${chat.type === "group" ? "Group" : "DM"}: ${chatName}\n🕐 Synced: ${new Date().toLocaleDateString("ru-RU")}\n\n${msgText || "(no messages)"}`;
       try {
         await axios.patch(
           `https://api.notion.com/v1/pages/${match.id}`,
-          { properties: { "Notes": { rich_text: [{ text: { content: noteContent.slice(0, 2000) } }] } } },
+          { properties: { "Notes": { rich_text: [{ text: { content: note.slice(0, 2000) } }] } } },
           { headers: notionHeaders() }
         );
-        results.push({ chat: chatName, network: networkLabel, company: match.name, status: "synced" });
-        console.log(`[beeper/sync-chats] ✅ [${networkLabel}] ${chatName} → ${match.name}`);
+        results.push({ chat: chatName, network: label, company: match.name, status: "synced" });
+        console.log(`[sync-chats] ✅ [${label}] "${chatName}" → ${match.name}`);
       } catch (e) {
-        results.push({ chat: chatName, network: networkLabel, company: match.name, status: "notion_error", error: e.message });
+        results.push({ chat: chatName, network: label, company: match.name, status: "notion_error", error: e.message });
       }
     }
-    const synced  = results.filter(r => r.status === "synced").length;
-    const noMatch = results.filter(r => r.status === "no_match").length;
-    res.json({ ok: true, synced, noMatch, total: groups.length, results });
+
+    res.json({
+      ok: true,
+      synced:    results.filter(r => r.status === "synced").length,
+      noMatch:   results.filter(r => r.status === "no_match").length,
+      duplicate: results.filter(r => r.status === "duplicate").length,
+      total:     relevant.length,
+      results,
+    });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.message });
   }
 });
 
-// ── Beeper: POST /beeper/sync-linkedin (LinkedIn DMs → Notion People) ─────────
+// ── POST /beeper/sync-linkedin → Notion People ────────────────────────────────
 app.post("/beeper/sync-linkedin", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   const { msgLimit = 10 } = req.body;
   try {
-    const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=100`, { headers: beeperHeaders(), timeout: 10000 });
-    const liChats = (chatsRes.data?.items || []).filter(c => c.accountID === "linkedin" && c.type === "single");
-    console.log(`[beeper/sync-linkedin] Found ${liChats.length} LinkedIn DMs`);
+    const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=500`, { headers: beeperHeaders(), timeout: 15000 });
+    const liChats = (chatsRes.data?.items || []).filter(c => isLinkedIn(c.accountID));
+    console.log(`[sync-linkedin] ${liChats.length} LinkedIn chats`);
+
     const notionRes = await axios.post(
       `https://api.notion.com/v1/databases/${NOTION_PEOPLE_DB}/query`,
-      { page_size: 100 },
-      { headers: notionHeaders() }
+      { page_size: 200 }, { headers: notionHeaders() }
     );
     const people = notionRes.data.results.map(p => ({
       id: p.id,
       name: p.properties["Name"]?.title?.[0]?.text?.content || "",
     })).filter(p => p.name);
+
     const results = [];
     for (const chat of liChats) {
-      const chatName = chat.title || "";
+      const chatName = chat.title || chat.name || "";
       const match = people.find(p => fuzzyMatch(chatName, p.name));
       if (!match) { results.push({ chat: chatName, status: "no_match" }); continue; }
       let msgText = "";
       try {
-        const msgsRes = await axios.get(
+        const mr = await axios.get(
           `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(chat.id)}&limit=${msgLimit}`,
           { headers: beeperHeaders(), timeout: 10000 }
         );
-        msgText = formatMessages(msgsRes.data?.items, msgLimit);
-      } catch (e) {
-        console.error(`[beeper/sync-linkedin] Messages fetch failed for ${chatName}:`, e.message);
-      }
-      const noteContent = `💼 LinkedIn DM: ${chatName}\n🕐 Synced: ${new Date().toLocaleDateString("en-GB")}\n\n${msgText}`;
+        msgText = formatMessages(mr.data?.items, msgLimit);
+      } catch (e) {}
+      const note = `💼 LinkedIn DM: ${chatName}\n🕐 Synced: ${new Date().toLocaleDateString("ru-RU")}\n\n${msgText || "(no messages)"}`;
       try {
         await axios.patch(
           `https://api.notion.com/v1/pages/${match.id}`,
-          { properties: { "Notes": { rich_text: [{ text: { content: noteContent.slice(0, 2000) } }] } } },
+          { properties: { "Notes": { rich_text: [{ text: { content: note.slice(0, 2000) } }] } } },
           { headers: notionHeaders() }
         );
         results.push({ chat: chatName, person: match.name, status: "synced" });
-        console.log(`[beeper/sync-linkedin] ✅ ${chatName} → ${match.name}`);
+        console.log(`[sync-linkedin] ✅ "${chatName}" → ${match.name}`);
       } catch (e) {
         results.push({ chat: chatName, person: match.name, status: "notion_error", error: e.message });
       }
     }
-    const synced  = results.filter(r => r.status === "synced").length;
-    const noMatch = results.filter(r => r.status === "no_match").length;
-    res.json({ ok: true, synced, noMatch, total: liChats.length, results });
+    res.json({ ok: true, synced: results.filter(r => r.status === "synced").length, noMatch: results.filter(r => r.status === "no_match").length, total: liChats.length, results });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.message });
   }
 });
 
-// ── node-cron: auto warm-cache every weekday at 09:00 EET ────────────────────
+// ── node-cron: auto warm-cache weekdays 09:00 EET ─────────────────────────────
 if (BEEPER_TOKEN) {
   cron.schedule("0 9 * * 1-5", async () => {
-    console.log("[cron] Running warm-cache...");
+    console.log("[cron] warm-cache start");
     try {
-      const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=100`, { headers: beeperHeaders(), timeout: 15000 });
-      const chats = chatsRes.data?.items || [];
+      const r = await axios.get(`${BEEPER_URL}/v1/chats?limit=500`, { headers: beeperHeaders(), timeout: 15000 });
+      const chats = r.data?.items || [];
       let warmed = 0;
-      for (const chat of chats) {
+      for (const c of chats) {
         try {
-          await axios.get(
-            `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(chat.id)}&limit=200`,
-            { headers: beeperHeaders(), timeout: 15000 }
-          );
+          await axios.get(`${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(c.id)}&limit=200`, { headers: beeperHeaders(), timeout: 15000 });
           warmed++;
         } catch (_) {}
       }
       console.log(`[cron] warm-cache done: ${warmed}/${chats.length}`);
-    } catch (e) {
-      console.error("[cron] warm-cache failed:", e.message);
-    }
+    } catch (e) { console.error("[cron] warm-cache failed:", e.message); }
   }, { timezone: "Europe/Tallinn" });
-  console.log("[cron] warm-cache scheduler registered (weekdays 09:00 EET)");
+  console.log("[cron] warm-cache registered (weekdays 09:00 EET)");
 }
 
 // ── Health ────────────────────────────────────────────────────────────────────
@@ -813,7 +964,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.2", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.4", status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));

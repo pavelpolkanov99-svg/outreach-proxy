@@ -575,7 +575,30 @@ function formatMessages(items = [], limit = 9999) {
     .join("\n");
 }
 
-// ── GET /beeper/health ────────────────────────────────────────────────────────
+// Helper: fetch messages via Beeper MCP (since /v1/messages doesn't exist)
+async function beeperGetMessages(chatID, limit = 9999) {
+  const rpcBody = {
+    jsonrpc: "2.0", id: Date.now(),
+    method: "tools/call",
+    params: { name: "list_messages", arguments: { chatID, limit } }
+  };
+  const r = await axios.post(
+    `${BEEPER_URL}/v0/mcp`,
+    rpcBody,
+    { headers: { ...beeperHeaders(), "Content-Type": "application/json" }, timeout: 30000 }
+  );
+  // MCP returns result.content[0].text as JSON string
+  const content = r.data?.result?.content;
+  if (!content) return [];
+  const textBlock = Array.isArray(content) ? content.find(c => c.type === "text") : null;
+  if (!textBlock) return [];
+  try {
+    const parsed = JSON.parse(textBlock.text);
+    return parsed.messages || parsed.items || parsed || [];
+  } catch {
+    return [];
+  }
+}
 app.get("/beeper/health", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   try {
@@ -638,18 +661,15 @@ app.get("/beeper/recent", async (req, res) => {
       .sort((a, b) => new Date(b.lastMessageAt || 0) - new Date(a.lastMessageAt || 0))
       .slice(0, parseInt(limit));
 
-    // For each — fetch last message preview
+    // For each — fetch last message via MCP
     const result = await Promise.all(items.map(async c => {
       let lastMsg = "";
       try {
-        const mr = await axios.get(
-          `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(c.id)}&limit=1`,
-          { headers: beeperHeaders(), timeout: 5000 }
-        );
-        const m = (mr.data?.items || [])[0];
+        const msgs = await beeperGetMessages(c.id, 1);
+        const m = msgs[0];
         if (m) {
-          const sender = m.sender?.fullName || m.sender?.displayName || "?";
-          const text   = m.content?.text || m.content?.body || "";
+          const sender = m.sender?.fullName || m.sender?.displayName || m.senderName || "?";
+          const text   = m.content?.text || m.content?.body || m.text || m.body || "";
           const time   = m.timestamp ? new Date(m.timestamp).toLocaleString("ru-RU") : "";
           lastMsg = `[${time}] ${sender}: ${text}`;
         }
@@ -669,27 +689,23 @@ app.get("/beeper/recent", async (req, res) => {
   }
 });
 
-// ── GET /beeper/messages — все сообщения из конкретного чата ──────────────────
+// ── GET /beeper/messages — все сообщения из конкретного чата (via MCP) ────────
 // Query params: chatId (required), limit (default 9999 = all)
 app.get("/beeper/messages", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   const { chatId, limit = 9999 } = req.query;
   if (!chatId) return res.status(400).json({ error: "chatId required" });
   try {
-    const r = await axios.get(
-      `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(chatId)}&limit=${limit}`,
-      { headers: beeperHeaders(), timeout: 30000 }
-    );
-    const items = r.data?.items || [];
+    const items = await beeperGetMessages(chatId, parseInt(limit));
     const messages = items.map(m => ({
       id: m.id,
-      sender: m.sender?.fullName || m.sender?.displayName || m.sender?.id || "?",
-      text: m.content?.text || m.content?.body || "",
-      time: m.timestamp ? new Date(m.timestamp).toLocaleString("ru-RU") : "?",
+      sender: m.sender?.fullName || m.sender?.displayName || m.sender?.id || m.senderName || "?",
+      text: m.content?.text || m.content?.body || m.text || m.body || "",
+      time: m.timestamp ? new Date(m.timestamp).toLocaleString("ru-RU") : (m.time || "?"),
     })).filter(m => m.text);
     res.json({ chatId, total: messages.length, messages });
   } catch (err) {
-    res.status(err.response?.status || 500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -735,15 +751,13 @@ app.post("/beeper/get-conversation", async (req, res) => {
 
     // 2. Fetch messages for each match
     const results = await Promise.all(matches.map(async c => {
-      const mr = await axios.get(
-        `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(c.id)}&limit=${limit}`,
-        { headers: beeperHeaders(), timeout: 30000 }
-      );
-      const msgs = (mr.data?.items || [])
+      // Fetch messages via MCP
+      const msgs = await beeperGetMessages(c.id, limit);
+      const formatted = msgs
         .map(m => ({
-          sender: m.sender?.fullName || m.sender?.displayName || m.sender?.id || "?",
-          text: m.content?.text || m.content?.body || "",
-          time: m.timestamp ? new Date(m.timestamp).toLocaleString("ru-RU") : "?",
+          sender: m.sender?.fullName || m.sender?.displayName || m.sender?.id || m.senderName || "?",
+          text: m.content?.text || m.content?.body || m.text || m.body || "",
+          time: m.timestamp ? new Date(m.timestamp).toLocaleString("ru-RU") : (m.time || "?"),
         }))
         .filter(m => m.text)
         .reverse();
@@ -768,12 +782,17 @@ app.post("/beeper/send", async (req, res) => {
   const { chatId, text } = req.body;
   if (!chatId || !text) return res.status(400).json({ error: "chatId and text required" });
   try {
+    const rpcBody = {
+      jsonrpc: "2.0", id: Date.now(),
+      method: "tools/call",
+      params: { name: "send_message", arguments: { chatID: chatId, text } }
+    };
     const r = await axios.post(
-      `${BEEPER_URL}/v1/messages`,
-      { chatID: chatId, content: { text } },
-      { headers: beeperHeaders(), timeout: 10000 }
+      `${BEEPER_URL}/v0/mcp`,
+      rpcBody,
+      { headers: { ...beeperHeaders(), "Content-Type": "application/json" }, timeout: 10000 }
     );
-    res.json({ ok: true, messageId: r.data?.id });
+    res.json({ ok: true, result: r.data?.result });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.message });
   }
@@ -785,11 +804,17 @@ app.post("/beeper/search", async (req, res) => {
   const { query } = req.body;
   if (!query) return res.status(400).json({ error: "query required" });
   try {
-    const r = await axios.get(
-      `${BEEPER_URL}/v1/messages/search?q=${encodeURIComponent(query)}&limit=50`,
-      { headers: beeperHeaders(), timeout: 10000 }
+    const rpcBody = {
+      jsonrpc: "2.0", id: Date.now(),
+      method: "tools/call",
+      params: { name: "search_messages", arguments: { query, limit: 50 } }
+    };
+    const r = await axios.post(
+      `${BEEPER_URL}/v0/mcp`,
+      rpcBody,
+      { headers: { ...beeperHeaders(), "Content-Type": "application/json" }, timeout: 15000 }
     );
-    res.json(r.data);
+    res.json({ ok: true, result: r.data?.result });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.message });
   }
@@ -806,10 +831,7 @@ app.post("/beeper/warm-cache", async (req, res) => {
     let warmed = 0, failed = 0;
     for (const c of chats) {
       try {
-        await axios.get(
-          `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(c.id)}&limit=${depth}`,
-          { headers: beeperHeaders(), timeout: 15000 }
-        );
+        await beeperGetMessages(c.id, depth);
         warmed++;
       } catch (_) { failed++; }
     }
@@ -852,11 +874,8 @@ app.post("/beeper/sync-chats", async (req, res) => {
 
       let msgText = "";
       try {
-        const mr = await axios.get(
-          `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(chat.id)}&limit=${msgLimit}`,
-          { headers: beeperHeaders(), timeout: 10000 }
-        );
-        msgText = formatMessages(mr.data?.items, msgLimit);
+        const msgs = await beeperGetMessages(chat.id, msgLimit);
+        msgText = formatMessages(msgs, msgLimit);
       } catch (e) { console.error(`[sync-chats] msg fetch failed for ${chatName}:`, e.message); }
 
       const note = `📱 ${label} ${chat.type === "group" ? "Group" : "DM"}: ${chatName}\n🕐 Synced: ${new Date().toLocaleDateString("ru-RU")}\n\n${msgText || "(no messages)"}`;
@@ -912,11 +931,8 @@ app.post("/beeper/sync-linkedin", async (req, res) => {
       if (!match) { results.push({ chat: chatName, status: "no_match" }); continue; }
       let msgText = "";
       try {
-        const mr = await axios.get(
-          `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(chat.id)}&limit=${msgLimit}`,
-          { headers: beeperHeaders(), timeout: 10000 }
-        );
-        msgText = formatMessages(mr.data?.items, msgLimit);
+        const msgs = await beeperGetMessages(chat.id, msgLimit);
+        msgText = formatMessages(msgs, msgLimit);
       } catch (e) {}
       const note = `💼 LinkedIn DM: ${chatName}\n🕐 Synced: ${new Date().toLocaleDateString("ru-RU")}\n\n${msgText || "(no messages)"}`;
       try {
@@ -937,6 +953,48 @@ app.post("/beeper/sync-linkedin", async (req, res) => {
   }
 });
 
+// ── Beeper: POST /beeper/mcp-call — relay JSON-RPC to Beeper MCP ──────────────
+// Beeper Desktop не имеет REST endpoint для сообщений — только MCP (/v0/mcp)
+// Этот endpoint проксирует MCP tool вызовы к Beeper Desktop
+// Body: { tool: "list_messages", params: { chatID: "...", limit: 50 } }
+app.post("/beeper/mcp-call", async (req, res) => {
+  if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
+  const { tool, params = {} } = req.body;
+  if (!tool) return res.status(400).json({ error: "tool required" });
+  try {
+    const rpcBody = {
+      jsonrpc: "2.0",
+      id: Date.now(),
+      method: "tools/call",
+      params: { name: tool, arguments: params }
+    };
+    const r = await axios.post(
+      `${BEEPER_URL}/v0/mcp`,
+      rpcBody,
+      { headers: { ...beeperHeaders(), "Content-Type": "application/json" }, timeout: 30000 }
+    );
+    res.json({ ok: true, result: r.data });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.message, detail: err.response?.data });
+  }
+});
+
+// ── Beeper: GET /beeper/mcp-tools — список доступных MCP tools ────────────────
+app.get("/beeper/mcp-tools", async (req, res) => {
+  if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
+  try {
+    const rpcBody = { jsonrpc: "2.0", id: Date.now(), method: "tools/list", params: {} };
+    const r = await axios.post(
+      `${BEEPER_URL}/v0/mcp`,
+      rpcBody,
+      { headers: { ...beeperHeaders(), "Content-Type": "application/json" }, timeout: 10000 }
+    );
+    res.json({ ok: true, tools: r.data?.result?.tools || r.data });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.message, detail: err.response?.data });
+  }
+});
+
 // ── node-cron: auto warm-cache weekdays 09:00 EET ─────────────────────────────
 if (BEEPER_TOKEN) {
   cron.schedule("0 9 * * 1-5", async () => {
@@ -947,7 +1005,7 @@ if (BEEPER_TOKEN) {
       let warmed = 0;
       for (const c of chats) {
         try {
-          await axios.get(`${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(c.id)}&limit=200`, { headers: beeperHeaders(), timeout: 15000 });
+          await beeperGetMessages(c.id, 200);
           warmed++;
         } catch (_) {}
       }
@@ -964,7 +1022,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.4", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.5", status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));

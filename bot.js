@@ -101,7 +101,7 @@ async function askClaude(userMessage, contextData = "") {
   const r = await axios.post(
     "https://api.anthropic.com/v1/messages",
     {
-      model: "claude-sonnet-4-6",
+      model: "claude-sonnet-4-5",
       max_tokens: 1500,
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content }],

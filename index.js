@@ -1162,10 +1162,8 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.9.2", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.9.3", status: "ok" }));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
 
 // ══════════════════════════════════════════════════════════════════════════════
 // BEEPER → NOTION SYNC ENGINE
@@ -1427,3 +1425,8 @@ if (BEEPER_TOKEN && NOTION_TOKEN) {
     } catch (e) { console.error("[startup] catch-up failed:", e.message); }
   }, 15000); // 15 сек после старта
 }
+
+const PORT = process.env.PORT || 3000;
+
+
+app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));

@@ -575,6 +575,31 @@ function formatMessages(items = [], limit = 9999) {
     .join("\n");
 }
 
+// MCP headers — Beeper requires both application/json and text/event-stream
+function beeperMcpHeaders() {
+  return {
+    "Authorization": `Bearer ${BEEPER_TOKEN}`,
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+  };
+}
+
+// Parse SSE response from Beeper MCP into JSON
+function parseMcpSse(rawText) {
+  // SSE format: lines starting with "data: "
+  const lines = rawText.split('\n').filter(l => l.startsWith('data: '));
+  for (const line of lines) {
+    try {
+      const json = JSON.parse(line.slice(6));
+      if (json.result) return json.result;
+      if (json.error) throw new Error(json.error.message);
+    } catch (_) {}
+  }
+  // Try parsing as plain JSON if not SSE
+  try { return JSON.parse(rawText); } catch (_) {}
+  return null;
+}
+
 // Helper: fetch messages via Beeper MCP (since /v1/messages doesn't exist)
 async function beeperGetMessages(chatID, limit = 9999) {
   const rpcBody = {
@@ -585,18 +610,21 @@ async function beeperGetMessages(chatID, limit = 9999) {
   const r = await axios.post(
     `${BEEPER_URL}/v0/mcp`,
     rpcBody,
-    { headers: { ...beeperHeaders(), "Content-Type": "application/json" }, timeout: 30000 }
+    { headers: beeperMcpHeaders(), timeout: 30000, responseType: "text" }
   );
-  // MCP returns result.content[0].text as JSON string
-  const content = r.data?.result?.content;
-  if (!content) return [];
+  const result = parseMcpSse(r.data);
+  if (!result) return [];
+  // result.content is array of {type, text} blocks
+  const content = result.content || result;
   const textBlock = Array.isArray(content) ? content.find(c => c.type === "text") : null;
-  if (!textBlock) return [];
+  const rawText = textBlock?.text || (typeof content === "string" ? content : null);
+  if (!rawText) return [];
   try {
-    const parsed = JSON.parse(textBlock.text);
-    return parsed.messages || parsed.items || parsed || [];
+    const parsed = JSON.parse(rawText);
+    return parsed.messages || parsed.items || (Array.isArray(parsed) ? parsed : []);
   } catch {
-    return [];
+    // Return raw text as single message
+    return [{ senderName: "system", text: rawText, timestamp: Date.now() }];
   }
 }
 app.get("/beeper/health", async (req, res) => {
@@ -790,7 +818,7 @@ app.post("/beeper/send", async (req, res) => {
     const r = await axios.post(
       `${BEEPER_URL}/v0/mcp`,
       rpcBody,
-      { headers: { ...beeperHeaders(), "Content-Type": "application/json" }, timeout: 10000 }
+      { headers: beeperMcpHeaders(), timeout: 10000, responseType: "text" }
     );
     res.json({ ok: true, result: r.data?.result });
   } catch (err) {
@@ -812,7 +840,7 @@ app.post("/beeper/search", async (req, res) => {
     const r = await axios.post(
       `${BEEPER_URL}/v0/mcp`,
       rpcBody,
-      { headers: { ...beeperHeaders(), "Content-Type": "application/json" }, timeout: 15000 }
+      { headers: beeperMcpHeaders(), timeout: 15000, responseType: "text" }
     );
     res.json({ ok: true, result: r.data?.result });
   } catch (err) {
@@ -954,26 +982,15 @@ app.post("/beeper/sync-linkedin", async (req, res) => {
 });
 
 // ── Beeper: POST /beeper/mcp-call — relay JSON-RPC to Beeper MCP ──────────────
-// Beeper Desktop не имеет REST endpoint для сообщений — только MCP (/v0/mcp)
-// Этот endpoint проксирует MCP tool вызовы к Beeper Desktop
-// Body: { tool: "list_messages", params: { chatID: "...", limit: 50 } }
 app.post("/beeper/mcp-call", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   const { tool, params = {} } = req.body;
   if (!tool) return res.status(400).json({ error: "tool required" });
   try {
-    const rpcBody = {
-      jsonrpc: "2.0",
-      id: Date.now(),
-      method: "tools/call",
-      params: { name: tool, arguments: params }
-    };
-    const r = await axios.post(
-      `${BEEPER_URL}/v0/mcp`,
-      rpcBody,
-      { headers: { ...beeperHeaders(), "Content-Type": "application/json" }, timeout: 30000 }
-    );
-    res.json({ ok: true, result: r.data });
+    const rpcBody = { jsonrpc: "2.0", id: Date.now(), method: "tools/call", params: { name: tool, arguments: params } };
+    const r = await axios.post(`${BEEPER_URL}/v0/mcp`, rpcBody, { headers: beeperMcpHeaders(), timeout: 30000, responseType: "text" });
+    const result = parseMcpSse(r.data);
+    res.json({ ok: true, result });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.message, detail: err.response?.data });
   }
@@ -984,12 +1001,9 @@ app.get("/beeper/mcp-tools", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   try {
     const rpcBody = { jsonrpc: "2.0", id: Date.now(), method: "tools/list", params: {} };
-    const r = await axios.post(
-      `${BEEPER_URL}/v0/mcp`,
-      rpcBody,
-      { headers: { ...beeperHeaders(), "Content-Type": "application/json" }, timeout: 10000 }
-    );
-    res.json({ ok: true, tools: r.data?.result?.tools || r.data });
+    const r = await axios.post(`${BEEPER_URL}/v0/mcp`, rpcBody, { headers: beeperMcpHeaders(), timeout: 10000, responseType: "text" });
+    const result = parseMcpSse(r.data);
+    res.json({ ok: true, tools: result?.tools || result });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.message, detail: err.response?.data });
   }
@@ -1022,7 +1036,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.5", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.6", status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));

@@ -1162,7 +1162,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.9.1", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.9.2", status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
@@ -1247,6 +1247,42 @@ async function getChatParticipantNames(chatID) {
     }
     return names;
   } catch (_) { return []; }
+}
+
+// ── Link detection helpers ─────────────────────────────────────────────────
+// Паттерны для определения отправки Discovery Card и Calendly
+const DISCOVERY_CARD_PATTERN = /notion\.so\/plex0\/Discovery-Card/i;
+const CALENDLY_PATTERN = /calendly\.com\/plex0\//i;
+
+async function checkLinksInChat(chatID) {
+  const result = { discoveryCard: false, calendly: false };
+  try {
+    // Читаем историю сообщений через MCP (берём побольше — ищем по всей истории)
+    const rpc = {
+      jsonrpc: "2.0", id: Date.now(), method: "tools/call",
+      params: { name: "list_messages", arguments: { chatID } }
+    };
+    const r = await axios.post(`${BEEPER_URL}/v0/mcp`, rpc,
+      { headers: beeperMcpHeaders(), timeout: 20000, responseType: "text" });
+    const msgResult = parseMcpSse(r.data);
+    const msgText = msgResult?.content?.[0]?.text || "";
+
+    let items = [];
+    try { items = JSON.parse(msgText)?.items || []; } catch (_) {}
+
+    for (const msg of items) {
+      const text = msg.text || "";
+      if (!result.discoveryCard && DISCOVERY_CARD_PATTERN.test(text)) {
+        result.discoveryCard = true;
+      }
+      if (!result.calendly && CALENDLY_PATTERN.test(text)) {
+        result.calendly = true;
+      }
+      // Если оба нашли — можно выйти раньше
+      if (result.discoveryCard && result.calendly) break;
+    }
+  } catch (_) {}
+  return result;
 }
 
 async function upsertChatToHub(chatInfo) {
@@ -1390,40 +1426,4 @@ if (BEEPER_TOKEN && NOTION_TOKEN) {
       console.log(`[startup] catch-up done: +${results.created} created, ~${results.updated} updated`);
     } catch (e) { console.error("[startup] catch-up failed:", e.message); }
   }, 15000); // 15 сек после старта
-}
-
-// ── Link detection helpers ─────────────────────────────────────────────────
-// Паттерны для определения отправки Discovery Card и Calendly
-const DISCOVERY_CARD_PATTERN = /notion\.so\/plex0\/Discovery-Card/i;
-const CALENDLY_PATTERN = /calendly\.com\/plex0\//i;
-
-async function checkLinksInChat(chatID) {
-  const result = { discoveryCard: false, calendly: false };
-  try {
-    // Читаем историю сообщений через MCP (берём побольше — ищем по всей истории)
-    const rpc = {
-      jsonrpc: "2.0", id: Date.now(), method: "tools/call",
-      params: { name: "list_messages", arguments: { chatID } }
-    };
-    const r = await axios.post(`${BEEPER_URL}/v0/mcp`, rpc,
-      { headers: beeperMcpHeaders(), timeout: 20000, responseType: "text" });
-    const msgResult = parseMcpSse(r.data);
-    const msgText = msgResult?.content?.[0]?.text || "";
-
-    let items = [];
-    try { items = JSON.parse(msgText)?.items || []; } catch (_) {}
-
-    for (const msg of items) {
-      const text = msg.text || "";
-      if (!result.discoveryCard && DISCOVERY_CARD_PATTERN.test(text)) {
-        result.discoveryCard = true;
-      }
-      if (!result.calendly && CALENDLY_PATTERN.test(text)) {
-        result.calendly = true;
-      }
-      // Если оба нашли — можно выйти раньше
-      if (result.discoveryCard && result.calendly) break;
-    }
-  } catch (_) {}
-  return result;
 }

@@ -1,10 +1,11 @@
 const express = require("express");
-const axios = require("axios");
-const app = express();
+const axios   = require("axios");
+const cron    = require("node-cron");
+const app     = express();
 
 app.use(express.json());
 
-// ── CORS ─────────────────────────────────────────────────────────────────────
+// ── CORS ──────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*");
   res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -14,10 +15,10 @@ app.use((req, res, next) => {
 });
 
 // ── Notion config ─────────────────────────────────────────────────────────────
-const NOTION_TOKEN = process.env.NOTION_TOKEN;
-const NOTION_VERSION = "2022-06-28";
+const NOTION_TOKEN        = process.env.NOTION_TOKEN;
+const NOTION_VERSION      = "2022-06-28";
 const NOTION_COMPANIES_DB = "f9b59c5b05fa4df18f9569479633fd74";
-const NOTION_PEOPLE_DB = "f36b2a0f0ab241cebbdbd1d0874a55be";
+const NOTION_PEOPLE_DB    = "f36b2a0f0ab241cebbdbd1d0874a55be";
 
 function notionHeaders() {
   return {
@@ -27,7 +28,7 @@ function notionHeaders() {
   };
 }
 
-// ── Apollo filter ─────────────────────────────────────────────────────────────
+// ── Apollo helpers ────────────────────────────────────────────────────────────
 function filterPerson(p) {
   const org = p.organization || {};
   return {
@@ -56,7 +57,7 @@ function filterPerson(p) {
   };
 }
 
-// ── Apollo search ─────────────────────────────────────────────────────────────
+// ── Apollo: POST /apollo/search ───────────────────────────────────────────────
 app.post("/apollo/search", async (req, res) => {
   const { apolloKey, name, company } = req.body;
   if (!apolloKey) return res.status(400).json({ error: "apolloKey required" });
@@ -72,7 +73,7 @@ app.post("/apollo/search", async (req, res) => {
   }
 });
 
-// ── Apollo enrich ─────────────────────────────────────────────────────────────
+// ── Apollo: POST /apollo/match ────────────────────────────────────────────────
 app.post("/apollo/match", async (req, res) => {
   const { apolloKey, firstName, lastName, organizationName, domain, linkedinUrl } = req.body;
   if (!apolloKey) return res.status(400).json({ error: "apolloKey required" });
@@ -90,7 +91,7 @@ app.post("/apollo/match", async (req, res) => {
   }
 });
 
-// ── HeyReach proxy ────────────────────────────────────────────────────────────
+// ── HeyReach proxy: POST /heyreach/proxy ──────────────────────────────────────
 app.post("/heyreach/proxy", async (req, res) => {
   const { hrKey, path, payload } = req.body;
   if (!hrKey || !path) return res.status(400).json({ error: "hrKey and path required" });
@@ -121,7 +122,7 @@ app.get("/notion/db-schema", async (req, res) => {
   }
 });
 
-// ── Notion: POST /notion/upsert-lead ──────────────────────────────────────────
+// ── Notion: POST /notion/upsert-lead ─────────────────────────────────────────
 app.post("/notion/upsert-lead", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   const {
@@ -129,7 +130,6 @@ app.post("/notion/upsert-lead", async (req, res) => {
     companyWebsite, companyLinkedin, companyDescription,
     linkedin, email, status = "Connection Sent"
   } = req.body;
-
   try {
     let companyPageId = null;
     if (company) {
@@ -156,20 +156,17 @@ app.post("/notion/upsert-lead", async (req, res) => {
         companyPageId = newCompany.data.id;
       }
     }
-
     const fullName = [firstName, lastName].filter(Boolean).join(" ");
     const personProps = { "Name": { title: [{ text: { content: fullName } }] } };
     if (title) personProps["Role"] = { rich_text: [{ text: { content: title } }] };
     if (linkedin) personProps["LinkedIn"] = { url: linkedin };
-    if (email) personProps["Email"] = { email: email };
+    if (email) personProps["Email"] = { email };
     if (companyPageId) personProps["Company"] = { relation: [{ id: companyPageId }] };
-
     const searchPerson = await axios.post(
       `https://api.notion.com/v1/databases/${NOTION_PEOPLE_DB}/query`,
       { filter: { property: "Name", title: { equals: fullName } }, page_size: 1 },
       { headers: notionHeaders() }
     );
-
     let personPageId = null;
     if (searchPerson.data.results.length > 0) {
       personPageId = searchPerson.data.results[0].id;
@@ -182,7 +179,6 @@ app.post("/notion/upsert-lead", async (req, res) => {
       );
       personPageId = newPerson.data.id;
     }
-
     res.json({ ok: true, companyPageId, personPageId });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
@@ -246,14 +242,13 @@ app.post("/notion/update-tags", async (req, res) => {
     );
     if (search.data.results.length === 0) return res.status(404).json({ error: `${name} not found` });
     const page = search.data.results[0];
-    const pageId = page.id;
     let finalTags = tags.map(t => ({ name: t }));
     if (mode === "add") {
       const existing = (page.properties?.Tags?.multi_select || []).map(t => t.name);
       finalTags = [...new Set([...existing, ...tags])].map(t => ({ name: t }));
     }
-    await axios.patch(`https://api.notion.com/v1/pages/${pageId}`, { properties: { "Tags": { multi_select: finalTags } } }, { headers: notionHeaders() });
-    res.json({ ok: true, pageId, tags: finalTags.map(t => t.name) });
+    await axios.patch(`https://api.notion.com/v1/pages/${page.id}`, { properties: { "Tags": { multi_select: finalTags } } }, { headers: notionHeaders() });
+    res.json({ ok: true, pageId: page.id, tags: finalTags.map(t => t.name) });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
   }
@@ -291,28 +286,13 @@ app.post("/notion/search-company", async (req, res) => {
 });
 
 // ── Notion: POST /notion/append-note ─────────────────────────────────────────
-// Appends a timestamped note to the Notes field of a company or person page.
-// Finds the page by name (exact match, then contains fallback for companies).
-// Body: { name, note, db? }
-//   name  — company name (db=companies) or person name (db=people)
-//   note  — text to append
-//   db    — "companies" (default) | "people"
-//
-// Behaviour:
-//   1. Finds the page in the target DB
-//   2. Reads the existing Notes rich_text value
-//   3. Appends "\n---\n{note}" to the existing content (preserves history)
-//   4. Writes the combined text back (Notion rich_text max 2000 chars — we truncate from the front if needed)
 app.post("/notion/append-note", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   const { name, note, db = "companies" } = req.body;
   if (!name || !note) return res.status(400).json({ error: "name and note required" });
-
   const dbId = db === "companies" ? NOTION_COMPANIES_DB : NOTION_PEOPLE_DB;
   const titleField = db === "companies" ? "Company name" : "Name";
-
   try {
-    // 1. Find page — exact match first, then contains fallback (companies only)
     let search = await axios.post(
       `https://api.notion.com/v1/databases/${dbId}/query`,
       { filter: { property: titleField, title: { equals: name } }, page_size: 1 },
@@ -325,35 +305,19 @@ app.post("/notion/append-note", async (req, res) => {
         { headers: notionHeaders() }
       );
     }
-    if (search.data.results.length === 0) {
-      return res.status(404).json({ error: `${name} not found in ${db} DB` });
-    }
-
+    if (search.data.results.length === 0) return res.status(404).json({ error: `${name} not found in ${db} DB` });
     const page = search.data.results[0];
     const pageId = page.id;
     const resolvedName = page.properties[titleField]?.title?.[0]?.text?.content || name;
-
-    // 2. Read existing Notes value
-    const existing = (page.properties?.Notes?.rich_text || [])
-      .map(rt => rt.plain_text || rt.text?.content || "")
-      .join("");
-
-    // 3. Build combined text — separator between old and new
+    const existing = (page.properties?.Notes?.rich_text || []).map(rt => rt.plain_text || rt.text?.content || "").join("");
     const separator = existing ? "\n---\n" : "";
     let combined = existing + separator + note;
-
-    // 4. Notion rich_text property max = 2000 chars — trim from the front if over
-    if (combined.length > 2000) {
-      combined = combined.slice(combined.length - 2000);
-    }
-
-    // 5. Write back
+    if (combined.length > 2000) combined = combined.slice(combined.length - 2000);
     await axios.patch(
       `https://api.notion.com/v1/pages/${pageId}`,
       { properties: { "Notes": { rich_text: [{ text: { content: combined } }] } } },
       { headers: notionHeaders() }
     );
-
     res.json({ ok: true, pageId, resolvedName, noteLength: note.length, totalLength: combined.length });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
@@ -361,8 +325,6 @@ app.post("/notion/append-note", async (req, res) => {
 });
 
 // ── Notion: POST /notion/query ────────────────────────────────────────────────
-// Generic DB query — used by email sync (Sinker) and other internal tools.
-// Body: { db_id, filter?, sorts?, page_size? }
 app.post("/notion/query", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   const { db_id, filter, sorts, page_size = 20 } = req.body;
@@ -371,11 +333,7 @@ app.post("/notion/query", async (req, res) => {
     const payload = { page_size };
     if (filter) payload.filter = filter;
     if (sorts) payload.sorts = sorts;
-    const r = await axios.post(
-      `https://api.notion.com/v1/databases/${db_id}/query`,
-      payload,
-      { headers: notionHeaders() }
-    );
+    const r = await axios.post(`https://api.notion.com/v1/databases/${db_id}/query`, payload, { headers: notionHeaders() });
     res.json(r.data);
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
@@ -391,8 +349,8 @@ function parallelHeaders() {
 
 function buildResearchQuery(company, domain) {
   return [
-    `You are a B2B fintech analyst qualifying "${company}"${domain ? ` (${domain})` : ""} as a potential client or partner for RemiDe — a Stablecoin Clearing Network for licensed financial institutions.`,
-    `RemiDe enables compliant cross-border stablecoin settlements (USDC/USDT/EURC) between licensed FIs.`,
+    `You are a B2B fintech analyst qualifying "${company}"${domain ? ` (${domain})` : ""} as a potential client or partner for Plexo — a Stablecoin Clearing Network for licensed financial institutions.`,
+    `Plexo enables compliant cross-border stablecoin settlements (USDC/USDT/EURC) between licensed FIs.`,
     `Research this company and answer ONLY the following scoring questions. For each, provide a factual answer with source URL. If not found, say NOT FOUND.`,
     `AXIS 1 — Cross-Border Payments Core: Does this company process cross-border B2B payments as a core business? Any volume or corridor data?`,
     `AXIS 2 — On/Off Ramp: Do they convert between fiat and stablecoins/crypto? Any USDC/USDT/EURC ramp infrastructure?`,
@@ -401,7 +359,7 @@ function buildResearchQuery(company, domain) {
     `AXIS 5 — Network Role: Are they likely an Originating FI, Destination FI, or Beneficiary FI?`,
     `AXIS 6 — Regulatory Licenses: What licenses do they hold? (EMI, PI, MSB, VASP, MiCA CASP, PSD2, banking license) Which jurisdictions?`,
     `AXIS 7 — B2B Scale: Do they serve businesses (not retail)? Any employee count, revenue, or transaction volume signals?`,
-    `AXIS 8 — Competitive Proximity: Are they a potential competitor to RemiDe or clearly a client/partner?`,
+    `AXIS 8 — Competitive Proximity: Are they a potential competitor to Plexo or clearly a client/partner?`,
     `HARD KILL CHECK: Is this company ONLY doing: RWA tokenization, DeFi without KYC, custody/trading only, consulting, payroll, retail on-ramp widget, or compliance SaaS? If yes, say HARD KILL and why.`,
     `STRATEGIC SIGNAL: Any recent signal (last 12 months) suggesting urgency — new funding, hiring payments/crypto roles, regulatory approval, expansion announcement?`,
   ].join(" ");
@@ -413,23 +371,22 @@ const parallelTaskSpec = {
     json_schema: {
       type: "object",
       properties: {
-        axis1_xborder_core: { type: "string" },
-        axis2_ramp: { type: "string" },
-        axis3_stablecoin_alignment: { type: "string" },
-        axis4_corridors: { type: "string" },
-        axis5_network_role: { type: "string" },
-        axis6_licenses: { type: "string" },
-        axis7_b2b_scale: { type: "string" },
-        axis8_competitive: { type: "string" },
-        hard_kill: { type: "string" },
-        strategic_signal: { type: "string" },
-        sources: { type: "array", items: { type: "string" } }
+        axis1_xborder_core:        { type: "string" },
+        axis2_ramp:                { type: "string" },
+        axis3_stablecoin_alignment:{ type: "string" },
+        axis4_corridors:           { type: "string" },
+        axis5_network_role:        { type: "string" },
+        axis6_licenses:            { type: "string" },
+        axis7_b2b_scale:           { type: "string" },
+        axis8_competitive:         { type: "string" },
+        hard_kill:                 { type: "string" },
+        strategic_signal:          { type: "string" },
+        sources:                   { type: "array", items: { type: "string" } },
       }
     }
   }
 };
 
-// ── Parallel endpoints ────────────────────────────────────────────────────────
 app.post("/parallel/research/start", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
   const { company, domain, processor = "lite" } = req.body;
@@ -454,7 +411,7 @@ app.get("/parallel/result/:taskId", async (req, res) => {
   try {
     const statusRes = await axios.get(`https://api.parallel.ai/v1/tasks/runs/${taskId}`, { headers: parallelHeaders(), timeout: 15000 });
     const status = statusRes.data?.status;
-    const done = status === "completed" || status === "succeeded";
+    const done   = status === "completed" || status === "succeeded";
     const failed = status === "failed" || status === "error";
     let output = null;
     if (done) {
@@ -520,7 +477,7 @@ app.post("/parallel/upgrade", async (req, res) => {
         type: "object",
         properties: {
           ...parallelTaskSpec.output_schema.json_schema.properties,
-          outreach_insight: { type: "string" }
+          outreach_insight: { type: "string" },
         }
       }
     }
@@ -572,7 +529,7 @@ app.post("/webhook/heyreach", async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 // BEEPER INTEGRATION
 // ══════════════════════════════════════════════════════════════════════════════
-const BEEPER_URL = process.env.BEEPER_URL || "http://localhost:23373";
+const BEEPER_URL   = process.env.BEEPER_URL   || "http://localhost:23373";
 const BEEPER_TOKEN = process.env.BEEPER_TOKEN;
 
 function beeperHeaders() {
@@ -585,7 +542,7 @@ function beeperHeaders() {
 
 function fuzzyMatch(chatName, targetName) {
   if (!chatName || !targetName) return false;
-  const chat = chatName.toLowerCase().trim();
+  const chat   = chatName.toLowerCase().trim();
   const target = targetName.toLowerCase().trim();
   if (chat === target) return true;
   if (chat.includes(target) || target.includes(chat)) return true;
@@ -598,9 +555,9 @@ function formatMessages(items, limit = 10) {
     .slice(0, limit)
     .reverse()
     .map(m => {
-      const time = m.timestamp ? new Date(m.timestamp).toLocaleDateString("en-GB") : "?";
+      const time   = m.timestamp ? new Date(m.timestamp).toLocaleDateString("en-GB") : "?";
       const sender = m.sender?.fullName || m.sender?.displayName || "?";
-      const text = m.content?.text || m.content?.body || "";
+      const text   = m.content?.text || m.content?.body || "";
       return text ? `[${time}] ${sender}: ${text}` : null;
     })
     .filter(Boolean)
@@ -627,11 +584,8 @@ app.get("/beeper/chats", async (req, res) => {
     res.json({
       total: items.length,
       chats: items.map(c => ({
-        id: c.id,
-        name: c.title,
-        type: c.type,
-        network: c.accountID,
-        participants: c.participants?.items?.length || 0,
+        id: c.id, name: c.title, type: c.type,
+        network: c.accountID, participants: c.participants?.items?.length || 0,
       }))
     });
   } catch (err) {
@@ -691,6 +645,31 @@ app.post("/beeper/search", async (req, res) => {
   }
 });
 
+// ── Beeper: POST /beeper/warm-cache ──────────────────────────────────────────
+app.post("/beeper/warm-cache", async (req, res) => {
+  if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
+  const { depth = 200 } = req.body;
+  try {
+    const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=100`, { headers: beeperHeaders(), timeout: 15000 });
+    const chats = chatsRes.data?.items || [];
+    console.log(`[beeper/warm-cache] Warming ${chats.length} chats, depth=${depth}`);
+    let warmed = 0, failed = 0;
+    for (const chat of chats) {
+      try {
+        await axios.get(
+          `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(chat.id)}&limit=${depth}`,
+          { headers: beeperHeaders(), timeout: 15000 }
+        );
+        warmed++;
+      } catch (_) { failed++; }
+    }
+    res.json({ ok: true, total: chats.length, warmed, failed });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.message });
+  }
+});
+
+// ── Beeper: POST /beeper/sync-chats (WA + TG groups → Notion Companies) ──────
 app.post("/beeper/sync-chats", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
@@ -713,7 +692,7 @@ app.post("/beeper/sync-chats", async (req, res) => {
     })).filter(c => c.name);
     const results = [];
     for (const group of groups) {
-      const chatName = group.title || "";
+      const chatName    = group.title || "";
       const networkLabel = networks.find(n => group.accountID?.includes(n))?.toUpperCase() || "MSG";
       const match = companies.find(c => fuzzyMatch(chatName, c.name));
       if (!match) { results.push({ chat: chatName, network: networkLabel, status: "no_match" }); continue; }
@@ -740,7 +719,7 @@ app.post("/beeper/sync-chats", async (req, res) => {
         results.push({ chat: chatName, network: networkLabel, company: match.name, status: "notion_error", error: e.message });
       }
     }
-    const synced = results.filter(r => r.status === "synced").length;
+    const synced  = results.filter(r => r.status === "synced").length;
     const noMatch = results.filter(r => r.status === "no_match").length;
     res.json({ ok: true, synced, noMatch, total: groups.length, results });
   } catch (err) {
@@ -748,6 +727,7 @@ app.post("/beeper/sync-chats", async (req, res) => {
   }
 });
 
+// ── Beeper: POST /beeper/sync-linkedin (LinkedIn DMs → Notion People) ─────────
 app.post("/beeper/sync-linkedin", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
@@ -793,7 +773,7 @@ app.post("/beeper/sync-linkedin", async (req, res) => {
         results.push({ chat: chatName, person: match.name, status: "notion_error", error: e.message });
       }
     }
-    const synced = results.filter(r => r.status === "synced").length;
+    const synced  = results.filter(r => r.status === "synced").length;
     const noMatch = results.filter(r => r.status === "no_match").length;
     res.json({ ok: true, synced, noMatch, total: liChats.length, results });
   } catch (err) {
@@ -801,14 +781,39 @@ app.post("/beeper/sync-linkedin", async (req, res) => {
   }
 });
 
+// ── node-cron: auto warm-cache every weekday at 09:00 EET ────────────────────
+if (BEEPER_TOKEN) {
+  cron.schedule("0 9 * * 1-5", async () => {
+    console.log("[cron] Running warm-cache...");
+    try {
+      const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=100`, { headers: beeperHeaders(), timeout: 15000 });
+      const chats = chatsRes.data?.items || [];
+      let warmed = 0;
+      for (const chat of chats) {
+        try {
+          await axios.get(
+            `${BEEPER_URL}/v1/messages?chatID=${encodeURIComponent(chat.id)}&limit=200`,
+            { headers: beeperHeaders(), timeout: 15000 }
+          );
+          warmed++;
+        } catch (_) {}
+      }
+      console.log(`[cron] warm-cache done: ${warmed}/${chats.length}`);
+    } catch (e) {
+      console.error("[cron] warm-cache failed:", e.message);
+    }
+  }, { timezone: "Europe/Tallinn" });
+  console.log("[cron] warm-cache scheduler registered (weekdays 09:00 EET)");
+}
+
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
   ok: true,
-  notion: !!NOTION_TOKEN,
+  notion:   !!NOTION_TOKEN,
   parallel: !!PARALLEL_KEY,
-  beeper: !!BEEPER_TOKEN,
+  beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.1", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.2", status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));

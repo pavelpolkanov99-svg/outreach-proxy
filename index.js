@@ -1162,7 +1162,262 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.7", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.9", status: "ok" }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+
+// ══════════════════════════════════════════════════════════════════════════════
+// BEEPER → NOTION SYNC ENGINE
+// ══════════════════════════════════════════════════════════════════════════════
+
+const MESSAGES_HUB_DB = "8617a441c4254b41be671a1e65946a03";
+const COMPANIES_DB_ID  = "f9b59c5b05fa4df18f9569479633fd74";
+const PEOPLE_DB_ID     = "f36b2a0f0ab241cebbdbd1d0874a55be";
+
+let lastSyncAt = null;
+
+function networkFromAccountID(accountID = "", chatID = "") {
+  if (accountID === "telegram") return "Telegram";
+  if (accountID.includes("linkedin")) return "LinkedIn";
+  return "WhatsApp";
+}
+
+function extractCompanyName(chatName = "") {
+  return chatName
+    .replace(/RemiDe|Remide|Plexo|plexo/gi, "")
+    .replace(/<>|<=>|x\s/gi, "|")
+    .split("|")[0]
+    .replace(/[<>]/g, "")
+    .trim();
+}
+
+async function findNotionCompany(name) {
+  if (!name || name.length < 2) return null;
+  try {
+    const r = await notion.databases.query({
+      database_id: COMPANIES_DB_ID,
+      filter: { property: "Company name", title: { contains: name.slice(0, 30) } },
+      page_size: 1
+    });
+    return r.results?.[0]?.id || null;
+  } catch (_) { return null; }
+}
+
+async function findNotionPeopleByNames(names = []) {
+  const ids = [];
+  for (const name of names.slice(0, 5)) {
+    const clean = name.replace(/@.*/, "").trim();
+    if (!clean || clean.length < 2) continue;
+    try {
+      const r = await notion.databases.query({
+        database_id: PEOPLE_DB_ID,
+        filter: { property: "Name", title: { contains: clean.slice(0, 30) } },
+        page_size: 1
+      });
+      if (r.results?.[0]?.id) ids.push(r.results[0].id);
+    } catch (_) {}
+  }
+  return ids;
+}
+
+async function findHubByRemoteId(remoteId) {
+  try {
+    const r = await notion.databases.query({
+      database_id: MESSAGES_HUB_DB,
+      filter: { property: "Remote ID", rich_text: { equals: remoteId } },
+      page_size: 1
+    });
+    return r.results?.[0]?.id || null;
+  } catch (_) { return null; }
+}
+
+async function getChatParticipantNames(chatID) {
+  try {
+    const rpc = { jsonrpc: "2.0", id: Date.now(), method: "tools/call",
+      params: { name: "get_chat", arguments: { chatID, maxParticipantCount: 10 } } };
+    const r = await axios.post(`${BEEPER_URL}/v0/mcp`, rpc,
+      { headers: beeperMcpHeaders(), timeout: 10000, responseType: "text" });
+    const result = parseMcpSse(r.data);
+    const text = result?.content?.[0]?.text || "";
+    const names = [];
+    for (const m of text.matchAll(/[-•*]\s+([A-Za-zА-Яа-я][^\n,@(]{2,30})/g)) {
+      const n = m[1].trim();
+      if (!/plexo|remide|anton|pavel/i.test(n)) names.push(n);
+    }
+    return names;
+  } catch (_) { return []; }
+}
+
+async function upsertChatToHub(chatInfo) {
+  const { chatName, chatID, accountID, lastMsg, lastActiveDate } = chatInfo;
+  const net = networkFromAccountID(accountID, chatID);
+  const companyName = extractCompanyName(chatName);
+  const companyId = await findNotionCompany(companyName);
+  const participantNames = await getChatParticipantNames(chatID);
+  const personIds = await findNotionPeopleByNames(participantNames);
+
+  let lastMsgText = "", rawSender = "", lastDate = lastActiveDate || null;
+  if (lastMsg) {
+    const timeM = lastMsg.match(/\[(\d{2})\.(\d{2})\.(\d{4})/);
+    if (timeM) lastDate = `${timeM[3]}-${timeM[2]}-${timeM[1]}`;
+    const senderM = lastMsg.match(/[→←]\s+([^:]+):/);
+    rawSender = senderM?.[1]?.trim() || "";
+    lastMsgText = lastMsg.replace(/^\[.*?\]\s*[→←]\s*[^:]+:\s*/, "").trim().slice(0, 500);
+  }
+
+  const props = {
+    "Chat Name":  { title:       [{ text: { content: chatName || "Unknown" } }] },
+    "Remote ID":  { rich_text:   [{ text: { content: chatID } }] },
+    "Network":    { multi_select: [{ name: net }] },
+    "Status":     { status:      { name: "Active" } },
+  };
+  if (lastMsgText) props["Last Message"]    = { rich_text: [{ text: { content: lastMsgText } }] };
+  if (rawSender)   props["Raw Sender Name"] = { rich_text: [{ text: { content: rawSender } }] };
+  if (lastDate)    props["Last Active"]     = { date: { start: lastDate } };
+  if (companyId)   props["Link: Companies"] = { relation: [{ id: companyId }] };
+  if (personIds.length) props["Link: People"] = { relation: personIds.map(id => ({ id })) };
+  if (participantNames.length)
+    props["Participants"] = { rich_text: [{ text: { content: participantNames.join(", ").slice(0, 500) } }] };
+  if (links.discoveryCard) props["Discovery Card Sent"] = { checkbox: true };
+  if (links.calendly)      props["Calendly Sent"]       = { checkbox: true };
+
+  const existingId = await findHubByRemoteId(chatID);
+  if (existingId) {
+    await notion.pages.update({ page_id: existingId, properties: props });
+    return { action: "updated", chatName };
+  } else {
+    await notion.pages.create({ parent: { database_id: MESSAGES_HUB_DB }, properties: props });
+    return { action: "created", chatName };
+  }
+}
+
+async function runBeeperSync(opts = {}) {
+  const { since, limit = 100 } = opts;
+  if (!BEEPER_TOKEN) throw new Error("BEEPER_TOKEN not set");
+  const results = { created: 0, updated: 0, skipped: 0, errors: [] };
+
+  const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=${limit}`,
+    { headers: beeperHeaders(), timeout: 15000 });
+  const allChats = chatsRes.data?.items || [];
+  const sinceDate = since ? new Date(since) : null;
+  const filtered = sinceDate
+    ? allChats.filter(c => c.lastActivityAt && new Date(c.lastActivityAt) > sinceDate)
+    : allChats;
+
+  console.log(`[sync] ${filtered.length} chats to sync (since=${since || "all"})`);
+
+  for (const c of filtered) {
+    try {
+      // Получаем последнее сообщение через MCP
+      const rpc = { jsonrpc: "2.0", id: Date.now(), method: "tools/call",
+        params: { name: "list_messages", arguments: { chatID: c.id } } };
+      const mr = await axios.post(`${BEEPER_URL}/v0/mcp`, rpc,
+        { headers: beeperMcpHeaders(), timeout: 15000, responseType: "text" });
+      const msgResult = parseMcpSse(mr.data);
+      const msgText = msgResult?.content?.[0]?.text || "";
+      let lastMsg = "", lastActiveDate = null;
+      try {
+        const parsed = JSON.parse(msgText);
+        const first = parsed.items?.[0];
+        if (first) {
+          const t = new Date(first.timestamp);
+          lastActiveDate = t.toISOString().split("T")[0];
+          lastMsg = `[${t.toLocaleString("ru-RU")}] ${first.isSender ? "→" : "←"} ${first.senderName}: ${first.text || "[медиа]"}`;
+        }
+      } catch (_) {}
+
+      const r = await upsertChatToHub({
+        chatName: c.title || c.name || "Unknown",
+        chatID: c.id, accountID: c.accountID,
+        lastMsg, lastActiveDate,
+      });
+      if (r.action === "created") results.created++;
+      else results.updated++;
+      await new Promise(r => setTimeout(r, 400)); // rate limit protection
+    } catch (e) {
+      results.errors.push(`${c.title}: ${e.message}`);
+      results.skipped++;
+    }
+  }
+
+  lastSyncAt = new Date().toISOString();
+  return results;
+}
+
+// ── POST /beeper/sync-to-notion ───────────────────────────────────────────────
+app.post("/beeper/sync-to-notion", async (req, res) => {
+  if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
+  const { since, limit = 100 } = req.body || {};
+  console.log(`[sync] Manual sync triggered since=${since || "all"}`);
+  try {
+    const results = await runBeeperSync({ since, limit });
+    res.json({ ok: true, ...results, lastSyncAt });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /beeper/sync-status ───────────────────────────────────────────────────
+app.get("/beeper/sync-status", (_, res) =>
+  res.json({ ok: true, lastSyncAt, nextSync: "hourly cron" })
+);
+
+// ── node-cron: Beeper→Notion incremental sync every hour ─────────────────────
+if (BEEPER_TOKEN && NOTION_TOKEN) {
+  cron.schedule("0 * * * *", async () => {
+    console.log("[cron] Beeper→Notion sync start");
+    try {
+      const since = lastSyncAt || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const results = await runBeeperSync({ since, limit: 100 });
+      console.log(`[cron] sync done: +${results.created} created, ~${results.updated} updated, ${results.skipped} skipped`);
+    } catch (e) { console.error("[cron] sync failed:", e.message); }
+  });
+  console.log("[cron] Beeper→Notion sync registered (every hour)");
+
+  // При старте — догоняющий синк за последние 7 дней
+  setTimeout(async () => {
+    console.log("[startup] Running catch-up sync (last 7 days)...");
+    try {
+      const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const results = await runBeeperSync({ since, limit: 100 });
+      console.log(`[startup] catch-up done: +${results.created} created, ~${results.updated} updated`);
+    } catch (e) { console.error("[startup] catch-up failed:", e.message); }
+  }, 15000); // 15 сек после старта
+}
+
+// ── Link detection helpers ─────────────────────────────────────────────────
+// Паттерны для определения отправки Discovery Card и Calendly
+const DISCOVERY_CARD_PATTERN = /notion\.so\/plex0\/Discovery-Card/i;
+const CALENDLY_PATTERN = /calendly\.com\/plex0\//i;
+
+async function checkLinksInChat(chatID) {
+  const result = { discoveryCard: false, calendly: false };
+  try {
+    // Читаем историю сообщений через MCP (берём побольше — ищем по всей истории)
+    const rpc = {
+      jsonrpc: "2.0", id: Date.now(), method: "tools/call",
+      params: { name: "list_messages", arguments: { chatID } }
+    };
+    const r = await axios.post(`${BEEPER_URL}/v0/mcp`, rpc,
+      { headers: beeperMcpHeaders(), timeout: 20000, responseType: "text" });
+    const msgResult = parseMcpSse(r.data);
+    const msgText = msgResult?.content?.[0]?.text || "";
+
+    let items = [];
+    try { items = JSON.parse(msgText)?.items || []; } catch (_) {}
+
+    for (const msg of items) {
+      const text = msg.text || "";
+      if (!result.discoveryCard && DISCOVERY_CARD_PATTERN.test(text)) {
+        result.discoveryCard = true;
+      }
+      if (!result.calendly && CALENDLY_PATTERN.test(text)) {
+        result.calendly = true;
+      }
+      // Если оба нашли — можно выйти раньше
+      if (result.discoveryCard && result.calendly) break;
+    }
+  } catch (_) {}
+  return result;
+}

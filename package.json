@@ -1,9 +1,9 @@
 {
   "name": "outreach-proxy",
-  "version": "2.7.0",
+  "version": "3.1.0",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js & node bot.js"
+    "start": "bash start.sh"
   },
   "dependencies": {
     "express": "^4.18.0",

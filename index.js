@@ -1162,7 +1162,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.1", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.2", status: "ok" }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1326,8 +1326,8 @@ async function upsertChatToHub(chatInfo) {
   if (personIds.length) props["Link: People"] = { relation: personIds.map(id => ({ id })) };
   if (participantNames.length)
     props["Participants"] = { rich_text: [{ text: { content: participantNames.join(", ").slice(0, 500) } }] };
-  if (links.discoveryCard) props["Discovery Card Sent"] = { checkbox: true };
-  if (links.calendly)      props["Calendly Sent"]       = { checkbox: true };
+  if (links.discoveryCard) props["DiscoveryCard"] = { checkbox: true };
+  if (links.calendly)      props["Calendly"] = { checkbox: true };
 
   const existingId = await findHubByRemoteId(chatID);
   if (existingId) {

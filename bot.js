@@ -480,22 +480,9 @@ bot.catch(err => {
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-async function startBot() {
-  try {
-    console.log("[bot] Plexo Loop Bot starting" + (ANTHROPIC_KEY ? " (AI mode ON)" : " (AI mode OFF)"));
-    await bot.start({
-      drop_pending_updates: true,
-      onStart: () => console.log("[bot] Plexo Loop Bot started"),
-    });
-  } catch (err) {
-    if (err.error_code === 409) {
-      // Another instance running — wait and retry
-      console.log("[bot] 409 conflict, retrying in 5s...");
-      setTimeout(startBot, 5000);
-    } else {
-      console.error("[bot] Fatal error:", err.message);
-      // Don't crash the whole process — just log
-    }
-  }
-}
-startBot();
+console.log("[bot] Plexo Loop Bot starting" + (ANTHROPIC_KEY ? " (AI mode ON)" : " (AI mode OFF)"));
+bot.start().then(() => {
+  console.log("[bot] Plexo Loop Bot started");
+}).catch(err => {
+  console.error("[bot] Start error (non-fatal):", err.message);
+});

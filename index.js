@@ -1162,7 +1162,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.9.3", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.9.4", status: "ok" }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1290,6 +1290,9 @@ async function upsertChatToHub(chatInfo) {
   const companyId = await findNotionCompany(companyName);
   const participantNames = await getChatParticipantNames(chatID);
   const personIds = await findNotionPeopleByNames(participantNames);
+
+  // Проверяем наличие ссылок в истории чата
+  const links = await checkLinksInChat(chatID);
 
   let lastMsgText = "", rawSender = "", lastDate = lastActiveDate || null;
   if (lastMsg) {

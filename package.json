@@ -3,7 +3,7 @@
   "version": "3.1.0",
   "main": "index.js",
   "scripts": {
-    "start": "node bot.js & node index.js",
+    "start": "node index.js",
     "start:proxy": "node index.js",
     "start:bot": "node bot.js"
   },

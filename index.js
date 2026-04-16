@@ -1162,7 +1162,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.3", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.4", status: "ok" }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1438,3 +1438,6 @@ if (BEEPER_TOKEN && NOTION_TOKEN) {
     } catch (e) { console.error("[startup] catch-up failed:", e.message); }
   }, 90000); // 90s delay — proxy starts first
 }
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));

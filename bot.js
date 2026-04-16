@@ -16,6 +16,14 @@ if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
 
 const bot = new Bot(BOT_TOKEN);
 
+// Prevent grammy crashes from killing the whole process
+process.on("uncaughtException", err => {
+  console.error("[bot] Uncaught exception (ignored):", err.message);
+});
+process.on("unhandledRejection", err => {
+  console.error("[bot] Unhandled rejection (ignored):", err?.message || err);
+});
+
 // ── Auth ──────────────────────────────────────────────────────────────────────
 function isAllowed(ctx) {
   if (ALLOWED_USERS.length === 0) return true; // dev mode

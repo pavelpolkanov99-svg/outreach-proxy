@@ -1162,7 +1162,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.0", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.1", status: "ok" }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1387,7 +1387,9 @@ async function runBeeperSync(opts = {}) {
       console.log(`[sync] ${r.action}: ${r.chatName}`);
       await new Promise(r => setTimeout(r, 400));
     } catch (e) {
-      results.errors.push(`${c.title || c.id}: ${e.message}`);
+      const errMsg = e.response?.data ? JSON.stringify(e.response.data).slice(0, 200) : e.message;
+      console.error(`[sync] ERROR ${c.title || c.id}: ${errMsg}`);
+      results.errors.push(`${c.title || c.id}: ${errMsg}`);
       results.skipped++;
     }
   }

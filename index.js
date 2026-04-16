@@ -1162,7 +1162,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.9.4", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.0", status: "ok" }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1172,10 +1172,12 @@ app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "2.9.4",
 const MESSAGES_HUB_DB = "8617a441c4254b41be671a1e65946a03";
 const COMPANIES_DB_ID  = "f9b59c5b05fa4df18f9569479633fd74";
 const PEOPLE_DB_ID     = "f36b2a0f0ab241cebbdbd1d0874a55be";
+const DISCOVERY_CARD_PATTERN = /notion\.so\/plex0\/Discovery-Card/i;
+const CALENDLY_PATTERN = /calendly\.com\/plex0\//i;
 
 let lastSyncAt = null;
 
-function networkFromAccountID(accountID = "", chatID = "") {
+function networkFromAccountID(accountID = "") {
   if (accountID === "telegram") return "Telegram";
   if (accountID.includes("linkedin")) return "LinkedIn";
   return "WhatsApp";
@@ -1190,15 +1192,42 @@ function extractCompanyName(chatName = "") {
     .trim();
 }
 
+// Notion API helpers using axios (no SDK)
+async function notionQuery(dbId, filter, pageSize = 1) {
+  const r = await axios.post(
+    `https://api.notion.com/v1/databases/${dbId}/query`,
+    { filter, page_size: pageSize },
+    { headers: notionHeaders(), timeout: 10000 }
+  );
+  return r.data.results || [];
+}
+
+async function notionCreatePage(dbId, properties) {
+  const r = await axios.post(
+    "https://api.notion.com/v1/pages",
+    { parent: { database_id: dbId }, properties },
+    { headers: notionHeaders(), timeout: 10000 }
+  );
+  return r.data;
+}
+
+async function notionUpdatePage(pageId, properties) {
+  const r = await axios.patch(
+    `https://api.notion.com/v1/pages/${pageId}`,
+    { properties },
+    { headers: notionHeaders(), timeout: 10000 }
+  );
+  return r.data;
+}
+
 async function findNotionCompany(name) {
   if (!name || name.length < 2) return null;
   try {
-    const r = await notion.databases.query({
-      database_id: COMPANIES_DB_ID,
-      filter: { property: "Company name", title: { contains: name.slice(0, 30) } },
-      page_size: 1
+    const results = await notionQuery(COMPANIES_DB_ID, {
+      property: "Company name",
+      title: { contains: name.slice(0, 30) }
     });
-    return r.results?.[0]?.id || null;
+    return results[0]?.id || null;
   } catch (_) { return null; }
 }
 
@@ -1208,12 +1237,11 @@ async function findNotionPeopleByNames(names = []) {
     const clean = name.replace(/@.*/, "").trim();
     if (!clean || clean.length < 2) continue;
     try {
-      const r = await notion.databases.query({
-        database_id: PEOPLE_DB_ID,
-        filter: { property: "Name", title: { contains: clean.slice(0, 30) } },
-        page_size: 1
+      const results = await notionQuery(PEOPLE_DB_ID, {
+        property: "Name",
+        title: { contains: clean.slice(0, 30) }
       });
-      if (r.results?.[0]?.id) ids.push(r.results[0].id);
+      if (results[0]?.id) ids.push(results[0].id);
     } catch (_) {}
   }
   return ids;
@@ -1221,12 +1249,11 @@ async function findNotionPeopleByNames(names = []) {
 
 async function findHubByRemoteId(remoteId) {
   try {
-    const r = await notion.databases.query({
-      database_id: MESSAGES_HUB_DB,
-      filter: { property: "Remote ID", rich_text: { equals: remoteId } },
-      page_size: 1
+    const results = await notionQuery(MESSAGES_HUB_DB, {
+      property: "Remote ID",
+      rich_text: { equals: remoteId }
     });
-    return r.results?.[0]?.id || null;
+    return results[0]?.id || null;
   } catch (_) { return null; }
 }
 
@@ -1247,36 +1274,21 @@ async function getChatParticipantNames(chatID) {
   } catch (_) { return []; }
 }
 
-// ── Link detection helpers ─────────────────────────────────────────────────
-// Паттерны для определения отправки Discovery Card и Calendly
-const DISCOVERY_CARD_PATTERN = /notion\.so\/plex0\/Discovery-Card/i;
-const CALENDLY_PATTERN = /calendly\.com\/plex0\//i;
-
 async function checkLinksInChat(chatID) {
   const result = { discoveryCard: false, calendly: false };
   try {
-    // Читаем историю сообщений через MCP (берём побольше — ищем по всей истории)
-    const rpc = {
-      jsonrpc: "2.0", id: Date.now(), method: "tools/call",
-      params: { name: "list_messages", arguments: { chatID } }
-    };
+    const rpc = { jsonrpc: "2.0", id: Date.now(), method: "tools/call",
+      params: { name: "list_messages", arguments: { chatID } } };
     const r = await axios.post(`${BEEPER_URL}/v0/mcp`, rpc,
       { headers: beeperMcpHeaders(), timeout: 20000, responseType: "text" });
     const msgResult = parseMcpSse(r.data);
     const msgText = msgResult?.content?.[0]?.text || "";
-
     let items = [];
     try { items = JSON.parse(msgText)?.items || []; } catch (_) {}
-
     for (const msg of items) {
       const text = msg.text || "";
-      if (!result.discoveryCard && DISCOVERY_CARD_PATTERN.test(text)) {
-        result.discoveryCard = true;
-      }
-      if (!result.calendly && CALENDLY_PATTERN.test(text)) {
-        result.calendly = true;
-      }
-      // Если оба нашли — можно выйти раньше
+      if (!result.discoveryCard && DISCOVERY_CARD_PATTERN.test(text)) result.discoveryCard = true;
+      if (!result.calendly && CALENDLY_PATTERN.test(text)) result.calendly = true;
       if (result.discoveryCard && result.calendly) break;
     }
   } catch (_) {}
@@ -1285,13 +1297,11 @@ async function checkLinksInChat(chatID) {
 
 async function upsertChatToHub(chatInfo) {
   const { chatName, chatID, accountID, lastMsg, lastActiveDate } = chatInfo;
-  const net = networkFromAccountID(accountID, chatID);
+  const net = networkFromAccountID(accountID);
   const companyName = extractCompanyName(chatName);
   const companyId = await findNotionCompany(companyName);
   const participantNames = await getChatParticipantNames(chatID);
   const personIds = await findNotionPeopleByNames(participantNames);
-
-  // Проверяем наличие ссылок в истории чата
   const links = await checkLinksInChat(chatID);
 
   let lastMsgText = "", rawSender = "", lastDate = lastActiveDate || null;
@@ -1304,10 +1314,10 @@ async function upsertChatToHub(chatInfo) {
   }
 
   const props = {
-    "Chat Name":  { title:       [{ text: { content: chatName || "Unknown" } }] },
-    "Remote ID":  { rich_text:   [{ text: { content: chatID } }] },
+    "Chat Name":  { title:        [{ text: { content: chatName || "Unknown" } }] },
+    "Remote ID":  { rich_text:    [{ text: { content: chatID } }] },
     "Network":    { multi_select: [{ name: net }] },
-    "Status":     { status:      { name: "Active" } },
+    "Status":     { status:       { name: "Active" } },
   };
   if (lastMsgText) props["Last Message"]    = { rich_text: [{ text: { content: lastMsgText } }] };
   if (rawSender)   props["Raw Sender Name"] = { rich_text: [{ text: { content: rawSender } }] };
@@ -1321,10 +1331,10 @@ async function upsertChatToHub(chatInfo) {
 
   const existingId = await findHubByRemoteId(chatID);
   if (existingId) {
-    await notion.pages.update({ page_id: existingId, properties: props });
+    await notionUpdatePage(existingId, props);
     return { action: "updated", chatName };
   } else {
-    await notion.pages.create({ parent: { database_id: MESSAGES_HUB_DB }, properties: props });
+    await notionCreatePage(MESSAGES_HUB_DB, props);
     return { action: "created", chatName };
   }
 }
@@ -1337,22 +1347,19 @@ async function runBeeperSync(opts = {}) {
   const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=${limit}`,
     { headers: beeperHeaders(), timeout: 15000 });
   const allChats = chatsRes.data?.items || [];
-  // Beeper /v1/chats fields: id, title/name, accountID, lastActivityAt (may be null)
-  // Filter by lastActivityAt if available, otherwise include all
   const sinceDate = since ? new Date(since) : null;
   const filtered = allChats.filter(c => {
     if (!sinceDate) return true;
-    // Try both field names Beeper might use
-    const ts = c.lastActivityAt || c.lastActivity || c.updatedAt || c.timestamp;
-    if (!ts) return true; // no timestamp = always include
+    const ts = c.lastActivityAt || c.lastActivity || c.updatedAt;
+    if (!ts) return true;
     return new Date(ts) > sinceDate;
   });
 
-  console.log(`[sync] ${allChats.length} total chats, ${filtered.length} to sync (since=${since || "all"})`);
+  console.log(`[sync] ${allChats.length} total chats, ${filtered.length} to sync`);
 
   for (const c of filtered) {
     try {
-      // Получаем последнее сообщение через MCP
+      // Получаем последнее сообщение
       const rpc = { jsonrpc: "2.0", id: Date.now(), method: "tools/call",
         params: { name: "list_messages", arguments: { chatID: c.id } } };
       const mr = await axios.post(`${BEEPER_URL}/v0/mcp`, rpc,
@@ -1377,9 +1384,10 @@ async function runBeeperSync(opts = {}) {
       });
       if (r.action === "created") results.created++;
       else results.updated++;
-      await new Promise(r => setTimeout(r, 400)); // rate limit protection
+      console.log(`[sync] ${r.action}: ${r.chatName}`);
+      await new Promise(r => setTimeout(r, 400));
     } catch (e) {
-      results.errors.push(`${c.title}: ${e.message}`);
+      results.errors.push(`${c.title || c.id}: ${e.message}`);
       results.skipped++;
     }
   }
@@ -1406,7 +1414,7 @@ app.get("/beeper/sync-status", (_, res) =>
   res.json({ ok: true, lastSyncAt, nextSync: "hourly cron" })
 );
 
-// ── node-cron: Beeper→Notion incremental sync every hour ─────────────────────
+// ── node-cron: Beeper→Notion sync every hour ──────────────────────────────────
 if (BEEPER_TOKEN && NOTION_TOKEN) {
   cron.schedule("0 * * * *", async () => {
     console.log("[cron] Beeper→Notion sync start");
@@ -1418,7 +1426,7 @@ if (BEEPER_TOKEN && NOTION_TOKEN) {
   });
   console.log("[cron] Beeper→Notion sync registered (every hour)");
 
-  // При старте — догоняющий синк за последние 7 дней
+  // Catch-up sync при старте — последние 7 дней
   setTimeout(async () => {
     console.log("[startup] Running catch-up sync (last 7 days)...");
     try {
@@ -1426,10 +1434,5 @@ if (BEEPER_TOKEN && NOTION_TOKEN) {
       const results = await runBeeperSync({ since, limit: 100 });
       console.log(`[startup] catch-up done: +${results.created} created, ~${results.updated} updated`);
     } catch (e) { console.error("[startup] catch-up failed:", e.message); }
-  }, 15000); // 15 сек после старта
+  }, 15000);
 }
-
-const PORT = process.env.PORT || 3000;
-
-
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));

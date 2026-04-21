@@ -128,8 +128,10 @@ app.post("/notion/upsert-lead", async (req, res) => {
   const {
     firstName, lastName, title, company,
     companyWebsite, companyLinkedin, companyDescription,
-    linkedin, email, status = "Connection Sent"
+    linkedin, email, status = "Not Started"
   } = req.body;
+  const nameOverride = req.body.name;
+  const roleOverride = req.body.role;
   try {
     let companyPageId = null;
     if (company) {
@@ -156,9 +158,10 @@ app.post("/notion/upsert-lead", async (req, res) => {
         companyPageId = newCompany.data.id;
       }
     }
-    const fullName = [firstName, lastName].filter(Boolean).join(" ");
+    const fullName = nameOverride || [firstName, lastName].filter(Boolean).join(" ");
     const personProps = { "Name": { title: [{ text: { content: fullName } }] } };
-    if (title) personProps["Role"] = { rich_text: [{ text: { content: title } }] };
+    const roleValue = title || roleOverride;
+    if (roleValue) personProps["Role"] = { rich_text: [{ text: { content: roleValue } }] };
     if (linkedin) personProps["LinkedIn"] = { url: linkedin };
     if (email) personProps["Email"] = { email };
     if (companyPageId) personProps["Company"] = { relation: [{ id: companyPageId }] };
@@ -1162,7 +1165,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.4", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.5", status: "ok" }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════

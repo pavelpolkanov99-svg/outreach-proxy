@@ -366,12 +366,12 @@ app.post("/notion/update-company", async (req, res) => {
     if (priority)     props["Priority"]             = { select: { name: priority } };
     if (bd_score !== undefined) props["BD Score"]   = { number: parseFloat(bd_score) };
     if (corridors?.length) props["Corridors"]       = { multi_select: corridors.map(c => ({ name: c })) };
-    if (description)  props["Company description"]  = { rich_text: [{ text: { content: description } }] };
+    if (description)  props["Company description"]  = { rich_text: [{ text: { content: description.slice(0,2000) } }] };
     if (website)      props["Website"]              = { url: website };
     if (location)     props["Location"]             = { rich_text: [{ text: { content: location } }] };
-    if (source)       props["Source"]               = { rich_text: [{ text: { content: source } }] };
+    if (source)       props["Source"]               = { select: { name: source } };
     if (pipeline)     props["Pipeline"]             = { select: { name: pipeline } };
-    if (type)         props["Type"]                 = { select: { name: type } };
+    if (type)         props["Type"]                 = { multi_select: (Array.isArray(type) ? type : [type]).map(t => ({ name: t })) };
     if (heat)         props["Heat"]                 = { select: { name: heat } };
     if (action)       props["Action"]               = { rich_text: [{ text: { content: action } }] };
     if (status)       props["Stage"]                = { status: { name: status } };
@@ -1229,7 +1229,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.6", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.7", status: "ok" }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════

@@ -327,6 +327,70 @@ app.post("/notion/append-note", async (req, res) => {
   }
 });
 
+
+// ── Notion: POST /notion/update-company ───────────────────────────────────────
+// Заполняет все поля компании в CRM одним вызовом
+app.post("/notion/update-company", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+  const {
+    name,           // required — для поиска
+    industry,       // select: VC/PE, Bank, Fintech, Crypto, Payments, Enterprise, Other, Wallet, Legal, Central Bank
+    priority,       // select: High, Mid, Low
+    bd_score,       // number e.g. 7.5
+    corridors,      // array of strings: ["NGN", "INR", "THB"]
+    description,    // rich_text
+    website,        // url
+    location,       // rich_text
+    source,         // rich_text
+    pipeline,       // select: Fundraising, Sales, Partnership, Unsure, Not relevant, Regulator
+    type,           // select
+    heat,           // select
+    action,         // rich_text
+    status,         // status: Stage field
+  } = req.body;
+
+  if (!name) return res.status(400).json({ error: "name required" });
+
+  try {
+    // Найти компанию
+    const search = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+      { filter: { property: "Company name", title: { contains: name } }, page_size: 1 },
+      { headers: notionHeaders() }
+    );
+    if (!search.data.results.length) return res.status(404).json({ error: `Company not found: ${name}` });
+    const pageId = search.data.results[0].id;
+
+    const props = {};
+    if (industry)     props["Industry"]             = { select: { name: industry } };
+    if (priority)     props["Priority"]             = { select: { name: priority } };
+    if (bd_score !== undefined) props["BD Score"]   = { number: parseFloat(bd_score) };
+    if (corridors?.length) props["Corridors"]       = { multi_select: corridors.map(c => ({ name: c })) };
+    if (description)  props["Company description"]  = { rich_text: [{ text: { content: description } }] };
+    if (website)      props["Website"]              = { url: website };
+    if (location)     props["Location"]             = { rich_text: [{ text: { content: location } }] };
+    if (source)       props["Source"]               = { rich_text: [{ text: { content: source } }] };
+    if (pipeline)     props["Pipeline"]             = { select: { name: pipeline } };
+    if (type)         props["Type"]                 = { select: { name: type } };
+    if (heat)         props["Heat"]                 = { select: { name: heat } };
+    if (action)       props["Action"]               = { rich_text: [{ text: { content: action } }] };
+    if (status)       props["Stage"]                = { status: { name: status } };
+
+    if (!Object.keys(props).length) return res.status(400).json({ error: "No fields to update" });
+
+    await axios.patch(
+      `https://api.notion.com/v1/pages/${pageId}`,
+      { properties: props },
+      { headers: notionHeaders() }
+    );
+
+    res.json({ ok: true, pageId, updated: Object.keys(props) });
+  } catch (e) {
+    const msg = e.response?.data?.message || e.message;
+    res.status(500).json({ error: msg });
+  }
+});
+
 // ── Notion: POST /notion/query ────────────────────────────────────────────────
 app.post("/notion/query", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
@@ -1165,7 +1229,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.5", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.6", status: "ok" }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════

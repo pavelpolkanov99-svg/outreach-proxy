@@ -107,6 +107,512 @@ app.post("/heyreach/proxy", async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// HEYREACH CAMPAIGN API (confirmed working Apr 24, 2026)
+// ══════════════════════════════════════════════════════════════════════════════
+const HEYREACH_API = "https://api.heyreach.io/api/public";
+const DEFAULT_LINKEDIN_ACCOUNT_ID = 81384; // Anton's LinkedIn account
+
+function heyreachHeaders(hrKey) {
+  return {
+    "X-API-KEY": hrKey,
+    "Content-Type": "application/json",
+  };
+}
+
+// ── POST /heyreach/list/create — create empty lead list ───────────────────────
+app.post("/heyreach/list/create", async (req, res) => {
+  const { hrKey, name, type = "USER_LIST" } = req.body;
+  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
+  if (!name) return res.status(400).json({ error: "name required" });
+  try {
+    const r = await axios.post(
+      `${HEYREACH_API}/list/CreateEmptyList`,
+      { name, type },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    res.json({
+      ok: true,
+      listId: r.data?.id,
+      name: r.data?.name,
+      type: r.data?.listType,
+      raw: r.data,
+    });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ── POST /heyreach/campaign/create — create campaign linked to a list ─────────
+app.post("/heyreach/campaign/create", async (req, res) => {
+  const {
+    hrKey,
+    name,
+    linkedInUserListId,
+    linkedInAccountIds = [DEFAULT_LINKEDIN_ACCOUNT_ID],
+  } = req.body;
+  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
+  if (!name || !linkedInUserListId) {
+    return res.status(400).json({ error: "name and linkedInUserListId required" });
+  }
+  try {
+    const r = await axios.post(
+      `${HEYREACH_API}/campaign/Create`,
+      { name, linkedInUserListId, linkedInAccountIds },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    res.json({
+      ok: true,
+      campaignId: r.data?.campaignId,
+      name,
+      linkedInUserListId,
+      linkedInAccountIds,
+      status: "DRAFT",
+    });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ── POST /heyreach/campaigns/list — list all campaigns ────────────────────────
+app.post("/heyreach/campaigns/list", async (req, res) => {
+  const { hrKey, offset = 0, limit = 50 } = req.body;
+  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
+  try {
+    const r = await axios.post(
+      `${HEYREACH_API}/campaign/GetAll`,
+      { offset, limit },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    const items = r.data?.items || [];
+    res.json({
+      ok: true,
+      total: r.data?.totalCount || 0,
+      campaigns: items.map(c => ({
+        id: c.id,
+        name: c.name,
+        status: c.status,
+        listId: c.linkedInUserListId,
+        listName: c.linkedInUserListName,
+        accountIds: c.campaignAccountIds,
+        createdAt: c.creationTime,
+        startedAt: c.startedAt,
+        stats: c.progressStats,
+      })),
+    });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ── POST /heyreach/campaign/create-with-list — одним вызовом: list + campaign ─
+app.post("/heyreach/campaign/create-with-list", async (req, res) => {
+  const {
+    hrKey,
+    campaignName,
+    listName,
+    linkedInAccountIds = [DEFAULT_LINKEDIN_ACCOUNT_ID],
+  } = req.body;
+  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
+  if (!campaignName) return res.status(400).json({ error: "campaignName required" });
+
+  const finalListName = listName || `${campaignName} — leads`;
+  try {
+    // Step 1: create list
+    const listResp = await axios.post(
+      `${HEYREACH_API}/list/CreateEmptyList`,
+      { name: finalListName, type: "USER_LIST" },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    const listId = listResp.data?.id;
+    if (!listId) return res.status(500).json({ error: "List creation returned no id", raw: listResp.data });
+
+    // Step 2: create campaign
+    const campResp = await axios.post(
+      `${HEYREACH_API}/campaign/Create`,
+      { name: campaignName, linkedInUserListId: listId, linkedInAccountIds },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    res.json({
+      ok: true,
+      campaignId: campResp.data?.campaignId,
+      listId,
+      campaignName,
+      listName: finalListName,
+      linkedInAccountIds,
+      status: "DRAFT",
+      nextStep: `Add leads via HeyReach public API /lead/AddLeadsToCampaignV2 with campaignId=${campResp.data?.campaignId}`,
+    });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// HEYREACH CAMPAIGN API — Sequence / Schedule / Accounts (Apr 24, 2026)
+// Placeholders: {FIRST_NAME}, {LAST_NAME}, {POSITION}, {COMPANY},
+//               {LOCATION}, {INDUSTRY}, {ACCOUNT_NAME}, {ACCOUNT_LAST_NAME}
+// Rule: ALL nodes incl. END require actionDelay >= 3 HOURS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Terminal END-node with required 3h delay
+const END_NODE = { nodeType: "END", actionDelay: 3, actionDelayUnit: "HOUR" };
+
+// ── Plexo Sequence Presets ────────────────────────────────────────────────────
+const PLEXO_PRESETS = {
+  // Preset 1: Connect request with note, END on both branches
+  connect_note: (msgs = {}) => ({
+    nodeType: "CONNECTION_REQUEST",
+    actionDelay: 3,
+    actionDelayUnit: "HOUR",
+    payload: {
+      messages: [
+        msgs.note ||
+        "Hi {FIRST_NAME}, building Plexo — stablecoin clearing for licensed FIs. Thought {COMPANY} might be relevant. Connect?"
+      ],
+      fallbackMessage:
+        msgs.noteFallback ||
+        "Hi, building Plexo — stablecoin clearing for licensed FIs. Connect?",
+      toBeWithdrawnAfterDays: msgs.withdrawDays || 14,
+    },
+    conditionalNode: END_NODE,
+    unconditionalNode: END_NODE,
+  }),
+
+  // Preset 2: Blank connect + MESSAGE on accept
+  connect_fu: (msgs = {}) => ({
+    nodeType: "CONNECTION_REQUEST",
+    actionDelay: 3,
+    actionDelayUnit: "HOUR",
+    payload: {
+      messages: [""],
+      toBeWithdrawnAfterDays: msgs.withdrawDays || 14,
+    },
+    conditionalNode: {
+      nodeType: "MESSAGE",
+      actionDelay: msgs.fuDelay || 2,
+      actionDelayUnit: "DAY",
+      payload: {
+        messages: [
+          msgs.followup ||
+          "Thanks for connecting {FIRST_NAME}. Plexo is a stablecoin clearing network for licensed FIs — cross-border settlement on USDC/USDT/EURC. Curious if relevant to {COMPANY}."
+        ],
+        fallbackMessage:
+          msgs.followupFallback ||
+          "Thanks for connecting. Plexo — stablecoin clearing network for licensed FIs. Happy to share a one-pager if useful.",
+      },
+      unconditionalNode: END_NODE,
+    },
+    unconditionalNode: END_NODE,
+  }),
+
+  // Preset 3: Connect with note → message on accept → second follow-up on no-reply
+  connect_note_fu: (msgs = {}) => ({
+    nodeType: "CONNECTION_REQUEST",
+    actionDelay: 3,
+    actionDelayUnit: "HOUR",
+    payload: {
+      messages: [
+        msgs.note ||
+        "Hi {FIRST_NAME}, building Plexo — stablecoin clearing for licensed FIs. Saw your work at {COMPANY}. Open to connect?"
+      ],
+      fallbackMessage:
+        msgs.noteFallback ||
+        "Hi, building Plexo — stablecoin clearing for licensed FIs. Open to connect?",
+      toBeWithdrawnAfterDays: msgs.withdrawDays || 14,
+    },
+    conditionalNode: {
+      nodeType: "MESSAGE",
+      actionDelay: msgs.fu1Delay || 3,
+      actionDelayUnit: "DAY",
+      payload: {
+        messages: [
+          msgs.followup1 ||
+          "Thanks for connecting {FIRST_NAME}. Plexo = SWIFT for stablecoins, built only for licensed FIs. Cross-border USDC/USDT/EURC, fully KYC/AML-compliant. Relevant to {COMPANY}? 15 min next week?"
+        ],
+        fallbackMessage:
+          msgs.followup1Fallback ||
+          "Thanks for connecting. Plexo — stablecoin clearing for licensed FIs. 15 min next week to see if there's a fit?",
+      },
+      unconditionalNode: {
+        nodeType: "MESSAGE",
+        actionDelay: msgs.fu2Delay || 5,
+        actionDelayUnit: "DAY",
+        payload: {
+          messages: [
+            msgs.followup2 ||
+            "Quick follow-up {FIRST_NAME} — we're onboarding founding partners now, 4 live corridors (EU↔LATAM, UAE↔SEA, UK↔Africa, US↔Philippines). Worth 15 min this week?"
+          ],
+          fallbackMessage:
+            msgs.followup2Fallback ||
+            "Quick follow-up — we're onboarding founding partners now. Worth 15 min this week?",
+        },
+        unconditionalNode: END_NODE,
+      },
+    },
+    unconditionalNode: END_NODE,
+  }),
+};
+
+// ── POST /heyreach/campaign/update-sequence ───────────────────────────────────
+app.post("/heyreach/campaign/update-sequence", async (req, res) => {
+  const { hrKey, campaignId, preset, customMessages, sequence } = req.body;
+  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
+  if (!campaignId) return res.status(400).json({ error: "campaignId required" });
+
+  let finalSequence;
+  if (sequence) {
+    finalSequence = sequence;
+  } else if (preset) {
+    if (!PLEXO_PRESETS[preset]) {
+      return res.status(400).json({
+        error: `Unknown preset: ${preset}. Valid: ${Object.keys(PLEXO_PRESETS).join(", ")}`,
+      });
+    }
+    finalSequence = PLEXO_PRESETS[preset](customMessages || {});
+  } else {
+    return res.status(400).json({ error: "Either preset or sequence required" });
+  }
+
+  try {
+    await axios.post(
+      `${HEYREACH_API}/campaign/UpdateSequence`,
+      { campaignId, sequence: finalSequence },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    res.json({ ok: true, campaignId, preset: preset || "custom" });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ── GET /heyreach/campaign/get-sequence?hrKey=...&campaignId=... ──────────────
+app.get("/heyreach/campaign/get-sequence", async (req, res) => {
+  const hrKey = req.query.hrKey || req.headers["x-api-key"];
+  const { campaignId } = req.query;
+  if (!hrKey) return res.status(400).json({ error: "hrKey required (query or X-API-KEY header)" });
+  if (!campaignId) return res.status(400).json({ error: "campaignId required" });
+  try {
+    const r = await axios.get(
+      `${HEYREACH_API}/campaign/GetCampaignSequence?campaignId=${campaignId}`,
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    res.json({ ok: true, campaignId, sequence: r.data });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ── POST /heyreach/campaign/update-schedule ───────────────────────────────────
+app.post("/heyreach/campaign/update-schedule", async (req, res) => {
+  const { hrKey, campaignId, schedule } = req.body;
+  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
+  if (!campaignId) return res.status(400).json({ error: "campaignId required" });
+
+  const defaultSchedule = {
+    dailyStartTime: "09:00:00",
+    dailyEndTime: "17:00:00",
+    timeZoneId: "Europe/Tallinn",
+    enabledMonday: true,
+    enabledTuesday: true,
+    enabledWednesday: true,
+    enabledThursday: true,
+    enabledFriday: true,
+    enabledSaturday: false,
+    enabledSunday: false,
+  };
+  const finalSchedule = { ...defaultSchedule, ...(schedule || {}) };
+
+  try {
+    await axios.post(
+      `${HEYREACH_API}/campaign/UpdateSchedule`,
+      { campaignId, schedule: finalSchedule },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    res.json({ ok: true, campaignId, schedule: finalSchedule });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ── POST /heyreach/campaign/update-accounts ───────────────────────────────────
+app.post("/heyreach/campaign/update-accounts", async (req, res) => {
+  const {
+    hrKey,
+    campaignId,
+    linkedInAccountIds = [DEFAULT_LINKEDIN_ACCOUNT_ID],
+  } = req.body;
+  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
+  if (!campaignId) return res.status(400).json({ error: "campaignId required" });
+  try {
+    await axios.post(
+      `${HEYREACH_API}/campaign/UpdateAccounts`,
+      { campaignId, linkedInAccountIds },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    res.json({ ok: true, campaignId, linkedInAccountIds });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ── POST /heyreach/campaign/start — activate campaign (DRAFT → IN_PROGRESS) ───
+app.post("/heyreach/campaign/start", async (req, res) => {
+  const { hrKey, campaignId } = req.body;
+  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
+  if (!campaignId) return res.status(400).json({ error: "campaignId required" });
+  try {
+    const r = await axios.post(
+      `${HEYREACH_API}/campaign/Resume`,
+      { campaignId },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    res.json({ ok: true, campaignId, result: r.data });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ── POST /heyreach/campaign/pause ─────────────────────────────────────────────
+app.post("/heyreach/campaign/pause", async (req, res) => {
+  const { hrKey, campaignId } = req.body;
+  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
+  if (!campaignId) return res.status(400).json({ error: "campaignId required" });
+  try {
+    const r = await axios.post(
+      `${HEYREACH_API}/campaign/Pause`,
+      { campaignId },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    res.json({ ok: true, campaignId, result: r.data });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ⭐ POST /heyreach/campaign/create-full — ONE-SHOT end-to-end
+//    list + campaign + sequence + schedule + optional start
+// ══════════════════════════════════════════════════════════════════════════════
+app.post("/heyreach/campaign/create-full", async (req, res) => {
+  const {
+    hrKey,
+    campaignName,
+    listName,
+    preset = "connect_note",
+    customMessages,
+    sequence: customSequence,
+    linkedInAccountIds = [DEFAULT_LINKEDIN_ACCOUNT_ID],
+    schedule,
+    startImmediately = false,
+  } = req.body;
+
+  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
+  if (!campaignName) return res.status(400).json({ error: "campaignName required" });
+
+  const finalListName = listName || `${campaignName} — leads`;
+  const result = { ok: true, campaignName };
+
+  try {
+    // Step 1: Create list
+    const listResp = await axios.post(
+      `${HEYREACH_API}/list/CreateEmptyList`,
+      { name: finalListName, type: "USER_LIST" },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    result.listId = listResp.data?.id;
+    result.listName = finalListName;
+    if (!result.listId) throw new Error("List creation returned no id");
+
+    // Step 2: Create campaign
+    const campResp = await axios.post(
+      `${HEYREACH_API}/campaign/Create`,
+      {
+        name: campaignName,
+        linkedInUserListId: result.listId,
+        linkedInAccountIds,
+      },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    result.campaignId = campResp.data?.campaignId;
+    result.linkedInAccountIds = linkedInAccountIds;
+    if (!result.campaignId) throw new Error("Campaign creation returned no id");
+
+    // Step 3: Resolve sequence
+    let finalSequence;
+    if (customSequence) {
+      finalSequence = customSequence;
+      result.preset = "custom";
+    } else {
+      if (!PLEXO_PRESETS[preset]) {
+        throw new Error(
+          `Unknown preset: ${preset}. Valid: ${Object.keys(PLEXO_PRESETS).join(", ")}`
+        );
+      }
+      finalSequence = PLEXO_PRESETS[preset](customMessages || {});
+      result.preset = preset;
+    }
+
+    // Step 4: Upload sequence
+    await axios.post(
+      `${HEYREACH_API}/campaign/UpdateSequence`,
+      { campaignId: result.campaignId, sequence: finalSequence },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    result.sequenceUploaded = true;
+
+    // Step 5: Apply schedule
+    const defaultSchedule = {
+      dailyStartTime: "09:00:00",
+      dailyEndTime: "17:00:00",
+      timeZoneId: "Europe/Tallinn",
+      enabledMonday: true,
+      enabledTuesday: true,
+      enabledWednesday: true,
+      enabledThursday: true,
+      enabledFriday: true,
+      enabledSaturday: false,
+      enabledSunday: false,
+    };
+    const finalSchedule = { ...defaultSchedule, ...(schedule || {}) };
+    await axios.post(
+      `${HEYREACH_API}/campaign/UpdateSchedule`,
+      { campaignId: result.campaignId, schedule: finalSchedule },
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    result.schedule = finalSchedule;
+
+    // Step 6: Optionally start
+    if (startImmediately) {
+      await axios.post(
+        `${HEYREACH_API}/campaign/Resume`,
+        { campaignId: result.campaignId },
+        { headers: heyreachHeaders(hrKey), timeout: 15000 }
+      );
+      result.status = "IN_PROGRESS";
+    } else {
+      result.status = "DRAFT";
+    }
+
+    result.nextStep = result.status === "DRAFT"
+      ? `Add leads via /lead/AddLeadsToCampaignV2 with campaignId=${result.campaignId}, then POST /heyreach/campaign/start to activate`
+      : `Campaign is live. Add leads via /lead/AddLeadsToCampaignV2 with campaignId=${result.campaignId}`;
+
+    res.json(result);
+  } catch (err) {
+    result.ok = false;
+    result.error = err.response?.data || err.message;
+    result.failedAt = result.sequenceUploaded
+      ? "schedule_or_start"
+      : result.campaignId
+      ? "sequence_upload"
+      : result.listId
+      ? "campaign_create"
+      : "list_create";
+    res.status(err.response?.status || 500).json(result);
+  }
+});
+
 // ── Notion: GET /notion/db-schema ─────────────────────────────────────────────
 app.get("/notion/db-schema", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
@@ -1229,7 +1735,7 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.7", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.9", status: "ok" }));
 
 
 // ══════════════════════════════════════════════════════════════════════════════

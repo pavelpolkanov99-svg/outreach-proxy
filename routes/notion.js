@@ -9,6 +9,14 @@ const {
 
 const router = express.Router();
 
+// Helper: MCP sometimes sends objects/arrays as JSON strings — parse defensively.
+function parseIfString(v) {
+  if (typeof v === "string") {
+    try { return JSON.parse(v); } catch { return v; }
+  }
+  return v;
+}
+
 // ── GET /notion/db-schema ─────────────────────────────────────────────────────
 router.get("/db-schema", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
@@ -291,19 +299,89 @@ router.post("/update-company", async (req, res) => {
 });
 
 // ── POST /notion/query ────────────────────────────────────────────────────────
+// Supports pagination via start_cursor.
+// MCP sometimes serializes objects/arrays as JSON strings — we parse them
+// defensively with parseIfString() so callers never need to worry.
 router.post("/query", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
-  const { db_id, filter, sorts, page_size = 20 } = req.body;
+  const {
+    db_id,
+    page_size = 20,
+  } = req.body;
+
+  // Parse defensively — MCP may stringify objects/arrays
+  const filter       = parseIfString(req.body.filter);
+  const sorts        = parseIfString(req.body.sorts);
+  const start_cursor = parseIfString(req.body.start_cursor);
+
   if (!db_id) return res.status(400).json({ error: "db_id required" });
+
   try {
     const payload = { page_size };
-    if (filter) payload.filter = filter;
-    if (sorts)  payload.sorts  = sorts;
-    const r = await axios.post(`https://api.notion.com/v1/databases/${db_id}/query`, payload, { headers: notionHeaders() });
+    if (filter && typeof filter === "object")        payload.filter       = filter;
+    if (Array.isArray(sorts) && sorts.length)        payload.sorts        = sorts;
+    if (start_cursor && typeof start_cursor === "string") payload.start_cursor = start_cursor;
+
+    const r = await axios.post(
+      `https://api.notion.com/v1/databases/${db_id}/query`,
+      payload,
+      { headers: notionHeaders() }
+    );
     res.json(r.data);
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
   }
+});
+
+// ── POST /notion/check-duplicates ─────────────────────────────────────────────
+// Bulk dedup check: given a list of company names, returns which ones
+// already exist in the CRM and their current Stage.
+// Body: { names: ["Airwallex", "Rapyd", ...] }
+router.post("/check-duplicates", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+  let { names } = req.body;
+  names = parseIfString(names);
+  if (!Array.isArray(names) || !names.length) {
+    return res.status(400).json({ error: "names array required" });
+  }
+
+  const found = [];
+  const notFound = [];
+
+  // Search each name individually (Notion doesn't support OR title filters natively)
+  await Promise.all(names.map(async (name) => {
+    try {
+      const r = await axios.post(
+        `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+        {
+          filter: { property: "Company name", title: { contains: name } },
+          page_size: 1,
+        },
+        { headers: notionHeaders() }
+      );
+      if (r.data.results.length > 0) {
+        const page = r.data.results[0];
+        found.push({
+          queried: name,
+          matched: page.properties["Company name"]?.title?.[0]?.text?.content || name,
+          stage:   page.properties["Stage"]?.status?.name || null,
+          pageId:  page.id,
+        });
+      } else {
+        notFound.push(name);
+      }
+    } catch {
+      notFound.push(name);
+    }
+  }));
+
+  res.json({
+    ok: true,
+    total_queried: names.length,
+    found_count: found.length,
+    found,
+    not_found: notFound,
+  });
 });
 
 module.exports = router;

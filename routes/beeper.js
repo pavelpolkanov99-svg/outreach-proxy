@@ -9,6 +9,7 @@ const {
   isTelegram,
   isLinkedIn,
   netLabel,
+  networkFromAccountID,
   fuzzyMatch,
   formatMessages,
   parseMcpSse,
@@ -108,6 +109,66 @@ router.get("/recent", async (req, res) => {
   }
 });
 
+// ── GET /beeper/digest ────────────────────────────────────────────────────────
+// Returns all chats active in the last N days with network label + last message.
+// Used by /comms skill. Uses /v1/chats REST endpoint which has accountID per chat
+// — accountID is the ONLY reliable way to determine network (LI/TG/WA).
+// Query params: days=7 (default), limit=200
+router.get("/digest", async (req, res) => {
+  if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
+  const { days = 7, limit = 200 } = req.query;
+  const since = new Date(Date.now() - parseInt(days) * 24 * 60 * 60 * 1000);
+  try {
+    const r = await axios.get(`${BEEPER_URL}/v1/chats?limit=${limit}`, { headers: beeperHeaders(), timeout: 15000 });
+    const items = r.data?.items || [];
+
+    const filtered = items.filter(c => {
+      const ts = c.lastMessageAt || c.lastActivityAt || c.updatedAt;
+      return ts ? new Date(ts) > since : true;
+    });
+
+    const chats = await Promise.all(filtered.map(async c => {
+      let lastMsgText = "", lastMsgSender = "", lastMsgTime = null, isSender = false;
+      try {
+        const msgs = await beeperGetMessages(c.id, 3);
+        const m = msgs[0];
+        if (m) {
+          const sender = m.sender?.fullName || m.sender?.displayName || m.senderName || "?";
+          const text   = m.content?.text || m.content?.body || m.text || m.body || "";
+          lastMsgText   = text.slice(0, 300);
+          lastMsgSender = sender;
+          lastMsgTime   = m.timestamp || null;
+          isSender      = !!(m.isSender);
+        }
+      } catch (_) {}
+
+      return {
+        id:           c.id,
+        name:         c.title || c.name || "",
+        type:         c.type,                            // "single" | "group"
+        network:      netLabel(c.accountID),             // "LI" | "TG" | "WA"
+        networkFull:  networkFromAccountID(c.accountID), // "LinkedIn" | "Telegram" | "WhatsApp"
+        accountID:    c.accountID,
+        lastMsgText,
+        lastMsgSender,
+        lastMsgTime,
+        isSender,      // true = Anton sent last, false = incoming
+        lastActivity:  c.lastMessageAt || c.lastActivityAt || null,
+      };
+    }));
+
+    res.json({
+      ok: true,
+      days: parseInt(days),
+      since: since.toISOString(),
+      total: chats.length,
+      chats,
+    });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.message });
+  }
+});
+
 // ── GET /beeper/messages ──────────────────────────────────────────────────────
 router.get("/messages", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
@@ -168,6 +229,7 @@ router.post("/get-conversation", async (req, res) => {
       return {
         chatName: c.title || c.name || "",
         network: netLabel(c.accountID),
+        networkFull: networkFromAccountID(c.accountID),
         type: c.type,
         messageCount: msgs.length,
         messages: msgs,
@@ -191,11 +253,7 @@ router.post("/send", async (req, res) => {
       method: "tools/call",
       params: { name: "send_message", arguments: { chatID: chatId, text } }
     };
-    const r = await axios.post(
-      `${BEEPER_URL}/v0/mcp`,
-      rpcBody,
-      { headers: beeperMcpHeaders(), timeout: 10000, responseType: "text" }
-    );
+    const r = await axios.post(`${BEEPER_URL}/v0/mcp`, rpcBody, { headers: beeperMcpHeaders(), timeout: 10000, responseType: "text" });
     res.json({ ok: true, result: r.data?.result });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.message });
@@ -213,11 +271,7 @@ router.post("/search", async (req, res) => {
       method: "tools/call",
       params: { name: "search_messages", arguments: { query, limit: 50 } }
     };
-    const r = await axios.post(
-      `${BEEPER_URL}/v0/mcp`,
-      rpcBody,
-      { headers: beeperMcpHeaders(), timeout: 15000, responseType: "text" }
-    );
+    const r = await axios.post(`${BEEPER_URL}/v0/mcp`, rpcBody, { headers: beeperMcpHeaders(), timeout: 15000, responseType: "text" });
     res.json({ ok: true, result: r.data?.result });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.message });
@@ -385,11 +439,7 @@ router.get("/mcp-tools", async (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// Convenience endpoints for Claude (no curl needed)
-// ══════════════════════════════════════════════════════════════════════════════
-
-// GET /beeper/inbox ──────────────────────────────────────────────────────────
+// ── GET /beeper/inbox ─────────────────────────────────────────────────────────
 router.get("/inbox", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   const { network = "all", limit = 10 } = req.query;
@@ -451,7 +501,7 @@ router.get("/inbox", async (req, res) => {
   }
 });
 
-// GET /beeper/chat?name=X ─────────────────────────────────────────────────────
+// ── GET /beeper/chat?name=X ───────────────────────────────────────────────────
 router.get("/chat", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   const { name, limit = 50 } = req.query;

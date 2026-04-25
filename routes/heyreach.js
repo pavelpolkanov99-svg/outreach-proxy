@@ -187,7 +187,12 @@ router.post("/campaign/update-sequence", async (req, res) => {
       { campaignId, sequence: finalSequence },
       { headers: heyreachHeaders(hrKey), timeout: 15000 }
     );
-    res.json({ ok: true, campaignId, preset: preset || "custom" });
+    res.json({
+      ok: true,
+      campaignId,
+      preset: preset || "custom",
+      customMessagesApplied: customMessages ? Object.keys(customMessages) : [],
+    });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
   }
@@ -297,9 +302,48 @@ router.post("/campaign/pause", async (req, res) => {
   }
 });
 
+// ── POST /heyreach/campaign/delete ────────────────────────────────────────────
+// Permanently deletes a campaign (and removes leads from it). Cannot be undone.
+router.post("/campaign/delete", async (req, res) => {
+  const { hrKey, campaignId } = req.body;
+  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
+  if (!campaignId) return res.status(400).json({ error: "campaignId required" });
+  try {
+    const r = await axios.delete(
+      `${HEYREACH_API}/campaign/Delete?campaignId=${campaignId}`,
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    res.json({ ok: true, campaignId, result: r.data || "deleted" });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
+// ── POST /heyreach/list/delete ────────────────────────────────────────────────
+// Permanently deletes a lead list. Cannot be undone.
+router.post("/list/delete", async (req, res) => {
+  const { hrKey, listId } = req.body;
+  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
+  if (!listId) return res.status(400).json({ error: "listId required" });
+  try {
+    const r = await axios.delete(
+      `${HEYREACH_API}/list/DeleteList?listId=${listId}`,
+      { headers: heyreachHeaders(hrKey), timeout: 15000 }
+    );
+    res.json({ ok: true, listId, result: r.data || "deleted" });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
+  }
+});
+
 // ══════════════════════════════════════════════════════════════════════════════
 // ⭐ POST /heyreach/campaign/create-full — ONE-SHOT end-to-end
 //    list + campaign + sequence + schedule + optional start
+//
+// IMPORTANT: customMessages must be a plain object (e.g. {note, followup1, ...}).
+// If using this via MCP, the MCP tool schema must declare customMessages as an
+// explicit z.object — z.any() drops the value somewhere in Streamable HTTP transit.
+// See lib/mcp.js for the canonical schema.
 // ══════════════════════════════════════════════════════════════════════════════
 router.post("/campaign/create-full", async (req, res) => {
   const {
@@ -316,6 +360,16 @@ router.post("/campaign/create-full", async (req, res) => {
 
   if (!hrKey) return res.status(400).json({ error: "hrKey required" });
   if (!campaignName) return res.status(400).json({ error: "campaignName required" });
+
+  // Defensive log: surface what arrived so future debugging in Railway logs
+  // doesn't require code changes.
+  console.log("[heyreach/campaign/create-full] input:", JSON.stringify({
+    campaignName,
+    preset,
+    customMessagesKeys: customMessages ? Object.keys(customMessages) : [],
+    hasCustomSequence: !!customSequence,
+    startImmediately,
+  }));
 
   const finalListName = listName || `${campaignName} — leads`;
   const result = { ok: true, campaignName };
@@ -359,6 +413,9 @@ router.post("/campaign/create-full", async (req, res) => {
       finalSequence = PLEXO_PRESETS[preset](customMessages || {});
       result.preset = preset;
     }
+
+    // Surface what was applied — caller can verify w/o another API round-trip.
+    result.customMessagesApplied = customMessages ? Object.keys(customMessages) : [];
 
     // Step 4: Upload sequence
     await axios.post(

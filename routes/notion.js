@@ -17,6 +17,38 @@ function parseIfString(v) {
   return v;
 }
 
+// Helper: build Notion properties object from BD scoring fields.
+// Used by both /update-company and /update-company-with-tags.
+function buildCompanyProps({ industry, priority, bd_score, corridors, description,
+  website, location, source, pipeline, type, heat, action, status, tags }, existingPage) {
+  const props = {};
+  if (industry)               props["Industry"]            = { select: { name: industry } };
+  if (priority)               props["Priority"]            = { select: { name: priority } };
+  if (bd_score !== undefined) props["BD Score"]            = { number: parseFloat(bd_score) };
+  if (corridors?.length)      props["Corridors"]           = { multi_select: corridors.map(c => ({ name: c })) };
+  if (description)            props["Company description"] = { rich_text: [{ text: { content: description.slice(0, 2000) } }] };
+  if (website)                props["Website"]             = { url: website };
+  if (location)               props["Location"]            = { rich_text: [{ text: { content: location } }] };
+  if (source)                 props["Source"]              = { select: { name: source } };
+  if (pipeline)               props["Pipeline"]            = { select: { name: pipeline } };
+  if (type)                   props["Type"]                = { multi_select: (Array.isArray(type) ? type : [type]).map(t => ({ name: t })) };
+  if (heat)                   props["Heat"]                = { select: { name: heat } };
+  if (action)                 props["Action"]              = { rich_text: [{ text: { content: action } }] };
+  if (status)                 props["Stage"]               = { status: { name: status } };
+
+  // Tags: additive merge with existing — never overwrite
+  const parsedTags = parseIfString(tags);
+  if (Array.isArray(parsedTags) && parsedTags.length) {
+    const existing = existingPage
+      ? (existingPage.properties?.Tags?.multi_select || []).map(t => t.name)
+      : [];
+    const merged = [...new Set([...existing, ...parsedTags])];
+    props["Tags"] = { multi_select: merged.map(t => ({ name: t })) };
+  }
+
+  return props;
+}
+
 // ── GET /notion/db-schema ─────────────────────────────────────────────────────
 router.get("/db-schema", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
@@ -154,7 +186,6 @@ router.post("/update-tags", async (req, res) => {
       { filter: { property: titleField, title: { equals: name } }, page_size: 1 },
       { headers: notionHeaders() }
     );
-    // Fall back to contains-match for companies
     const results = search.data.results.length > 0 ? search.data.results : (db === "companies" ? (await axios.post(
       `https://api.notion.com/v1/databases/${dbId}/query`,
       { filter: { property: titleField, title: { contains: name } }, page_size: 1 },
@@ -245,15 +276,11 @@ router.post("/append-note", async (req, res) => {
 });
 
 // ── POST /notion/update-company ───────────────────────────────────────────────
-// Base update — no tags handling. Used internally by update-company-with-tags.
+// UPSERT: updates existing entry OR creates new one if not found.
+// Does NOT handle tags — use /update-company-with-tags for BD scoring writeback.
 router.post("/update-company", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
-  const {
-    name, industry, priority, bd_score, corridors,
-    description, website, location, source, pipeline,
-    type, heat, action, status,
-  } = req.body;
-
+  const { name, status } = req.body;
   if (!name) return res.status(400).json({ error: "name required" });
 
   try {
@@ -262,52 +289,47 @@ router.post("/update-company", async (req, res) => {
       { filter: { property: "Company name", title: { contains: name } }, page_size: 1 },
       { headers: notionHeaders() }
     );
-    if (!search.data.results.length) return res.status(404).json({ error: `Company not found: ${name}` });
-    const page = search.data.results[0];
-    const pageId = page.id;
 
-    const props = {};
-    if (industry)               props["Industry"]            = { select: { name: industry } };
-    if (priority)               props["Priority"]            = { select: { name: priority } };
-    if (bd_score !== undefined) props["BD Score"]            = { number: parseFloat(bd_score) };
-    if (corridors?.length)      props["Corridors"]           = { multi_select: corridors.map(c => ({ name: c })) };
-    if (description)            props["Company description"] = { rich_text: [{ text: { content: description.slice(0,2000) } }] };
-    if (website)                props["Website"]             = { url: website };
-    if (location)               props["Location"]            = { rich_text: [{ text: { content: location } }] };
-    if (source)                 props["Source"]              = { select: { name: source } };
-    if (pipeline)               props["Pipeline"]            = { select: { name: pipeline } };
-    if (type)                   props["Type"]                = { multi_select: (Array.isArray(type) ? type : [type]).map(t => ({ name: t })) };
-    if (heat)                   props["Heat"]                = { select: { name: heat } };
-    if (action)                 props["Action"]              = { rich_text: [{ text: { content: action } }] };
-    if (status)                 props["Stage"]               = { status: { name: status } };
+    const props = buildCompanyProps(req.body, search.data.results[0] || null);
 
+    // CREATE if not found
+    if (!search.data.results.length) {
+      if (!Object.keys(props).length && !status) {
+        // Minimal create: just the name + default Backlog stage
+        props["Stage"] = { status: { name: "Backlog" } };
+      }
+      props["Company name"] = { title: [{ text: { content: name } }] };
+      // Ensure stage is set on creation
+      if (!props["Stage"]) props["Stage"] = { status: { name: status || "Backlog" } };
+
+      const created = await axios.post(
+        "https://api.notion.com/v1/pages",
+        { parent: { database_id: NOTION_COMPANIES_DB }, properties: props },
+        { headers: notionHeaders() }
+      );
+      return res.json({ ok: true, action: "created", pageId: created.data.id, updated: Object.keys(props) });
+    }
+
+    // UPDATE if found
     if (!Object.keys(props).length) return res.status(400).json({ error: "No fields to update" });
-
+    const pageId = search.data.results[0].id;
     await axios.patch(
       `https://api.notion.com/v1/pages/${pageId}`,
       { properties: props },
       { headers: notionHeaders() }
     );
-
-    res.json({ ok: true, pageId, updated: Object.keys(props) });
+    res.json({ ok: true, action: "updated", pageId, updated: Object.keys(props) });
   } catch (e) {
     res.status(500).json({ error: e.response?.data?.message || e.message });
   }
 });
 
 // ── POST /notion/update-company-with-tags ─────────────────────────────────────
-// Combined endpoint: update company fields + add Tags in ONE call.
-// tags param is additive (mode=add) — never overwrites existing tags.
-// This is the preferred endpoint for BD scoring writeback.
+// UPSERT: updates OR creates company entry + handles Tags additively.
+// Preferred endpoint for BD scoring writeback — one call does everything.
 router.post("/update-company-with-tags", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
-  const {
-    name, industry, priority, bd_score, corridors,
-    description, website, location, source, pipeline,
-    type, heat, action, status,
-  } = req.body;
-  const tags = parseIfString(req.body.tags);
-
+  const { name, status } = req.body;
   if (!name) return res.status(400).json({ error: "name required" });
 
   try {
@@ -316,41 +338,33 @@ router.post("/update-company-with-tags", async (req, res) => {
       { filter: { property: "Company name", title: { contains: name } }, page_size: 1 },
       { headers: notionHeaders() }
     );
-    if (!search.data.results.length) return res.status(404).json({ error: `Company not found: ${name}` });
-    const page = search.data.results[0];
-    const pageId = page.id;
 
-    const props = {};
-    if (industry)               props["Industry"]            = { select: { name: industry } };
-    if (priority)               props["Priority"]            = { select: { name: priority } };
-    if (bd_score !== undefined) props["BD Score"]            = { number: parseFloat(bd_score) };
-    if (corridors?.length)      props["Corridors"]           = { multi_select: corridors.map(c => ({ name: c })) };
-    if (description)            props["Company description"] = { rich_text: [{ text: { content: description.slice(0,2000) } }] };
-    if (website)                props["Website"]             = { url: website };
-    if (location)               props["Location"]            = { rich_text: [{ text: { content: location } }] };
-    if (source)                 props["Source"]              = { select: { name: source } };
-    if (pipeline)               props["Pipeline"]            = { select: { name: pipeline } };
-    if (type)                   props["Type"]                = { multi_select: (Array.isArray(type) ? type : [type]).map(t => ({ name: t })) };
-    if (heat)                   props["Heat"]                = { select: { name: heat } };
-    if (action)                 props["Action"]              = { rich_text: [{ text: { content: action } }] };
-    if (status)                 props["Stage"]               = { status: { name: status } };
+    const existingPage = search.data.results[0] || null;
+    const props = buildCompanyProps(req.body, existingPage);
 
-    // Tags: additive merge — never overwrite existing tags
-    if (Array.isArray(tags) && tags.length) {
-      const existing = (page.properties?.Tags?.multi_select || []).map(t => t.name);
-      const merged = [...new Set([...existing, ...tags])];
-      props["Tags"] = { multi_select: merged.map(t => ({ name: t })) };
+    // CREATE if not found
+    if (!existingPage) {
+      props["Company name"] = { title: [{ text: { content: name } }] };
+      // Always set stage on creation — default to Backlog
+      if (!props["Stage"]) props["Stage"] = { status: { name: status || "Backlog" } };
+
+      const created = await axios.post(
+        "https://api.notion.com/v1/pages",
+        { parent: { database_id: NOTION_COMPANIES_DB }, properties: props },
+        { headers: notionHeaders() }
+      );
+      return res.json({ ok: true, action: "created", pageId: created.data.id, updated: Object.keys(props) });
     }
 
+    // UPDATE if found
     if (!Object.keys(props).length) return res.status(400).json({ error: "No fields to update" });
-
+    const pageId = existingPage.id;
     await axios.patch(
       `https://api.notion.com/v1/pages/${pageId}`,
       { properties: props },
       { headers: notionHeaders() }
     );
-
-    res.json({ ok: true, pageId, updated: Object.keys(props) });
+    res.json({ ok: true, action: "updated", pageId, updated: Object.keys(props) });
   } catch (e) {
     res.status(500).json({ error: e.response?.data?.message || e.message });
   }
@@ -381,6 +395,7 @@ router.post("/query", async (req, res) => {
 });
 
 // ── POST /notion/check-duplicates ─────────────────────────────────────────────
+// Bulk dedup: given array of company names, returns which exist in CRM + their Stage.
 router.post("/check-duplicates", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   let { names } = req.body;

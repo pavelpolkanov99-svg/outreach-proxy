@@ -29,6 +29,11 @@ router.post("/proxy", async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // HEYREACH CAMPAIGN API (confirmed working Apr 24, 2026)
+//
+// Note on lifecycle: the HeyReach Public API does NOT expose endpoints for
+// deleting a campaign or a lead list. Deletion is UI-only. We expose Pause
+// for stopping outreach mid-flight; cleanup of test artifacts must happen
+// in the HeyReach dashboard.
 // ══════════════════════════════════════════════════════════════════════════════
 
 // ── POST /heyreach/list/create — create empty lead list ───────────────────────
@@ -302,48 +307,14 @@ router.post("/campaign/pause", async (req, res) => {
   }
 });
 
-// ── POST /heyreach/campaign/delete ────────────────────────────────────────────
-// Permanently deletes a campaign (and removes leads from it). Cannot be undone.
-router.post("/campaign/delete", async (req, res) => {
-  const { hrKey, campaignId } = req.body;
-  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
-  if (!campaignId) return res.status(400).json({ error: "campaignId required" });
-  try {
-    const r = await axios.delete(
-      `${HEYREACH_API}/campaign/Delete?campaignId=${campaignId}`,
-      { headers: heyreachHeaders(hrKey), timeout: 15000 }
-    );
-    res.json({ ok: true, campaignId, result: r.data || "deleted" });
-  } catch (err) {
-    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
-  }
-});
-
-// ── POST /heyreach/list/delete ────────────────────────────────────────────────
-// Permanently deletes a lead list. Cannot be undone.
-router.post("/list/delete", async (req, res) => {
-  const { hrKey, listId } = req.body;
-  if (!hrKey) return res.status(400).json({ error: "hrKey required" });
-  if (!listId) return res.status(400).json({ error: "listId required" });
-  try {
-    const r = await axios.delete(
-      `${HEYREACH_API}/list/DeleteList?listId=${listId}`,
-      { headers: heyreachHeaders(hrKey), timeout: 15000 }
-    );
-    res.json({ ok: true, listId, result: r.data || "deleted" });
-  } catch (err) {
-    res.status(err.response?.status || 500).json({ error: err.response?.data || err.message });
-  }
-});
-
 // ══════════════════════════════════════════════════════════════════════════════
 // ⭐ POST /heyreach/campaign/create-full — ONE-SHOT end-to-end
 //    list + campaign + sequence + schedule + optional start
 //
-// IMPORTANT: customMessages must be a plain object (e.g. {note, followup1, ...}).
-// If using this via MCP, the MCP tool schema must declare customMessages as an
-// explicit z.object — z.any() drops the value somewhere in Streamable HTTP transit.
-// See lib/mcp.js for the canonical schema.
+// customMessages can arrive as an object OR as a JSON-stringified object
+// (some MCP transports stringify nested objects). The MCP wrapper in
+// lib/mcp.js parses strings before forwarding here, but we also accept
+// strings defensively in case a direct HTTP caller sends one.
 // ══════════════════════════════════════════════════════════════════════════════
 router.post("/campaign/create-full", async (req, res) => {
   const {
@@ -351,12 +322,18 @@ router.post("/campaign/create-full", async (req, res) => {
     campaignName,
     listName,
     preset = "connect_note",
-    customMessages,
     sequence: customSequence,
     linkedInAccountIds = [DEFAULT_LINKEDIN_ACCOUNT_ID],
     schedule,
     startImmediately = false,
   } = req.body;
+
+  // Defensive: parse customMessages if it arrived as a JSON string.
+  let customMessages = req.body.customMessages;
+  if (typeof customMessages === "string") {
+    try { customMessages = JSON.parse(customMessages); }
+    catch { customMessages = undefined; }
+  }
 
   if (!hrKey) return res.status(400).json({ error: "hrKey required" });
   if (!campaignName) return res.status(400).json({ error: "campaignName required" });

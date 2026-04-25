@@ -29,6 +29,7 @@ router.post("/research/start", async (req, res) => {
 });
 
 // ── GET /parallel/result/:taskId ──────────────────────────────────────────────
+// Full output (status + basis with citations + content). Use for deep dive on 1-2 companies.
 router.get("/result/:taskId", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
   const { taskId } = req.params;
@@ -45,6 +46,52 @@ router.get("/result/:taskId", async (req, res) => {
       } catch { output = statusRes.data; }
     }
     res.json({ ok: true, taskId, status, done, failed, output });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+// ── GET /parallel/result/:taskId/compact ──────────────────────────────────────
+// Compact output (only content fields, no basis/citations/excerpts).
+// Use for batch processing: ~600 bytes vs ~7KB. ~10x token saving on batch 25-30.
+router.get("/result/:taskId/compact", async (req, res) => {
+  if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
+  const { taskId } = req.params;
+  try {
+    const statusRes = await axios.get(`https://api.parallel.ai/v1/tasks/runs/${taskId}`, { headers: parallelHeaders(), timeout: 15000 });
+    const status = statusRes.data?.status;
+    const done   = status === "completed" || status === "succeeded";
+    const failed = status === "failed"    || status === "error";
+    if (!done) return res.json({ ok: true, taskId, status, done, failed, compact: null });
+
+    let raw = null;
+    try {
+      const resultRes = await axios.get(`https://api.parallel.ai/v1/tasks/runs/${taskId}/result`, { headers: parallelHeaders(), timeout: 15000 });
+      raw = resultRes.data;
+    } catch { raw = statusRes.data; }
+
+    const c = raw?.output?.content || raw?.content;
+    if (!c) return res.json({ ok: true, taskId, status, done, failed, compact: null, error: "No content in output" });
+
+    // Compact axes: { score, label, source } → tightly packed
+    const ax = (n) => ({
+      s: c[`axis${n}_score`] ?? null,
+      l: c[`axis${n}_label`] ?? null,
+      u: c[`axis${n}_source`] ?? null,
+    });
+
+    const compact = {
+      cat: c.category ?? null,
+      role: c.network_role ?? null,
+      hk: c.hk_triggered ? c.hk_criterion : false,
+      axes: { 1: ax(1), 2: ax(2), 3: ax(3), 4: ax(4), 5: ax(5), 6: ax(6), 7: ax(7), 8: ax(8), 10: ax(10) },
+      strat: c.strategic_entrant_signal === "NOT APPLICABLE" ? null : c.strategic_entrant_signal,
+      ready: c.readiness ?? null,
+      vol: c.est_volume_monthly ?? null,
+      conf: c.confidence_level ?? null,
+    };
+
+    res.json({ ok: true, taskId, status, done, failed, compact });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
   }

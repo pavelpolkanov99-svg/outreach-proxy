@@ -6,8 +6,8 @@ app.use(express.json());
 // ── CORS ──────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin",  "*");
-  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, Cache-Control");
+  res.header("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Api-Key, Cache-Control, Mcp-Session-Id");
   if (req.method === "OPTIONS") return res.sendStatus(200);
   next();
 });
@@ -16,6 +16,7 @@ app.use((req, res, next) => {
 const NOTION_TOKEN  = process.env.NOTION_TOKEN;
 const PARALLEL_KEY  = process.env.PARALLEL_KEY;
 const BEEPER_TOKEN  = process.env.BEEPER_TOKEN;
+const GITHUB_PAT    = process.env.GITHUB_PAT;
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/apollo",   require("./routes/apollo"));
@@ -24,6 +25,7 @@ app.use("/notion",   require("./routes/notion"));
 app.use("/parallel", require("./routes/parallel"));
 app.use("/beeper",   require("./routes/beeper"));
 app.use("/webhook",  require("./routes/webhooks"));
+app.use("/mcp",      require("./routes/mcp")); // ← Custom Connector endpoint for claude.ai
 
 // ── Beeper sync job (mounted under /beeper/*) ─────────────────────────────────
 const beeperSync = require("./jobs/beeper-sync");
@@ -36,8 +38,10 @@ app.get("/health", (_, res) => res.json({
   notion:   !!NOTION_TOKEN,
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
+  github:   !!GITHUB_PAT,
+  mcp:      true,
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.9", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.10", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

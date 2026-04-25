@@ -53,7 +53,8 @@ router.get("/result/:taskId", async (req, res) => {
 
 // ── GET /parallel/result/:taskId/compact ──────────────────────────────────────
 // Compact output (only content fields, no basis/citations/excerpts).
-// Use for batch processing: ~600 bytes vs ~7KB. ~10x token saving on batch 25-30.
+// Use for batch processing: ~400 bytes vs ~7KB. ~15x token saving on batch 25-30.
+// v3.13: schema flattened (no axisN_label/axisN_source). Score-only axes.
 router.get("/result/:taskId/compact", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
   const { taskId } = req.params;
@@ -73,21 +74,28 @@ router.get("/result/:taskId/compact", async (req, res) => {
     const c = raw?.output?.content || raw?.content;
     if (!c) return res.json({ ok: true, taskId, status, done, failed, compact: null, error: "No content in output" });
 
-    // Compact axes: { score, label, source } → tightly packed
-    const ax = (n) => ({
-      s: c[`axis${n}_score`] ?? null,
-      l: c[`axis${n}_label`] ?? null,
-      u: c[`axis${n}_source`] ?? null,
-    });
+    // v3.13: weighted client score formula
+    // /17 normalized: (A1+A3+A6)*3 + (A2+A5+A8)*2 + A4 + A7
+    // Max raw = 90 + 60 + 20 = 170 → normalize ×17/170 = ×0.1
+    const a = (n) => Number(c[`axis${n}_score`]) || 0;
+    const rawScore = (a(1)+a(3)+a(6))*3 + (a(2)+a(5)+a(8))*2 + a(4) + a(7);
+    const clientScore = c.hk_triggered ? 0 : Math.round(rawScore * 0.1 * 10) / 10;
+    const tier = c.hk_triggered ? "Hard Kill"
+               : clientScore >= 9.0 ? "MH"
+               : clientScore >= 7.5 ? "P1"
+               : clientScore >= 5.0 ? "P2"
+               : "P3";
 
     const compact = {
       cat: c.category ?? null,
       role: c.network_role ?? null,
       hk: c.hk_triggered ? c.hk_criterion : false,
-      axes: { 1: ax(1), 2: ax(2), 3: ax(3), 4: ax(4), 5: ax(5), 6: ax(6), 7: ax(7), 8: ax(8), 10: ax(10) },
+      score: clientScore,
+      tier,
+      axes: { 1: a(1), 2: a(2), 3: a(3), 4: a(4), 5: a(5), 6: a(6), 7: a(7), 8: a(8), 10: a(10) },
+      sources: c.top_sources ?? [],
       strat: c.strategic_entrant_signal === "NOT APPLICABLE" ? null : c.strategic_entrant_signal,
       ready: c.readiness ?? null,
-      vol: c.est_volume_monthly ?? null,
       conf: c.confidence_level ?? null,
     };
 

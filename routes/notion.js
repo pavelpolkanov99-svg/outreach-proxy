@@ -143,7 +143,8 @@ router.post("/update-notes", async (req, res) => {
 // ── POST /notion/update-tags ──────────────────────────────────────────────────
 router.post("/update-tags", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
-  const { name, db = "companies", tags, mode = "add" } = req.body;
+  const { name, db = "companies", mode = "add" } = req.body;
+  const tags = parseIfString(req.body.tags);
   if (!name || !tags?.length) return res.status(400).json({ error: "name and tags required" });
   const dbId = db === "companies" ? NOTION_COMPANIES_DB : NOTION_PEOPLE_DB;
   const titleField = db === "companies" ? "Company name" : "Name";
@@ -153,8 +154,14 @@ router.post("/update-tags", async (req, res) => {
       { filter: { property: titleField, title: { equals: name } }, page_size: 1 },
       { headers: notionHeaders() }
     );
-    if (search.data.results.length === 0) return res.status(404).json({ error: `${name} not found` });
-    const page = search.data.results[0];
+    // Fall back to contains-match for companies
+    const results = search.data.results.length > 0 ? search.data.results : (db === "companies" ? (await axios.post(
+      `https://api.notion.com/v1/databases/${dbId}/query`,
+      { filter: { property: titleField, title: { contains: name } }, page_size: 1 },
+      { headers: notionHeaders() }
+    )).data.results : []);
+    if (results.length === 0) return res.status(404).json({ error: `${name} not found` });
+    const page = results[0];
     let finalTags = tags.map(t => ({ name: t }));
     if (mode === "add") {
       const existing = (page.properties?.Tags?.multi_select || []).map(t => t.name);
@@ -238,23 +245,13 @@ router.post("/append-note", async (req, res) => {
 });
 
 // ── POST /notion/update-company ───────────────────────────────────────────────
+// Base update — no tags handling. Used internally by update-company-with-tags.
 router.post("/update-company", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   const {
-    name,
-    industry,
-    priority,
-    bd_score,
-    corridors,
-    description,
-    website,
-    location,
-    source,
-    pipeline,
-    type,
-    heat,
-    action,
-    status,
+    name, industry, priority, bd_score, corridors,
+    description, website, location, source, pipeline,
+    type, heat, action, status,
   } = req.body;
 
   if (!name) return res.status(400).json({ error: "name required" });
@@ -266,7 +263,8 @@ router.post("/update-company", async (req, res) => {
       { headers: notionHeaders() }
     );
     if (!search.data.results.length) return res.status(404).json({ error: `Company not found: ${name}` });
-    const pageId = search.data.results[0].id;
+    const page = search.data.results[0];
+    const pageId = page.id;
 
     const props = {};
     if (industry)               props["Industry"]            = { select: { name: industry } };
@@ -293,35 +291,84 @@ router.post("/update-company", async (req, res) => {
 
     res.json({ ok: true, pageId, updated: Object.keys(props) });
   } catch (e) {
-    const msg = e.response?.data?.message || e.message;
-    res.status(500).json({ error: msg });
+    res.status(500).json({ error: e.response?.data?.message || e.message });
+  }
+});
+
+// ── POST /notion/update-company-with-tags ─────────────────────────────────────
+// Combined endpoint: update company fields + add Tags in ONE call.
+// tags param is additive (mode=add) — never overwrites existing tags.
+// This is the preferred endpoint for BD scoring writeback.
+router.post("/update-company-with-tags", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+  const {
+    name, industry, priority, bd_score, corridors,
+    description, website, location, source, pipeline,
+    type, heat, action, status,
+  } = req.body;
+  const tags = parseIfString(req.body.tags);
+
+  if (!name) return res.status(400).json({ error: "name required" });
+
+  try {
+    const search = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+      { filter: { property: "Company name", title: { contains: name } }, page_size: 1 },
+      { headers: notionHeaders() }
+    );
+    if (!search.data.results.length) return res.status(404).json({ error: `Company not found: ${name}` });
+    const page = search.data.results[0];
+    const pageId = page.id;
+
+    const props = {};
+    if (industry)               props["Industry"]            = { select: { name: industry } };
+    if (priority)               props["Priority"]            = { select: { name: priority } };
+    if (bd_score !== undefined) props["BD Score"]            = { number: parseFloat(bd_score) };
+    if (corridors?.length)      props["Corridors"]           = { multi_select: corridors.map(c => ({ name: c })) };
+    if (description)            props["Company description"] = { rich_text: [{ text: { content: description.slice(0,2000) } }] };
+    if (website)                props["Website"]             = { url: website };
+    if (location)               props["Location"]            = { rich_text: [{ text: { content: location } }] };
+    if (source)                 props["Source"]              = { select: { name: source } };
+    if (pipeline)               props["Pipeline"]            = { select: { name: pipeline } };
+    if (type)                   props["Type"]                = { multi_select: (Array.isArray(type) ? type : [type]).map(t => ({ name: t })) };
+    if (heat)                   props["Heat"]                = { select: { name: heat } };
+    if (action)                 props["Action"]              = { rich_text: [{ text: { content: action } }] };
+    if (status)                 props["Stage"]               = { status: { name: status } };
+
+    // Tags: additive merge — never overwrite existing tags
+    if (Array.isArray(tags) && tags.length) {
+      const existing = (page.properties?.Tags?.multi_select || []).map(t => t.name);
+      const merged = [...new Set([...existing, ...tags])];
+      props["Tags"] = { multi_select: merged.map(t => ({ name: t })) };
+    }
+
+    if (!Object.keys(props).length) return res.status(400).json({ error: "No fields to update" });
+
+    await axios.patch(
+      `https://api.notion.com/v1/pages/${pageId}`,
+      { properties: props },
+      { headers: notionHeaders() }
+    );
+
+    res.json({ ok: true, pageId, updated: Object.keys(props) });
+  } catch (e) {
+    res.status(500).json({ error: e.response?.data?.message || e.message });
   }
 });
 
 // ── POST /notion/query ────────────────────────────────────────────────────────
-// Supports pagination via start_cursor.
-// MCP sometimes serializes objects/arrays as JSON strings — we parse them
-// defensively with parseIfString() so callers never need to worry.
 router.post("/query", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
-  const {
-    db_id,
-    page_size = 20,
-  } = req.body;
-
-  // Parse defensively — MCP may stringify objects/arrays
+  const { db_id, page_size = 20 } = req.body;
   const filter       = parseIfString(req.body.filter);
   const sorts        = parseIfString(req.body.sorts);
   const start_cursor = parseIfString(req.body.start_cursor);
-
   if (!db_id) return res.status(400).json({ error: "db_id required" });
-
   try {
     const payload = { page_size };
-    if (filter && typeof filter === "object")        payload.filter       = filter;
-    if (Array.isArray(sorts) && sorts.length)        payload.sorts        = sorts;
+    if (filter && typeof filter === "object")             payload.filter       = filter;
+    if (Array.isArray(sorts) && sorts.length)             payload.sorts        = sorts;
     if (start_cursor && typeof start_cursor === "string") payload.start_cursor = start_cursor;
-
     const r = await axios.post(
       `https://api.notion.com/v1/databases/${db_id}/query`,
       payload,
@@ -334,9 +381,6 @@ router.post("/query", async (req, res) => {
 });
 
 // ── POST /notion/check-duplicates ─────────────────────────────────────────────
-// Bulk dedup check: given a list of company names, returns which ones
-// already exist in the CRM and their current Stage.
-// Body: { names: ["Airwallex", "Rapyd", ...] }
 router.post("/check-duplicates", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   let { names } = req.body;
@@ -344,19 +388,13 @@ router.post("/check-duplicates", async (req, res) => {
   if (!Array.isArray(names) || !names.length) {
     return res.status(400).json({ error: "names array required" });
   }
-
   const found = [];
   const notFound = [];
-
-  // Search each name individually (Notion doesn't support OR title filters natively)
   await Promise.all(names.map(async (name) => {
     try {
       const r = await axios.post(
         `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
-        {
-          filter: { property: "Company name", title: { contains: name } },
-          page_size: 1,
-        },
+        { filter: { property: "Company name", title: { contains: name } }, page_size: 1 },
         { headers: notionHeaders() }
       );
       if (r.data.results.length > 0) {
@@ -374,14 +412,7 @@ router.post("/check-duplicates", async (req, res) => {
       notFound.push(name);
     }
   }));
-
-  res.json({
-    ok: true,
-    total_queried: names.length,
-    found_count: found.length,
-    found,
-    not_found: notFound,
-  });
+  res.json({ ok: true, total_queried: names.length, found_count: found.length, found, not_found: notFound });
 });
 
 module.exports = router;

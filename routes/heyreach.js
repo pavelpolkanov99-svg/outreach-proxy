@@ -74,7 +74,13 @@ router.post("/campaign/create", async (req, res) => {
   try {
     const r = await axios.post(
       `${HEYREACH_API}/campaign/Create`,
-      { name, linkedInUserListId, linkedInAccountIds },
+      {
+        name,
+        linkedInUserListId,
+        linkedInAccountIds,
+        excludeInOtherCampaigns: true,
+        excludeContactedFromSenderInOtherCampaign: true,
+      },
       { headers: heyreachHeaders(hrKey), timeout: 15000 }
     );
     res.json({
@@ -144,7 +150,13 @@ router.post("/campaign/create-with-list", async (req, res) => {
 
     const campResp = await axios.post(
       `${HEYREACH_API}/campaign/Create`,
-      { name: campaignName, linkedInUserListId: listId, linkedInAccountIds },
+      {
+        name: campaignName,
+        linkedInUserListId: listId,
+        linkedInAccountIds,
+        excludeInOtherCampaigns: true,
+        excludeContactedFromSenderInOtherCampaign: true,
+      },
       { headers: heyreachHeaders(hrKey), timeout: 15000 }
     );
     res.json({
@@ -311,6 +323,10 @@ router.post("/campaign/pause", async (req, res) => {
 // ⭐ POST /heyreach/campaign/create-full — ONE-SHOT end-to-end
 //    list + campaign + sequence + schedule + optional start
 //
+// Always sets excludeInOtherCampaigns=true and
+// excludeContactedFromSenderInOtherCampaign=true on campaign creation
+// to prevent duplicate outreach across campaigns.
+//
 // customMessages can arrive as an object OR as a JSON-stringified object
 // (some MCP transports stringify nested objects). The MCP wrapper in
 // lib/mcp.js parses strings before forwarding here, but we also accept
@@ -363,12 +379,15 @@ router.post("/campaign/create-full", async (req, res) => {
     if (!result.listId) throw new Error("List creation returned no id");
 
     // Step 2: Create campaign
+    // Always exclude leads already contacted in other campaigns / by same sender.
     const campResp = await axios.post(
       `${HEYREACH_API}/campaign/Create`,
       {
         name: campaignName,
         linkedInUserListId: result.listId,
         linkedInAccountIds,
+        excludeInOtherCampaigns: true,
+        excludeContactedFromSenderInOtherCampaign: true,
       },
       { headers: heyreachHeaders(hrKey), timeout: 15000 }
     );
@@ -426,9 +445,13 @@ router.post("/campaign/create-full", async (req, res) => {
     // Step 6: Optionally start
     if (startImmediately) {
       await axios.post(
-        `${HEYREACH_API}/campaign/Resume`,
-        { campaignId: result.campaignId },
-        { headers: heyreachHeaders(hrKey), timeout: 15000 }
+        `${HEYREACH_API}/campaign/StartCampaign`,
+        null,
+        {
+          headers: heyreachHeaders(hrKey),
+          params: { campaignId: result.campaignId },
+          timeout: 15000,
+        }
       );
       result.status = "IN_PROGRESS";
     } else {

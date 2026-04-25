@@ -40,8 +40,9 @@ app.get("/health", (_, res) => res.json({
   beeper:   !!BEEPER_TOKEN,
   github:   !!GITHUB_PAT,
   mcp:      true,
+  version:  "3.12.2",
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.12", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.12.2", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

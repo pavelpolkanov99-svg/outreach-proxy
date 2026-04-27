@@ -64,31 +64,37 @@ async function fetchEvents({ calendarId, timeMin, timeMax, timeZone }) {
 }
 
 // ── Helper: get UTC ms boundaries for "today" in target TZ ───────────────────
-// Returns { startUtcMs, endUtcMs, ymd } where startUtcMs/endUtcMs bracket the
-// civil day (00:00:00 → 24:00:00) in the given timezone, expressed as UTC ms.
-// `ymd` is the YYYY-MM-DD string for that civil day in the target TZ.
 function todayBoundaries(timeZone) {
-  // Get current Y/M/D as seen in the target TZ
   const fmt = new Intl.DateTimeFormat("en-CA", {
     timeZone, year: "numeric", month: "2-digit", day: "2-digit",
   });
-  const ymd = fmt.format(new Date()); // e.g. "2026-04-27" (en-CA gives ISO order)
-
-  // Build a Date that represents "00:00:00 in target TZ on that civil day".
-  // Trick: ask the formatter what UTC offset that civil moment has, then apply.
+  const ymd = fmt.format(new Date());
   const [year, month, day] = ymd.split("-").map(Number);
 
   // Compute target TZ offset for that day's noon (avoids DST edge issues at midnight)
   const noon = Date.UTC(year, month - 1, day, 12, 0, 0);
   const noonInTz = new Date(noon).toLocaleString("en-US", { timeZone });
   const noonAsUtc = new Date(noonInTz + " UTC").getTime();
-  const tzOffsetMs = noonAsUtc - noon;  // negative for east-of-UTC
+  const tzOffsetMs = noonAsUtc - noon;
 
-  // 00:00 of civil day in target TZ, expressed as UTC ms:
   const startUtcMs = Date.UTC(year, month - 1, day, 0, 0, 0) - tzOffsetMs;
   const endUtcMs   = startUtcMs + 24 * 60 * 60 * 1000;
 
   return { startUtcMs, endUtcMs, ymd };
+}
+
+// ── Internal-attendee detection ──────────────────────────────────────────────
+// An attendee is "internal" if:
+//   - their email is on the @remide.xyz Workspace, OR
+//   - their email is a Google Calendar proxy address (resource cals, group
+//     cals, transferred-from cals — all live under *.calendar.google.com).
+// Anything else counts as external.
+function isInternalAttendee(email) {
+  if (!email) return true;
+  const e = email.toLowerCase();
+  if (e.endsWith("@remide.xyz")) return true;
+  if (e.endsWith(".calendar.google.com")) return true;  // catches *.calendar.google.com
+  return false;
 }
 
 // ── Helper: format event for digest output ───────────────────────────────────
@@ -106,9 +112,9 @@ function formatEvent(ev, viewerTimeZone) {
     ? "all-day"
     : `${fmt.format(start)}–${fmt.format(end)}`;
 
-  // Attendees: filter out @remide.xyz (internal team) — keep only externals
+  // Keep only attendees that are external (not @remide.xyz, not GCal proxies)
   const attendees = (ev.attendees || [])
-    .filter(a => !a.self && !(a.email || "").endsWith("@remide.xyz"))
+    .filter(a => !a.self && !isInternalAttendee(a.email))
     .map(a => ({
       email:    a.email,
       name:     a.displayName || null,
@@ -116,10 +122,7 @@ function formatEvent(ev, viewerTimeZone) {
     }));
 
   const externalDomains = [...new Set(
-    attendees
-      .map(a => (a.email || "").split("@")[1])
-      .filter(Boolean)
-      .filter(d => !d.includes("calendar.google.com") && !d.includes("group.calendar.google.com"))
+    attendees.map(a => (a.email || "").split("@")[1]).filter(Boolean)
   )];
 
   return {
@@ -136,33 +139,36 @@ function formatEvent(ev, viewerTimeZone) {
     meetUrl:     ev.conferenceUrl || ev.hangoutLink || null,
     attendees,
     externalDomains,
-    isInternal:  attendees.length === 0,
+    isInternal:  attendees.length === 0,   // no externals after filtering = internal
     eventType:   ev.eventType || "default",
   };
 }
 
 // ── GET /calendar/today ──────────────────────────────────────────────────────
+// By default returns only events with at least one external attendee.
+// Pass ?includeInternal=1 to get everything (focus blocks, team syncs, etc).
 router.get("/today", async (req, res) => {
-  const calendarId = req.query.calendarId || DEFAULT_CALENDAR_ID;
-  const timeZone   = req.query.timeZone   || DEFAULT_TIMEZONE;
+  const calendarId      = req.query.calendarId || DEFAULT_CALENDAR_ID;
+  const timeZone        = req.query.timeZone   || DEFAULT_TIMEZONE;
+  const includeInternal = req.query.includeInternal === "1" || req.query.includeInternal === "true";
 
   const { startUtcMs, endUtcMs, ymd } = todayBoundaries(timeZone);
-
-  // Google Calendar API requires RFC3339 with TZ offset/Z
-  const timeMin = new Date(startUtcMs).toISOString(); // "2026-04-27T22:00:00.000Z" (UTC)
+  const timeMin = new Date(startUtcMs).toISOString();
   const timeMax = new Date(endUtcMs).toISOString();
 
   try {
-    const events = await fetchEvents({ calendarId, timeMin, timeMax, timeZone });
-    const formatted = events.map(ev => formatEvent(ev, timeZone));
+    const events     = await fetchEvents({ calendarId, timeMin, timeMax, timeZone });
+    const formatted  = events.map(ev => formatEvent(ev, timeZone));
+    const visible    = includeInternal ? formatted : formatted.filter(ev => !ev.isInternal);
 
     res.json({
       ok: true,
       calendarId,
       timeZone,
       date: ymd,
-      total: formatted.length,
-      events: formatted,
+      total: visible.length,
+      hiddenInternal: includeInternal ? 0 : (formatted.length - visible.length),
+      events: visible,
     });
   } catch (err) {
     const status = err.response?.status || 500;
@@ -176,6 +182,8 @@ router.get("/today", async (req, res) => {
 });
 
 // ── GET /calendar/range ──────────────────────────────────────────────────────
+// Returns ALL events in the range — including internal/focus blocks. Used by
+// pre-call briefing triggers which need to see every meeting Anton has.
 router.get("/range", async (req, res) => {
   const calendarId = req.query.calendarId || DEFAULT_CALENDAR_ID;
   const timeZone   = req.query.timeZone   || DEFAULT_TIMEZONE;

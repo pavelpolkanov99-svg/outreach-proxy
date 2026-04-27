@@ -79,7 +79,6 @@ router.post("/upsert-lead", async (req, res) => {
   try {
     let companyPageId = null;
     if (company) {
-      // First try exact match, then contains
       let searchCompany = await axios.post(
         `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
         { filter: { property: "Company name", title: { equals: company } }, page_size: 1 },
@@ -277,7 +276,6 @@ router.post("/append-note", async (req, res) => {
 });
 
 // ── POST /notion/update-company ───────────────────────────────────────────────
-// UPSERT: updates existing OR creates new. Does NOT handle tags separately.
 router.post("/update-company", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   const { name, status } = req.body;
@@ -305,7 +303,6 @@ router.post("/update-company", async (req, res) => {
 });
 
 // ── POST /notion/update-company-with-tags ─────────────────────────────────────
-// UPSERT + Tags additive merge. Preferred for BD scoring writeback.
 router.post("/update-company-with-tags", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   const { name, status } = req.body;
@@ -376,6 +373,170 @@ router.post("/check-duplicates", async (req, res) => {
     } catch { notFound.push(name); }
   }));
   res.json({ ok: true, total_queried: names.length, found_count: found.length, found, not_found: notFound });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Insight cache helpers — read/write Loop's Insight field on Companies pages
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Format used inside the Insight rich_text field.
+//   First line: "Refreshed: 2026-04-27 23:00 UTC"
+//   Then one bullet per line: "• fact one (Apr 2026)"
+function formatInsightText(refreshedAt, bullets) {
+  const ts = new Date(refreshedAt || new Date()).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+  const head = `Refreshed: ${ts}`;
+  const body = (bullets || []).filter(Boolean).map(b => `• ${b}`).join("\n");
+  return body ? `${head}\n${body}` : head;
+}
+
+// Parse the Insight field text into { refreshedAt, bullets }.
+// Returns null if field is empty or does not match expected format.
+function parseInsightText(plainText) {
+  if (!plainText || typeof plainText !== "string") return null;
+  const lines = plainText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (!lines.length) return null;
+
+  // First line: "Refreshed: 2026-04-27 23:00 UTC"
+  const headMatch = lines[0].match(/^Refreshed:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::\d{2})?(?:\s*UTC)?\s*$/i);
+  let refreshedAt = null;
+  let bulletStart = 0;
+  if (headMatch) {
+    refreshedAt = `${headMatch[1]}T${headMatch[2]}:00Z`;
+    bulletStart = 1;
+  }
+
+  const bullets = [];
+  for (let i = bulletStart; i < lines.length; i++) {
+    const m = lines[i].match(/^[•\-*]\s*(.+)$/);
+    if (m) bullets.push(m[1]);
+    else if (lines[i].length > 0) bullets.push(lines[i]);
+  }
+
+  return { refreshedAt, bullets };
+}
+
+// Helper: extract company info we want for digest enrichment.
+function extractCompanyDigest(page) {
+  const props = page.properties || {};
+  const titleArr = props["Company name"]?.title || [];
+  const name = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
+
+  const description = (props["Company description"]?.rich_text || [])
+    .map(rt => rt.plain_text || rt.text?.content || "").join("");
+
+  const insightText = (props["Insight"]?.rich_text || [])
+    .map(rt => rt.plain_text || rt.text?.content || "").join("");
+  const insight = parseInsightText(insightText);
+
+  const tags = (props["Tags"]?.multi_select || []).map(t => t.name);
+
+  return {
+    pageId: page.id,
+    url: page.url,
+    name,
+    website: props["Website"]?.url || null,
+    description,
+    bdScore: props["BD Score"]?.number ?? null,
+    stage: props["Stage"]?.status?.name || null,
+    priority: props["Priority"]?.select?.name || null,  // "High" | "Mid" | "Low"
+    industry: props["Industry"]?.select?.name || null,
+    location: (props["Location"]?.rich_text || []).map(rt => rt.plain_text || rt.text?.content || "").join("") || null,
+    tags,
+    lastContact: props["Last Contact"]?.date?.start || null,
+    pipeline: props["Pipeline"]?.select?.name || null,
+    type: (props["Type"]?.multi_select || []).map(t => t.name),
+    insight,
+  };
+}
+
+// Normalize a domain for matching: strip protocol, www, trailing slash, lowercase.
+function normalizeDomain(input) {
+  if (!input) return null;
+  let s = String(input).toLowerCase().trim();
+  s = s.replace(/^https?:\/\//, "");
+  s = s.replace(/^www\./, "");
+  s = s.split("/")[0];
+  s = s.split("?")[0];
+  s = s.split("#")[0];
+  s = s.split(":")[0];
+  return s || null;
+}
+
+// ── GET /notion/insight-by-domain ────────────────────────────────────────────
+// Look up a company in the CRM by website domain. Returns digest-shaped record:
+// { found: true, company: {...} }  OR  { found: false }
+router.get("/insight-by-domain", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+  const domain = normalizeDomain(req.query.domain);
+  if (!domain) return res.status(400).json({ error: "domain query param required" });
+
+  try {
+    // Notion's url filter doesn't support 'contains' on URLs — use it on text instead.
+    // But Website is a url field, so we do a 'contains' on the value (Notion supports this for url).
+    const r = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+      {
+        filter: { property: "Website", url: { contains: domain } },
+        page_size: 5,
+      },
+      { headers: notionHeaders() }
+    );
+
+    if (!r.data.results.length) return res.json({ found: false, domain });
+
+    // Prefer the most recently edited active record (skip Lost/DELETE/Not relevant)
+    const skipStages = new Set(["Lost", "DELETE", "Not relevant"]);
+    const active = r.data.results
+      .map(extractCompanyDigest)
+      .filter(c => !skipStages.has(c.stage));
+    const company = active[0] || extractCompanyDigest(r.data.results[0]);
+
+    res.json({ found: true, domain, company });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+// ── POST /notion/update-insight ──────────────────────────────────────────────
+// Write Loop-managed insights to the Insight rich_text field.
+// Body: { pageId?: string, name?: string, bullets: string[], refreshedAt?: ISO }
+// Either pageId or name must be supplied.
+router.post("/update-insight", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+  const { pageId: bodyPageId, name, refreshedAt } = req.body || {};
+  const bullets = Array.isArray(req.body?.bullets) ? req.body.bullets : [];
+
+  try {
+    let pageId = bodyPageId;
+    if (!pageId) {
+      if (!name) return res.status(400).json({ error: "pageId or name required" });
+      let s = await axios.post(
+        `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+        { filter: { property: "Company name", title: { equals: name } }, page_size: 1 },
+        { headers: notionHeaders() }
+      );
+      if (!s.data.results.length) {
+        s = await axios.post(
+          `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+          { filter: { property: "Company name", title: { contains: name } }, page_size: 1 },
+          { headers: notionHeaders() }
+        );
+      }
+      if (!s.data.results.length) return res.status(404).json({ error: `${name} not found in CRM` });
+      pageId = s.data.results[0].id;
+    }
+
+    const text = formatInsightText(refreshedAt || new Date().toISOString(), bullets);
+    await axios.patch(
+      `https://api.notion.com/v1/pages/${pageId}`,
+      { properties: { "Insight": { rich_text: [{ text: { content: text.slice(0, 2000) } }] } } },
+      { headers: notionHeaders() }
+    );
+
+    res.json({ ok: true, pageId, bulletsWritten: bullets.length, length: text.length });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
 });
 
 module.exports = router;

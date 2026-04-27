@@ -9,14 +9,6 @@ const {
 
 const router = express.Router();
 
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-
-// Splitter model — used by /insights-bullets to break a synthesis sentence
-// into a clean array of bullets. Override via env if you want to A/B test.
-//   - claude-haiku-4-5-20251001  : fastest, cheapest
-//   - claude-sonnet-4-5-20250929 : higher quality, slightly more $
-const SPLITTER_MODEL = process.env.SPLITTER_MODEL || "claude-sonnet-4-5-20250929";
-
 // ── POST /parallel/research/start ─────────────────────────────────────────────
 router.post("/research/start", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
@@ -180,38 +172,66 @@ router.post("/upgrade", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helpers for /insights-bullets
+// /insights-bullets — single Parallel call with structured output (no LLM split)
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function startInsightTask(company, domain) {
-  // Mirror /insight/start prompt structure (proven 200 OK) — shorter form
-  // keeps lite processor; long custom topics push it past 4 minutes.
-  const query = [
-    `Find 1-3 recent specific facts about "${company}"${domain ? ` (${domain})` : ""}`,
-    `relevant for a personalized B2B outreach from a stablecoin payments company.`,
-    `Focus on: stablecoin launches/integrations, on/off ramp expansion, new payment corridors, regulatory milestones, funding, partnerships.`,
-    `Return one short sentence summarizing the 1-3 most relevant facts. Include dates where known.`,
-  ].join(" ");
+// Custom task_spec: ask Parallel directly for an array of bullets.
+// No Anthropic / no second LLM call. ~lite processor, ~20-40s typical.
+const insightsBulletsSpec = {
+  output_schema: {
+    type: "json",
+    json_schema: {
+      type: "object",
+      properties: {
+        bullets: {
+          type: "array",
+          description: "1-3 self-contained factual bullets, each ≤100 chars, with date in (MMM YYYY) format if known. No PR filler.",
+          items: { type: "string" },
+        },
+      },
+      required: ["bullets"],
+    },
+  },
+};
 
-  try {
-    const r = await axios.post(
-      "https://api.parallel.ai/v1/tasks/runs",
-      { input: query, processor: "lite" },
-      { headers: parallelHeaders(), timeout: 15000 }
-    );
-    const taskId = r.data?.run_id || r.data?.id;
-    if (!taskId) throw new Error(`Parallel start: no task ID (response=${JSON.stringify(r.data)})`);
-    return taskId;
-  } catch (err) {
-    const status = err.response?.status;
-    const data   = err.response?.data;
-    console.error(`[parallel/insights-bullets] startInsightTask failed: status=${status} data=${JSON.stringify(data)}`);
-    const reason = data?.message || data?.error || err.message;
-    const e = new Error(`Parallel start ${status || 500}: ${reason}`);
-    e.parallelStatus = status;
-    e.parallelData   = data;
-    throw e;
-  }
+function buildInsightsBulletsQuery(company, domain) {
+  return [
+    `You are doing fast BD research for Plexo, a stablecoin clearing network for licensed FIs.`,
+    `Find 1-3 recent specific facts about "${company}"${domain ? ` (${domain})` : ""} from the LAST 90 DAYS.`,
+    ``,
+    `PRIORITY signals (Plexo BD context):`,
+    `- Stablecoin: launches, integrations, issuance, treasury moves`,
+    `- On/off ramp: new corridors, fiat rails, geo expansion`,
+    `- Regulatory: CASP/EMI/PI/MiCA/VASP licenses or approvals`,
+    ``,
+    `OTHER useful signals:`,
+    `- Funding rounds (size, lead investor)`,
+    `- Key C-level / Head-of hires`,
+    `- Partnerships with banks, PSPs, exchanges, wallets`,
+    `- Measurable growth (volume, users, TVL)`,
+    ``,
+    `Output rules:`,
+    `- Return 1-3 bullets in the "bullets" array`,
+    `- Each bullet ≤100 chars, single complete fact`,
+    `- Add date in "(MMM YYYY)" format when known — do NOT invent dates`,
+    `- No PR filler ("excited to announce", "world's first", "leading provider")`,
+    `- If nothing factual found in last 90 days, return empty array`,
+  ].join("\n");
+}
+
+async function runInsightsBulletsTask(company, domain) {
+  const r = await axios.post(
+    "https://api.parallel.ai/v1/tasks/runs",
+    {
+      input: buildInsightsBulletsQuery(company, domain),
+      processor: "lite",
+      task_spec: insightsBulletsSpec,
+    },
+    { headers: parallelHeaders(), timeout: 15000 }
+  );
+  const taskId = r.data?.run_id || r.data?.id;
+  if (!taskId) throw new Error(`Parallel start: no task ID (response=${JSON.stringify(r.data)})`);
+  return taskId;
 }
 
 async function pollUntilDone(taskId, { intervalMs = 3000, timeoutMs = 90000 } = {}) {
@@ -234,166 +254,74 @@ async function pollUntilDone(taskId, { intervalMs = 3000, timeoutMs = 90000 } = 
   }
 }
 
-function extractInsightSentence(parallelResult) {
-  // parallel insight returns { output: { content: { output: "sentence..." } } }
-  const sentence = parallelResult?.output?.content?.output
-                 || parallelResult?.content?.output
-                 || null;
-  return sentence;
-}
+function extractBulletsAndCitations(parallelResult) {
+  // Structured output lives at output.content (as defined by our task_spec).
+  const c = parallelResult?.output?.content || parallelResult?.content || {};
+  const rawBullets = Array.isArray(c.bullets) ? c.bullets : [];
 
-function extractCitations(parallelResult) {
+  // Hard cap each bullet to 110 chars (slight buffer over the 100 rule), drop empties
+  const bullets = rawBullets
+    .map(b => String(b || "").trim())
+    .filter(b => b.length > 0)
+    .map(b => b.length > 110 ? b.slice(0, 107) + "..." : b)
+    .slice(0, 3);
+
+  // Citations live in output.basis[].citations
   const basis = parallelResult?.output?.basis || parallelResult?.basis || [];
   const cites = [];
   for (const b of basis) {
-    if (b?.field !== "output") continue;
-    for (const c of (b.citations || [])) {
+    for (const cite of (b.citations || [])) {
       cites.push({
-        title: c.title || null,
-        url: c.url || null,
-        excerpts: (c.excerpts || []).slice(0, 3),
+        title:    cite.title || null,
+        url:      cite.url   || null,
+        excerpts: (cite.excerpts || []).slice(0, 2),
       });
     }
   }
-  return cites;
-}
 
-function extractReasoning(parallelResult) {
-  const basis = parallelResult?.output?.basis || parallelResult?.basis || [];
-  for (const b of basis) {
-    if (b?.field === "output" && b.reasoning) return b.reasoning;
-  }
-  return null;
-}
-
-async function splitToBullets({ company, sentence, reasoning, citations }) {
-  if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
-  if (!sentence) return { bullets: [] };
-
-  const citationsText = citations.slice(0, 5).map((c, i) => {
-    const excerpts = (c.excerpts || []).join(" | ");
-    return `[${i + 1}] ${c.title || c.url || ""}${excerpts ? ` — ${excerpts}` : ""}`;
-  }).join("\n");
-
-  const prompt = [
-    `You are extracting factual BD-relevant bullets about "${company}".`,
-    ``,
-    `INPUT — synthesis sentence:`,
-    sentence,
-    ``,
-    `INPUT — reasoning notes from research agent (use to find dates, sources):`,
-    reasoning || "(none)",
-    ``,
-    `INPUT — supporting citations (use to find dates):`,
-    citationsText || "(none)",
-    ``,
-    `TASK: Split into 1-3 self-contained bullets.`,
-    ``,
-    `Rules:`,
-    `- Each bullet ≤100 chars`,
-    `- Each bullet must be a single complete fact (no "is launching" without subject — prefer "Launching X")`,
-    `- Add dates in format "(MMM YYYY)" or "(Q3 2025)" if found in reasoning/citations. Do not invent dates.`,
-    `- If a fact appears more than once, include it only once`,
-    `- No PR filler ("excited to announce", "leading provider", "world's first")`,
-    `- No bullets without factual content`,
-    `- If the synthesis sentence has no real facts, return empty array`,
-    ``,
-    `OUTPUT: Return ONLY valid JSON, no prose, no markdown:`,
-    `{"bullets": ["fact 1 (date)", "fact 2 (date)"]}`,
-  ].join("\n");
-
-  try {
-    const r = await axios.post(
-      "https://api.anthropic.com/v1/messages",
-      {
-        model: SPLITTER_MODEL,
-        max_tokens: 500,
-        messages: [{ role: "user", content: prompt }],
-      },
-      {
-        headers: {
-          "x-api-key": ANTHROPIC_API_KEY,
-          "anthropic-version": "2023-06-01",
-          "Content-Type": "application/json",
-        },
-        timeout: 30000,
-      }
-    );
-
-    const text = r.data?.content?.[0]?.text || "";
-    const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
-    let parsed;
-    try {
-      parsed = JSON.parse(cleaned);
-    } catch (e) {
-      const m = cleaned.match(/\{[\s\S]*\}/);
-      if (!m) throw new Error(`Splitter returned non-JSON: ${text.slice(0, 200)}`);
-      parsed = JSON.parse(m[0]);
-    }
-    const bullets = Array.isArray(parsed?.bullets) ? parsed.bullets : [];
-    const cleanedBullets = bullets
-      .map(b => String(b || "").trim())
-      .filter(b => b.length > 0)
-      .map(b => b.length > 110 ? b.slice(0, 107) + "..." : b)
-      .slice(0, 3);
-
-    return { bullets: cleanedBullets, model: SPLITTER_MODEL };
-  } catch (err) {
-    const status = err.response?.status;
-    const data   = err.response?.data;
-    console.error(`[parallel/insights-bullets] split via ${SPLITTER_MODEL} failed: status=${status} data=${JSON.stringify(data)?.slice(0, 500)}`);
-    const reason = data?.error?.message || data?.message || err.message;
-    const e = new Error(`Splitter (${SPLITTER_MODEL}) ${status || 500}: ${reason}`);
-    e.splitterStatus = status;
-    e.splitterData   = data;
-    throw e;
-  }
+  return { bullets, citations: cites };
 }
 
 // ── POST /parallel/insights-bullets ──────────────────────────────────────────
+// Single Parallel call with structured task_spec → returns bullets directly.
+// No Anthropic, no second LLM call.
+//
+// Body: { company: string, domain?: string }
+// Returns:
+// {
+//   ok: true,
+//   bullets: string[],
+//   refreshedAt: ISO string,
+//   parallelTaskId: string,
+//   raw: { citations: [...] }
+// }
 router.post("/insights-bullets", async (req, res) => {
-  if (!PARALLEL_KEY)       return res.status(500).json({ ok: false, error: "PARALLEL_KEY not set" });
-  if (!ANTHROPIC_API_KEY)  return res.status(500).json({ ok: false, error: "ANTHROPIC_API_KEY not set" });
+  if (!PARALLEL_KEY) return res.status(500).json({ ok: false, error: "PARALLEL_KEY not set" });
 
   const { company, domain } = req.body || {};
   if (!company) return res.status(400).json({ ok: false, error: "company required" });
 
   try {
-    const taskId   = await startInsightTask(company, domain);
-    const result   = await pollUntilDone(taskId, { intervalMs: 3000, timeoutMs: 90000 });
-    const sentence = extractInsightSentence(result);
-    const cites    = extractCitations(result);
-    const reasoning = extractReasoning(result);
-
-    if (!sentence) {
-      return res.json({
-        ok: true,
-        bullets: [],
-        refreshedAt: new Date().toISOString(),
-        parallelTaskId: taskId,
-        splitterModel: SPLITTER_MODEL,
-        raw: { sentence: null, citations: cites },
-      });
-    }
-
-    const { bullets, model } = await splitToBullets({ company, sentence, reasoning, citations: cites });
+    const taskId = await runInsightsBulletsTask(company, domain);
+    const result = await pollUntilDone(taskId, { intervalMs: 3000, timeoutMs: 90000 });
+    const { bullets, citations } = extractBulletsAndCitations(result);
 
     res.json({
       ok: true,
       bullets,
       refreshedAt: new Date().toISOString(),
       parallelTaskId: taskId,
-      splitterModel: model,
-      raw: { sentence, citations: cites },
+      raw: { citations },
     });
   } catch (err) {
-    console.error("[parallel/insights-bullets] error:", err.message);
+    const status = err.response?.status;
+    const data   = err.response?.data;
+    console.error(`[parallel/insights-bullets] error: ${err.message} (status=${status} data=${JSON.stringify(data)?.slice(0, 300)})`);
     res.status(500).json({
       ok: false,
-      error: err.message,
-      parallelStatus:  err.parallelStatus  || null,
-      parallelData:    err.parallelData    || null,
-      splitterStatus:  err.splitterStatus  || null,
+      error:           err.message,
+      parallelStatus:  status || null,
+      parallelData:    data   || null,
     });
   }
 });

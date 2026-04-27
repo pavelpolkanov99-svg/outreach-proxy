@@ -63,14 +63,40 @@ async function fetchEvents({ calendarId, timeMin, timeMax, timeZone }) {
   return r.data.items || [];
 }
 
+// ── Helper: get UTC ms boundaries for "today" in target TZ ───────────────────
+// Returns { startUtcMs, endUtcMs, ymd } where startUtcMs/endUtcMs bracket the
+// civil day (00:00:00 → 24:00:00) in the given timezone, expressed as UTC ms.
+// `ymd` is the YYYY-MM-DD string for that civil day in the target TZ.
+function todayBoundaries(timeZone) {
+  // Get current Y/M/D as seen in the target TZ
+  const fmt = new Intl.DateTimeFormat("en-CA", {
+    timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+  });
+  const ymd = fmt.format(new Date()); // e.g. "2026-04-27" (en-CA gives ISO order)
+
+  // Build a Date that represents "00:00:00 in target TZ on that civil day".
+  // Trick: ask the formatter what UTC offset that civil moment has, then apply.
+  const [year, month, day] = ymd.split("-").map(Number);
+
+  // Compute target TZ offset for that day's noon (avoids DST edge issues at midnight)
+  const noon = Date.UTC(year, month - 1, day, 12, 0, 0);
+  const noonInTz = new Date(noon).toLocaleString("en-US", { timeZone });
+  const noonAsUtc = new Date(noonInTz + " UTC").getTime();
+  const tzOffsetMs = noonAsUtc - noon;  // negative for east-of-UTC
+
+  // 00:00 of civil day in target TZ, expressed as UTC ms:
+  const startUtcMs = Date.UTC(year, month - 1, day, 0, 0, 0) - tzOffsetMs;
+  const endUtcMs   = startUtcMs + 24 * 60 * 60 * 1000;
+
+  return { startUtcMs, endUtcMs, ymd };
+}
+
 // ── Helper: format event for digest output ───────────────────────────────────
-// Returns clean shape: time, title, attendees (external only), meet URL, etc.
 function formatEvent(ev, viewerTimeZone) {
   const startISO = ev.start?.dateTime || ev.start?.date;
   const endISO   = ev.end?.dateTime   || ev.end?.date;
   const isAllDay = !ev.start?.dateTime;
 
-  // Time formatted in viewer's TZ (default: Europe/Prague for Anton)
   const start = new Date(startISO);
   const end   = new Date(endISO);
   const fmt = new Intl.DateTimeFormat("en-GB", {
@@ -89,7 +115,6 @@ function formatEvent(ev, viewerTimeZone) {
       response: a.responseStatus,
     }));
 
-  // Counterparty company guess from email domain
   const externalDomains = [...new Set(
     attendees
       .map(a => (a.email || "").split("@")[1])
@@ -111,33 +136,21 @@ function formatEvent(ev, viewerTimeZone) {
     meetUrl:     ev.conferenceUrl || ev.hangoutLink || null,
     attendees,
     externalDomains,
-    isInternal:  attendees.length === 0,  // no externals = team meeting / focus block
+    isInternal:  attendees.length === 0,
     eventType:   ev.eventType || "default",
   };
 }
 
 // ── GET /calendar/today ──────────────────────────────────────────────────────
-// Returns today's events (Europe/Prague day boundaries by default) for Anton's
-// calendar. Query params:
-//   calendarId  — override (default: anton@remide.xyz via env)
-//   timeZone    — override viewer TZ (default: Europe/Prague)
-//   includeInternal — "1" to include team-only meetings (default: include all)
 router.get("/today", async (req, res) => {
   const calendarId = req.query.calendarId || DEFAULT_CALENDAR_ID;
   const timeZone   = req.query.timeZone   || DEFAULT_TIMEZONE;
 
-  // Compute "today" in the target timezone
-  const now = new Date();
-  const dayStart = new Date(now.toLocaleString("en-US", { timeZone }));
-  dayStart.setHours(0, 0, 0, 0);
-  const dayEnd = new Date(dayStart);
-  dayEnd.setHours(23, 59, 59, 999);
+  const { startUtcMs, endUtcMs, ymd } = todayBoundaries(timeZone);
 
-  // Convert local TZ boundaries to UTC ISO for the API (uses date string + TZ)
-  const pad = n => String(n).padStart(2, "0");
-  const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-  const timeMin = `${ymd(dayStart)}T00:00:00`;
-  const timeMax = `${ymd(dayEnd)}T23:59:59`;
+  // Google Calendar API requires RFC3339 with TZ offset/Z
+  const timeMin = new Date(startUtcMs).toISOString(); // "2026-04-27T22:00:00.000Z" (UTC)
+  const timeMax = new Date(endUtcMs).toISOString();
 
   try {
     const events = await fetchEvents({ calendarId, timeMin, timeMax, timeZone });
@@ -147,14 +160,14 @@ router.get("/today", async (req, res) => {
       ok: true,
       calendarId,
       timeZone,
-      date: ymd(dayStart),
+      date: ymd,
       total: formatted.length,
       events: formatted,
     });
   } catch (err) {
     const status = err.response?.status || 500;
     const detail = err.response?.data || err.message;
-    console.error("[calendar/today] error:", detail);
+    console.error("[calendar/today] error:", JSON.stringify(detail));
     res.status(status).json({
       ok: false,
       error: typeof detail === "string" ? detail : (detail.error_description || detail.error?.message || err.message),
@@ -163,14 +176,12 @@ router.get("/today", async (req, res) => {
 });
 
 // ── GET /calendar/range ──────────────────────────────────────────────────────
-// More general: events between arbitrary timeMin/timeMax. Used by future
-// pre-call briefing trigger (looks at next 2 hours).
 router.get("/range", async (req, res) => {
   const calendarId = req.query.calendarId || DEFAULT_CALENDAR_ID;
   const timeZone   = req.query.timeZone   || DEFAULT_TIMEZONE;
   const { timeMin, timeMax } = req.query;
   if (!timeMin || !timeMax) {
-    return res.status(400).json({ ok: false, error: "timeMin and timeMax required (ISO 8601)" });
+    return res.status(400).json({ ok: false, error: "timeMin and timeMax required (RFC3339 with TZ)" });
   }
   try {
     const events = await fetchEvents({ calendarId, timeMin, timeMax, timeZone });
@@ -186,7 +197,7 @@ router.get("/range", async (req, res) => {
   } catch (err) {
     const status = err.response?.status || 500;
     const detail = err.response?.data || err.message;
-    console.error("[calendar/range] error:", detail);
+    console.error("[calendar/range] error:", JSON.stringify(detail));
     res.status(status).json({
       ok: false,
       error: typeof detail === "string" ? detail : (detail.error_description || detail.error?.message || err.message),
@@ -195,7 +206,6 @@ router.get("/range", async (req, res) => {
 });
 
 // ── GET /calendar/health ─────────────────────────────────────────────────────
-// Quick check that OAuth env is set and refresh works.
 router.get("/health", async (_req, res) => {
   const envOk = !!(GOOGLE_CLIENT_ID && GOOGLE_CLIENT_SECRET && GOOGLE_REFRESH_TOKEN);
   if (!envOk) {

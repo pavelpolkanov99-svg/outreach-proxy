@@ -4,10 +4,31 @@ const { filterPerson, filterOrganization } = require("../lib/apollo");
 
 const router = express.Router();
 
+// Server-side fallback. Cron jobs and internal callers don't pass a key in
+// the request body — they rely on this env var. External callers (MCP tool,
+// older client code) keep working unchanged because they still pass apolloKey
+// in the body, which takes precedence.
+const APOLLO_KEY_ENV = process.env.APOLLO_KEY || null;
+
+function resolveKey(req) {
+  return req.body?.apolloKey || APOLLO_KEY_ENV;
+}
+
+// ── GET /apollo/health ────────────────────────────────────────────────────────
+// Quick check that server-side APOLLO_KEY is configured and reachable.
+// Does NOT consume Apollo credits — only verifies env presence.
+router.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    serverKeyConfigured: !!APOLLO_KEY_ENV,
+  });
+});
+
 // ── POST /apollo/search ───────────────────────────────────────────────────────
 router.post("/search", async (req, res) => {
-  const { apolloKey, name, company } = req.body;
-  if (!apolloKey) return res.status(400).json({ error: "apolloKey required" });
+  const apolloKey = resolveKey(req);
+  const { name, company } = req.body;
+  if (!apolloKey) return res.status(400).json({ error: "apolloKey required (pass in body or set APOLLO_KEY env)" });
   try {
     const r = await axios.post(
       "https://api.apollo.io/api/v1/mixed_people/api_search",
@@ -22,8 +43,9 @@ router.post("/search", async (req, res) => {
 
 // ── POST /apollo/match ────────────────────────────────────────────────────────
 router.post("/match", async (req, res) => {
-  const { apolloKey, id, firstName, lastName, organizationName, domain, linkedinUrl } = req.body;
-  if (!apolloKey) return res.status(400).json({ error: "apolloKey required" });
+  const apolloKey = resolveKey(req);
+  const { id, firstName, lastName, organizationName, domain, linkedinUrl } = req.body;
+  if (!apolloKey) return res.status(400).json({ error: "apolloKey required (pass in body or set APOLLO_KEY env)" });
   try {
     const payload = id
       ? { id }
@@ -43,8 +65,9 @@ router.post("/match", async (req, res) => {
 
 // ── POST /apollo/bulk-match ───────────────────────────────────────────────────
 router.post("/bulk-match", async (req, res) => {
-  const { apolloKey, people } = req.body;
-  if (!apolloKey) return res.status(400).json({ error: "apolloKey required" });
+  const apolloKey = resolveKey(req);
+  const { people } = req.body;
+  if (!apolloKey) return res.status(400).json({ error: "apolloKey required (pass in body or set APOLLO_KEY env)" });
   if (!Array.isArray(people) || people.length === 0) {
     return res.status(400).json({ error: "people[] required (1-50 items)" });
   }
@@ -93,14 +116,14 @@ router.post("/bulk-match", async (req, res) => {
 // Look up canonical company info by domain. Used by Loop to derive Company name
 // from a calendar attendee's email (e.g. charlie@bankingcircle.com → "Banking Circle").
 //
-// Body: { apolloKey, domain }
+// Body: { apolloKey?, domain }
 // Returns: filteredOrganization | null
 router.post("/org-enrich", async (req, res) => {
-  const { apolloKey, domain } = req.body;
-  if (!apolloKey) return res.status(400).json({ error: "apolloKey required" });
+  const apolloKey = resolveKey(req);
+  const { domain } = req.body;
+  if (!apolloKey) return res.status(400).json({ error: "apolloKey required (pass in body or set APOLLO_KEY env)" });
   if (!domain)    return res.status(400).json({ error: "domain required" });
 
-  // Apollo's org enrich expects a clean domain ("bankingcircle.com"), not a URL.
   const cleanDomain = String(domain)
     .toLowerCase()
     .trim()

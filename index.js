@@ -34,6 +34,11 @@ const beeperSync = require("./jobs/beeper-sync");
 app.use("/beeper", beeperSync.router);
 beeperSync.registerJobs();
 
+// ── Prewarm-insights job (mounted under /jobs/*) ──────────────────────────────
+const prewarmInsights = require("./jobs/prewarm-insights");
+app.use("/jobs", prewarmInsights.router);
+prewarmInsights.registerJobs();
+
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({
   ok: true,
@@ -42,10 +47,11 @@ app.get("/health", (_, res) => res.json({
   beeper:   !!BEEPER_TOKEN,
   github:   !!GITHUB_PAT,
   calendar: GOOGLE_OAUTH,
+  apollo:   !!process.env.APOLLO_KEY,
   mcp:      true,
-  version:  "3.13.0",
+  version:  "3.14.0",
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.13.0", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.14.0", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

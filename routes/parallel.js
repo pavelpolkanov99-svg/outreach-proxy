@@ -175,8 +175,6 @@ router.post("/upgrade", async (req, res) => {
 // /insights-bullets — single Parallel call with structured output (no LLM split)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Custom task_spec: ask Parallel directly for an array of bullets.
-// No Anthropic / no second LLM call. ~lite processor, ~20-40s typical.
 const insightsBulletsSpec = {
   output_schema: {
     type: "json",
@@ -255,18 +253,15 @@ async function pollUntilDone(taskId, { intervalMs = 3000, timeoutMs = 90000 } = 
 }
 
 function extractBulletsAndCitations(parallelResult) {
-  // Structured output lives at output.content (as defined by our task_spec).
   const c = parallelResult?.output?.content || parallelResult?.content || {};
   const rawBullets = Array.isArray(c.bullets) ? c.bullets : [];
 
-  // Hard cap each bullet to 110 chars (slight buffer over the 100 rule), drop empties
   const bullets = rawBullets
     .map(b => String(b || "").trim())
     .filter(b => b.length > 0)
     .map(b => b.length > 110 ? b.slice(0, 107) + "..." : b)
     .slice(0, 3);
 
-  // Citations live in output.basis[].citations
   const basis = parallelResult?.output?.basis || parallelResult?.basis || [];
   const cites = [];
   for (const b of basis) {
@@ -283,27 +278,23 @@ function extractBulletsAndCitations(parallelResult) {
 }
 
 // ── POST /parallel/insights-bullets ──────────────────────────────────────────
-// Single Parallel call with structured task_spec → returns bullets directly.
-// No Anthropic, no second LLM call.
-//
-// Body: { company: string, domain?: string }
-// Returns:
-// {
-//   ok: true,
-//   bullets: string[],
-//   refreshedAt: ISO string,
-//   parallelTaskId: string,
-//   raw: { citations: [...] }
-// }
+// Body: { company: string, domain?: string, timeoutMs?: number }
+// timeoutMs — how long to poll Parallel for completion. Default 90000.
 router.post("/insights-bullets", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ ok: false, error: "PARALLEL_KEY not set" });
 
-  const { company, domain } = req.body || {};
+  const { company, domain, timeoutMs } = req.body || {};
   if (!company) return res.status(400).json({ ok: false, error: "company required" });
+
+  // Clamp caller-supplied timeout into a sane range (10s-300s)
+  const pollTimeoutMs = Math.max(
+    10_000,
+    Math.min(300_000, Number(timeoutMs) || 90_000)
+  );
 
   try {
     const taskId = await runInsightsBulletsTask(company, domain);
-    const result = await pollUntilDone(taskId, { intervalMs: 3000, timeoutMs: 90000 });
+    const result = await pollUntilDone(taskId, { intervalMs: 3000, timeoutMs: pollTimeoutMs });
     const { bullets, citations } = extractBulletsAndCitations(result);
 
     res.json({
@@ -311,6 +302,7 @@ router.post("/insights-bullets", async (req, res) => {
       bullets,
       refreshedAt: new Date().toISOString(),
       parallelTaskId: taskId,
+      pollTimeoutMs,
       raw: { citations },
     });
   } catch (err) {

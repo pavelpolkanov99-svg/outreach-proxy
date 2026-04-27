@@ -178,23 +178,34 @@ router.post("/upgrade", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function startInsightTask(company, domain) {
-  // Short topic — keeps lite processor (long custom topics push it to >4 min)
+  // Mirror /insight/start prompt structure (proven 200 OK) — shorter form
+  // keeps lite processor; long custom topics push it past 4 minutes.
   const query = [
     `Find 1-3 recent specific facts about "${company}"${domain ? ` (${domain})` : ""}`,
     `relevant for a personalized B2B outreach from a stablecoin payments company.`,
-    `PRIORITY: stablecoin launches/integrations, on/off ramp expansion, new payment corridors/geos, regulatory milestones (CASP/EMI/MiCA).`,
-    `OTHER: funding, key C-level hires, partnerships with banks/PSPs/exchanges.`,
-    `Return one sentence (max 30 words) summarizing the 1-3 most relevant facts. Include dates where known. Be specific, not generic.`,
+    `Focus on: stablecoin launches/integrations, on/off ramp expansion, new payment corridors, regulatory milestones, funding, partnerships.`,
+    `Return one short sentence summarizing the 1-3 most relevant facts. Include dates where known.`,
   ].join(" ");
 
-  const r = await axios.post(
-    "https://api.parallel.ai/v1/tasks/runs",
-    { input: query, processor: "lite" },
-    { headers: parallelHeaders(), timeout: 15000 }
-  );
-  const taskId = r.data?.run_id || r.data?.id;
-  if (!taskId) throw new Error("Parallel start: no task ID");
-  return taskId;
+  try {
+    const r = await axios.post(
+      "https://api.parallel.ai/v1/tasks/runs",
+      { input: query, processor: "lite" },
+      { headers: parallelHeaders(), timeout: 15000 }
+    );
+    const taskId = r.data?.run_id || r.data?.id;
+    if (!taskId) throw new Error(`Parallel start: no task ID (response=${JSON.stringify(r.data)})`);
+    return taskId;
+  } catch (err) {
+    const status = err.response?.status;
+    const data   = err.response?.data;
+    console.error(`[parallel/insights-bullets] startInsightTask failed: status=${status} data=${JSON.stringify(data)}`);
+    const reason = data?.message || data?.error || err.message;
+    const e = new Error(`Parallel start ${status || 500}: ${reason}`);
+    e.parallelStatus = status;
+    e.parallelData   = data;
+    throw e;
+  }
 }
 
 async function pollUntilDone(taskId, { intervalMs = 3000, timeoutMs = 90000 } = {}) {
@@ -218,7 +229,7 @@ async function pollUntilDone(taskId, { intervalMs = 3000, timeoutMs = 90000 } = 
 }
 
 function extractInsightSentence(parallelResult) {
-  // parallel_insight_start returns { output: { content: { output: "sentence..." } } }
+  // parallel insight returns { output: { content: { output: "sentence..." } } }
   const sentence = parallelResult?.output?.content?.output
                  || parallelResult?.content?.output
                  || null;
@@ -285,56 +296,55 @@ async function splitWithHaiku({ company, sentence, reasoning, citations }) {
     `{"bullets": ["fact 1 (date)", "fact 2 (date)"]}`,
   ].join("\n");
 
-  const r = await axios.post(
-    "https://api.anthropic.com/v1/messages",
-    {
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 500,
-      messages: [{ role: "user", content: prompt }],
-    },
-    {
-      headers: {
-        "x-api-key": ANTHROPIC_API_KEY,
-        "anthropic-version": "2023-06-01",
-        "Content-Type": "application/json",
-      },
-      timeout: 20000,
-    }
-  );
-
-  const text = r.data?.content?.[0]?.text || "";
-  // Strip code fences if Haiku adds them
-  const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
-  let parsed;
   try {
-    parsed = JSON.parse(cleaned);
-  } catch (e) {
-    // Best-effort: extract JSON object from anywhere in the response
-    const m = cleaned.match(/\{[\s\S]*\}/);
-    if (!m) throw new Error(`Haiku returned non-JSON: ${text.slice(0, 200)}`);
-    parsed = JSON.parse(m[0]);
-  }
-  const bullets = Array.isArray(parsed?.bullets) ? parsed.bullets : [];
-  // Hard cap each bullet to 110 chars (slight buffer over the rule), drop empties
-  const cleanedBullets = bullets
-    .map(b => String(b || "").trim())
-    .filter(b => b.length > 0)
-    .map(b => b.length > 110 ? b.slice(0, 107) + "..." : b)
-    .slice(0, 3);
+    const r = await axios.post(
+      "https://api.anthropic.com/v1/messages",
+      {
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 500,
+        messages: [{ role: "user", content: prompt }],
+      },
+      {
+        headers: {
+          "x-api-key": ANTHROPIC_API_KEY,
+          "anthropic-version": "2023-06-01",
+          "Content-Type": "application/json",
+        },
+        timeout: 20000,
+      }
+    );
 
-  return { bullets: cleanedBullets };
+    const text = r.data?.content?.[0]?.text || "";
+    const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      const m = cleaned.match(/\{[\s\S]*\}/);
+      if (!m) throw new Error(`Haiku returned non-JSON: ${text.slice(0, 200)}`);
+      parsed = JSON.parse(m[0]);
+    }
+    const bullets = Array.isArray(parsed?.bullets) ? parsed.bullets : [];
+    const cleanedBullets = bullets
+      .map(b => String(b || "").trim())
+      .filter(b => b.length > 0)
+      .map(b => b.length > 110 ? b.slice(0, 107) + "..." : b)
+      .slice(0, 3);
+
+    return { bullets: cleanedBullets };
+  } catch (err) {
+    const status = err.response?.status;
+    const data   = err.response?.data;
+    console.error(`[parallel/insights-bullets] Haiku split failed: status=${status} data=${JSON.stringify(data)?.slice(0, 500)}`);
+    const reason = data?.error?.message || data?.message || err.message;
+    const e = new Error(`Haiku split ${status || 500}: ${reason}`);
+    e.haikuStatus = status;
+    e.haikuData   = data;
+    throw e;
+  }
 }
 
 // ── POST /parallel/insights-bullets ──────────────────────────────────────────
-// Full flow in one call: Parallel insight task → poll until done → Haiku split.
-// Body: { company: string, domain?: string }
-// Returns: {
-//   ok: true,
-//   bullets: string[],
-//   refreshedAt: ISO string,
-//   parallelTaskId: string,
-//   raw: { sentence, citations[] }    // for debugging / Notion record
-// }
 router.post("/insights-bullets", async (req, res) => {
   if (!PARALLEL_KEY)       return res.status(500).json({ ok: false, error: "PARALLEL_KEY not set" });
   if (!ANTHROPIC_API_KEY)  return res.status(500).json({ ok: false, error: "ANTHROPIC_API_KEY not set" });
@@ -370,7 +380,13 @@ router.post("/insights-bullets", async (req, res) => {
     });
   } catch (err) {
     console.error("[parallel/insights-bullets] error:", err.message);
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({
+      ok: false,
+      error: err.message,
+      parallelStatus: err.parallelStatus || null,
+      parallelData:   err.parallelData   || null,
+      haikuStatus:    err.haikuStatus    || null,
+    });
   }
 });
 

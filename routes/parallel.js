@@ -11,6 +11,12 @@ const router = express.Router();
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
+// Splitter model — used by /insights-bullets to break a synthesis sentence
+// into a clean array of bullets. Override via env if you want to A/B test.
+//   - claude-haiku-4-5-20251001  : fastest, cheapest
+//   - claude-sonnet-4-5-20250929 : higher quality, slightly more $
+const SPLITTER_MODEL = process.env.SPLITTER_MODEL || "claude-sonnet-4-5-20250929";
+
 // ── POST /parallel/research/start ─────────────────────────────────────────────
 router.post("/research/start", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
@@ -260,7 +266,7 @@ function extractReasoning(parallelResult) {
   return null;
 }
 
-async function splitWithHaiku({ company, sentence, reasoning, citations }) {
+async function splitToBullets({ company, sentence, reasoning, citations }) {
   if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
   if (!sentence) return { bullets: [] };
 
@@ -300,7 +306,7 @@ async function splitWithHaiku({ company, sentence, reasoning, citations }) {
     const r = await axios.post(
       "https://api.anthropic.com/v1/messages",
       {
-        model: "claude-haiku-4-5-20251001",
+        model: SPLITTER_MODEL,
         max_tokens: 500,
         messages: [{ role: "user", content: prompt }],
       },
@@ -310,7 +316,7 @@ async function splitWithHaiku({ company, sentence, reasoning, citations }) {
           "anthropic-version": "2023-06-01",
           "Content-Type": "application/json",
         },
-        timeout: 20000,
+        timeout: 30000,
       }
     );
 
@@ -321,7 +327,7 @@ async function splitWithHaiku({ company, sentence, reasoning, citations }) {
       parsed = JSON.parse(cleaned);
     } catch (e) {
       const m = cleaned.match(/\{[\s\S]*\}/);
-      if (!m) throw new Error(`Haiku returned non-JSON: ${text.slice(0, 200)}`);
+      if (!m) throw new Error(`Splitter returned non-JSON: ${text.slice(0, 200)}`);
       parsed = JSON.parse(m[0]);
     }
     const bullets = Array.isArray(parsed?.bullets) ? parsed.bullets : [];
@@ -331,15 +337,15 @@ async function splitWithHaiku({ company, sentence, reasoning, citations }) {
       .map(b => b.length > 110 ? b.slice(0, 107) + "..." : b)
       .slice(0, 3);
 
-    return { bullets: cleanedBullets };
+    return { bullets: cleanedBullets, model: SPLITTER_MODEL };
   } catch (err) {
     const status = err.response?.status;
     const data   = err.response?.data;
-    console.error(`[parallel/insights-bullets] Haiku split failed: status=${status} data=${JSON.stringify(data)?.slice(0, 500)}`);
+    console.error(`[parallel/insights-bullets] split via ${SPLITTER_MODEL} failed: status=${status} data=${JSON.stringify(data)?.slice(0, 500)}`);
     const reason = data?.error?.message || data?.message || err.message;
-    const e = new Error(`Haiku split ${status || 500}: ${reason}`);
-    e.haikuStatus = status;
-    e.haikuData   = data;
+    const e = new Error(`Splitter (${SPLITTER_MODEL}) ${status || 500}: ${reason}`);
+    e.splitterStatus = status;
+    e.splitterData   = data;
     throw e;
   }
 }
@@ -365,17 +371,19 @@ router.post("/insights-bullets", async (req, res) => {
         bullets: [],
         refreshedAt: new Date().toISOString(),
         parallelTaskId: taskId,
+        splitterModel: SPLITTER_MODEL,
         raw: { sentence: null, citations: cites },
       });
     }
 
-    const { bullets } = await splitWithHaiku({ company, sentence, reasoning, citations: cites });
+    const { bullets, model } = await splitToBullets({ company, sentence, reasoning, citations: cites });
 
     res.json({
       ok: true,
       bullets,
       refreshedAt: new Date().toISOString(),
       parallelTaskId: taskId,
+      splitterModel: model,
       raw: { sentence, citations: cites },
     });
   } catch (err) {
@@ -383,9 +391,9 @@ router.post("/insights-bullets", async (req, res) => {
     res.status(500).json({
       ok: false,
       error: err.message,
-      parallelStatus: err.parallelStatus || null,
-      parallelData:   err.parallelData   || null,
-      haikuStatus:    err.haikuStatus    || null,
+      parallelStatus:  err.parallelStatus  || null,
+      parallelData:    err.parallelData    || null,
+      splitterStatus:  err.splitterStatus  || null,
     });
   }
 });

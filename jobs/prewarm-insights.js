@@ -26,6 +26,12 @@ const PORT       = process.env.PORT || 3000;
 const PROXY_BASE = process.env.PROXY_BASE || `http://127.0.0.1:${PORT}`;
 const APOLLO_KEY = process.env.APOLLO_KEY;
 
+// Insights polling — caller-side. Allow up to 3 minutes for Parallel to
+// produce bullets. Some companies (Monerium, slow research targets) need
+// longer than the 90s default of /parallel/insights-bullets.
+const INSIGHTS_POLL_TIMEOUT_MS = 180_000;
+const INSIGHTS_AXIOS_TIMEOUT_MS = 200_000;
+
 // Personal email providers — never auto-CRM-sync these
 const PERSONAL_EMAIL_DOMAINS = new Set([
   "gmail.com", "googlemail.com",
@@ -47,16 +53,14 @@ let lastRunStats = null;
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Map BD scoring tier → Notion Priority field
 function tierToPriority(tier) {
   if (tier === "MH") return "High";
-  if (tier === "P1") return "High";  // Both MH and P1 go to High in Notion
+  if (tier === "P1") return "High";
   if (tier === "P2") return "Mid";
   if (tier === "P3") return "Low";
-  return null;  // Hard Kill — no priority
+  return null;
 }
 
-// Determine if Notion Insight needs a refresh
 function needsInsightRefresh(notionCompany) {
   if (!notionCompany?.insight) return true;
   if (!notionCompany.insight.refreshedAt) return true;
@@ -67,17 +71,14 @@ function needsInsightRefresh(notionCompany) {
   return ageDays >= INSIGHT_STALE_DAYS;
 }
 
-// Get tomorrow / today calendar events via /calendar/range
 async function fetchCalendarForOffset(dayOffset) {
   const now = new Date();
   const targetDate = new Date(now);
   targetDate.setDate(now.getDate() + dayOffset);
 
-  // Build [00:00 Prague, 24:00 Prague] of target day in UTC
   const yyyy = targetDate.getFullYear();
   const mm   = String(targetDate.getMonth() + 1).padStart(2, "0");
   const dd   = String(targetDate.getDate()).padStart(2, "0");
-  // Use noon-anchored TZ math (DST-safe, mirroring routes/calendar.js)
   const noon = Date.UTC(yyyy, targetDate.getMonth(), targetDate.getDate(), 12, 0, 0);
   const noonInTz = new Date(noon).toLocaleString("en-US", { timeZone: "Europe/Prague" });
   const noonAsUtc = new Date(noonInTz + " UTC").getTime();
@@ -96,12 +97,8 @@ async function fetchCalendarForOffset(dayOffset) {
   return { events: r.data?.events || [], date: `${yyyy}-${mm}-${dd}` };
 }
 
-// Pick the primary external attendee from a calendar event.
-// Returns { email, name } or null if all attendees are internal.
 function pickPrimaryAttendee(event) {
   const attendees = event.attendees || [];
-  // attendees on /calendar/range payload are already filtered to externals by formatEvent
-  // but we double-guard here in case raw events come in
   for (const a of attendees) {
     const email = (a.email || "").toLowerCase();
     if (!email) continue;
@@ -115,7 +112,6 @@ function pickPrimaryAttendee(event) {
 
 // Wait for a Parallel research task and return the compact scoring payload.
 async function runParallelScoring({ company, domain }) {
-  // Kick off the task (lite processor — sufficient for cron-time scoring)
   const startRes = await axios.post(
     `${PROXY_BASE}/parallel/research/start`,
     { company, domain, processor: "lite" },
@@ -124,7 +120,6 @@ async function runParallelScoring({ company, domain }) {
   const taskId = startRes.data?.taskId;
   if (!taskId) throw new Error(`Parallel scoring: no taskId for ${company}`);
 
-  // Poll for completion (max 4 minutes — Parallel research lite usually 1-3 min)
   const startedAt = Date.now();
   const TIMEOUT_MS = 240_000;
   while (Date.now() - startedAt < TIMEOUT_MS) {
@@ -136,12 +131,12 @@ async function runParallelScoring({ company, domain }) {
   throw new Error(`Parallel scoring timeout (>${TIMEOUT_MS}ms) for ${company}`);
 }
 
-// Run /parallel/insights-bullets for a company
+// Run /parallel/insights-bullets for a company with extended polling timeout.
 async function runInsightsBullets(company, domain) {
   const r = await axios.post(
     `${PROXY_BASE}/parallel/insights-bullets`,
-    { company, domain },
-    { timeout: 120_000 }
+    { company, domain, timeoutMs: INSIGHTS_POLL_TIMEOUT_MS },
+    { timeout: INSIGHTS_AXIOS_TIMEOUT_MS }
   );
   return {
     bullets: r.data?.bullets || [],
@@ -163,11 +158,6 @@ async function writeInsightToNotion({ pageId, name, bullets, refreshedAt }) {
 // Per-event processing
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Returns one of:
-//   { action: "skip", reason }
-//   { action: "refresh-insight", company, bullets }
-//   { action: "create-company", company, person, scoring, bullets }
-//   { action: "error", error }
 async function processOneEvent(event, { dryRun = false } = {}) {
   const summary = event.summary || "(no title)";
 
@@ -224,7 +214,6 @@ async function processOneEvent(event, { dryRun = false } = {}) {
   }
 
   try {
-    // (a) Resolve canonical name (cascade: title → Apollo → fallback to domain)
     const resolved = await resolveCompanyName({
       meetingTitle: summary,
       attendeeEmail: attendee.email,
@@ -233,29 +222,23 @@ async function processOneEvent(event, { dryRun = false } = {}) {
     let companyName  = resolved.canonicalName;
     let apolloOrg    = resolved.apolloOrg;
 
-    // If title parsing succeeded but we didn't run Apollo yet — run Apollo
-    // separately so we still get firmographics for Notion writeback.
     if (!apolloOrg && APOLLO_KEY) {
       apolloOrg = await apolloOrgEnrich(domain);
       if (!companyName && apolloOrg?.name) companyName = apolloOrg.name;
     }
 
-    // Last-resort fallback: capitalize the domain stem
     if (!companyName) {
       const stem = domain.split(".")[0];
       companyName = stem.charAt(0).toUpperCase() + stem.slice(1);
     }
 
-    // (b) Apollo person enrichment by email (gives us LinkedIn + title)
     let apolloPerson = null;
     if (APOLLO_KEY) {
       apolloPerson = await apolloPersonEnrich({ email: attendee.email });
     }
 
-    // (c) Full BD scoring via Parallel (1-3 min)
     const scoring = await runParallelScoring({ company: companyName, domain });
 
-    // (d) Build Notion Company props
     const isHardKill = scoring.tier === "Hard Kill";
     const tags = [];
     if (scoring.tier && !isHardKill) tags.push(scoring.tier);
@@ -276,42 +259,29 @@ async function processOneEvent(event, { dryRun = false } = {}) {
                    scoring.cat === "Client"  ? "Client" : null,
       communication_channel: "Email",
       source:      "Loop OS Auto-CRM Apr2026",
-      status:      "initial discussions",  // Stage — only set on new entries
+      status:      "initial discussions",
     };
 
-    // Set priority only for non-Hard-Kill
     const priority = tierToPriority(scoring.tier);
     if (priority) companyProps.priority = priority;
 
-    // Drop empty values to keep payload clean
     Object.keys(companyProps).forEach(k => {
       if (companyProps[k] === null || companyProps[k] === undefined) delete companyProps[k];
     });
 
-    // (e) Write Company to Notion
     await axios.post(
       `${PROXY_BASE}/notion/update-company-with-tags`,
       companyProps,
       { timeout: 20000 }
     );
 
-    // (f) Upsert Person — link to the new company
     let personName = attendee.name;
     if (!personName && apolloPerson?.name) personName = apolloPerson.name;
     if (!personName) {
-      // Last resort: derive from email local part
       const local = attendee.email.split("@")[0];
       const parts = local.split(/[._-]/).filter(Boolean).map(p => p.charAt(0).toUpperCase() + p.slice(1));
       personName = parts.join(" ") || local;
     }
-
-    const personProps = {
-      name:    personName,
-      company: companyName,
-      email:   attendee.email,
-    };
-    if (apolloPerson?.linkedin) personProps.linkedin = apolloPerson.linkedin;
-    if (apolloPerson?.title)    personProps.title    = apolloPerson.title;
 
     await axios.post(
       `${PROXY_BASE}/notion/upsert-lead`,
@@ -328,7 +298,6 @@ async function processOneEvent(event, { dryRun = false } = {}) {
       { timeout: 20000 }
     );
 
-    // (g) Fetch insights and write to Notion (after Company exists)
     let insights = { bullets: [], refreshedAt: new Date().toISOString() };
     try {
       insights = await runInsightsBullets(companyName, domain);
@@ -339,7 +308,6 @@ async function processOneEvent(event, { dryRun = false } = {}) {
       });
     } catch (err) {
       console.error(`[prewarm] insights write failed for ${companyName}: ${err.message}`);
-      // non-fatal — Company is already in CRM
     }
 
     return {
@@ -388,13 +356,11 @@ async function runPrewarmInsights({ dayOffset = 1, dryRun = false } = {}) {
   const { events, date } = await fetchCalendarForOffset(dayOffset);
   console.log(`[prewarm] ${events.length} events on ${date}`);
 
-  // Filter to events that have at least one external attendee
   const candidates = events.filter(ev => !ev.isInternal);
   console.log(`[prewarm] ${candidates.length} candidates after dropping internal-only`);
 
   const results = await processWithLimit(candidates, 3, ev => processOneEvent(ev, { dryRun }));
 
-  // Aggregate stats
   const stats = {
     total: candidates.length,
     skipped:        results.filter(r => r.action === "skip").length,
@@ -405,7 +371,6 @@ async function runPrewarmInsights({ dayOffset = 1, dryRun = false } = {}) {
     errors:         results.filter(r => r.action === "error").length,
   };
 
-  // Log details
   for (const r of results) {
     const tag = r.action.padEnd(20);
     const detail = r.action === "error" ? `ERR: ${r.error}` :
@@ -425,8 +390,6 @@ async function runPrewarmInsights({ dayOffset = 1, dryRun = false } = {}) {
 // HTTP routes (test / status)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// POST /jobs/prewarm-insights/run — manual trigger
-// Body: { dayOffset?: 0|1, dryRun?: boolean }
 router.post("/prewarm-insights/run", async (req, res) => {
   const { dayOffset = 1, dryRun = false } = req.body || {};
   if (![0, 1, 2, 3, 7].includes(dayOffset)) {
@@ -441,7 +404,6 @@ router.post("/prewarm-insights/run", async (req, res) => {
   }
 });
 
-// GET /jobs/prewarm-insights/status
 router.get("/prewarm-insights/status", (_req, res) => {
   res.json({
     ok: true,
@@ -456,7 +418,6 @@ router.get("/prewarm-insights/status", (_req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 function registerJobs() {
-  // 23:00 Europe/Prague — process tomorrow
   cron.schedule("0 23 * * *", async () => {
     console.log("[cron] prewarm-insights (tomorrow) start");
     try {
@@ -467,7 +428,6 @@ function registerJobs() {
   }, { timezone: "Europe/Prague" });
   console.log("[cron] prewarm-insights registered (23:00 Europe/Prague — tomorrow)");
 
-  // 08:00 Europe/Prague — process today (catches overnight additions)
   cron.schedule("0 8 * * *", async () => {
     console.log("[cron] prewarm-insights (today) start");
     try {

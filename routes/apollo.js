@@ -1,6 +1,6 @@
 const express = require("express");
 const axios   = require("axios");
-const { filterPerson } = require("../lib/apollo");
+const { filterPerson, filterOrganization } = require("../lib/apollo");
 
 const router = express.Router();
 
@@ -21,8 +21,6 @@ router.post("/search", async (req, res) => {
 });
 
 // ── POST /apollo/match ────────────────────────────────────────────────────────
-// Accepts: id (Apollo person id) OR firstName+lastName+organizationName/domain
-// OR linkedinUrl. Returns compact filtered profile.
 router.post("/match", async (req, res) => {
   const { apolloKey, id, firstName, lastName, organizationName, domain, linkedinUrl } = req.body;
   if (!apolloKey) return res.status(400).json({ error: "apolloKey required" });
@@ -44,13 +42,6 @@ router.post("/match", async (req, res) => {
 });
 
 // ── POST /apollo/bulk-match ───────────────────────────────────────────────────
-// Enrich up to 50 people in parallel via Promise.all. Each item in `people`
-// can have any combination of: id, firstName+lastName+organizationName,
-// domain, linkedinUrl. Returns compact filtered profiles in same order.
-// Failed lookups return null at the corresponding index instead of throwing.
-//
-// Input shape: { apolloKey, people: [{id}, {firstName, lastName, organizationName}, ...] }
-// Output shape: { ok, total, succeeded, failed, results: [filteredPerson|null, ...] }
 router.post("/bulk-match", async (req, res) => {
   const { apolloKey, people } = req.body;
   if (!apolloKey) return res.status(400).json({ error: "apolloKey required" });
@@ -96,6 +87,45 @@ router.post("/bulk-match", async (req, res) => {
     elapsedMs,
     results,
   });
+});
+
+// ── POST /apollo/org-enrich ───────────────────────────────────────────────────
+// Look up canonical company info by domain. Used by Loop to derive Company name
+// from a calendar attendee's email (e.g. charlie@bankingcircle.com → "Banking Circle").
+//
+// Body: { apolloKey, domain }
+// Returns: filteredOrganization | null
+router.post("/org-enrich", async (req, res) => {
+  const { apolloKey, domain } = req.body;
+  if (!apolloKey) return res.status(400).json({ error: "apolloKey required" });
+  if (!domain)    return res.status(400).json({ error: "domain required" });
+
+  // Apollo's org enrich expects a clean domain ("bankingcircle.com"), not a URL.
+  const cleanDomain = String(domain)
+    .toLowerCase()
+    .trim()
+    .replace(/^https?:\/\//, "")
+    .replace(/^www\./, "")
+    .split("/")[0]
+    .split("?")[0];
+
+  try {
+    const r = await axios.get(
+      "https://api.apollo.io/api/v1/organizations/enrich",
+      {
+        params: { domain: cleanDomain },
+        headers: { "X-Api-Key": apolloKey },
+        timeout: 15000,
+      }
+    );
+    const org = r.data?.organization;
+    if (!org) return res.json(null);
+    res.json(filterOrganization(org));
+  } catch (err) {
+    res.status(err.response?.status || 500).json({
+      error: err.response?.data?.error || err.message,
+    });
+  }
 });
 
 module.exports = router;

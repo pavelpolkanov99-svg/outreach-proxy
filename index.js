@@ -17,6 +17,7 @@ const NOTION_TOKEN  = process.env.NOTION_TOKEN;
 const PARALLEL_KEY  = process.env.PARALLEL_KEY;
 const BEEPER_TOKEN  = process.env.BEEPER_TOKEN;
 const GITHUB_PAT    = process.env.GITHUB_PAT;
+const GOOGLE_OAUTH  = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REFRESH_TOKEN_PAVEL);
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/apollo",   require("./routes/apollo"));
@@ -24,6 +25,7 @@ app.use("/heyreach", require("./routes/heyreach"));
 app.use("/notion",   require("./routes/notion"));
 app.use("/parallel", require("./routes/parallel"));
 app.use("/beeper",   require("./routes/beeper"));
+app.use("/calendar", require("./routes/calendar"));
 app.use("/webhook",  require("./routes/webhooks"));
 app.use("/mcp",      require("./routes/mcp")); // ← Custom Connector endpoint for claude.ai
 
@@ -39,10 +41,11 @@ app.get("/health", (_, res) => res.json({
   parallel: !!PARALLEL_KEY,
   beeper:   !!BEEPER_TOKEN,
   github:   !!GITHUB_PAT,
+  calendar: GOOGLE_OAUTH,
   mcp:      true,
-  version:  "3.12.2",
+  version:  "3.13.0",
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.12.2", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.13.0", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

@@ -4,7 +4,7 @@ const axios   = require("axios");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY     = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION   = "4.2.0-fcc-today-enriched";
+const VERSION   = "4.3.0-fcc-stale-deals";
 const STARTED_AT = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -43,7 +43,7 @@ function esc(text) {
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// ── Helpers for /today rendering ─────────────────────────────────────────────
+// ── Helpers shared between /today and /stale ─────────────────────────────────
 
 // Days since ISO date string, returns string like "2d", "3w", "1mo"
 function daysAgo(isoDate) {
@@ -62,14 +62,12 @@ function daysAgo(isoDate) {
 // Scoring is on /17 scale: MH ≥9, P1 ≥7.5, P2 5-7.4, P3 3-4.9
 function tierFromCompany(company) {
   if (!company) return null;
-  // Hard Kill detection — look in tags
   const tags = company.tags || [];
   const hkTag = tags.find(t => /^Hard Kill\s*-\s*HK/i.test(t));
   if (hkTag) {
     const m = hkTag.match(/HK-?(\d+)/i);
     return { hardKill: true, code: m ? `HK-${m[1]}` : "HK", emoji: "🔴" };
   }
-  // Tier from BD score on /17 scale
   const score = company.bdScore;
   if (score == null) return null;
   if (score >= 9.0)  return { tier: "MH", emoji: "🟢", score };
@@ -99,7 +97,6 @@ function renderEvent(ev) {
   const time  = ev.timeRange;
   const title = esc(ev.summary);
 
-  // Header line: time + title
   lines.push(`<code>${time}</code>  <b>${title}</b>`);
 
   if (ev.isInternal) {
@@ -107,14 +104,12 @@ function renderEvent(ev) {
     return lines.join("\n");
   }
 
-  const indent = "             ";  // 13 spaces — visual alignment under timeRange
+  const indent = "             ";
 
-  // Domain line
   if (ev.primaryDomain) {
     lines.push(`${indent}🌐 ${esc(ev.primaryDomain)}`);
   }
 
-  // Person line
   const p = ev.attendeePerson;
   if (p) {
     const personName = p.name || p.email?.split("@")[0] || "?";
@@ -123,12 +118,10 @@ function renderEvent(ev) {
     lines.push(`${indent}👤 ${esc(personName)}${titlePart}${linkPart}`);
   }
 
-  // CRM company line
   const crm = ev.notion;
   if (crm) {
     const t = tierFromCompany(crm);
     if (t?.hardKill) {
-      // Hard Kill plate — red, bold, plus advisory
       const hkDesc = HK_DESCRIPTIONS[t.code] || "Hard Kill";
       lines.push(`${indent}🔴 <b>Hard Kill — ${esc(t.code)}</b> · ${esc(hkDesc)}`);
       lines.push(`${indent}   <i>Anton, замни диалог</i>`);
@@ -140,11 +133,9 @@ function renderEvent(ev) {
         `${indent}${t.emoji} <b>${t.tier}</b> · ${t.score}${stagePart}${touchPart}`
       );
     } else if (crm.stage) {
-      // No score yet, but we have a stage
       lines.push(`${indent}⚪ ${esc(crm.stage)}`);
     }
 
-    // Description — short, single-paragraph excerpt
     if (crm.description) {
       const shortDesc = crm.description.split(/\n\s*\n/)[0].trim();
       const truncated = shortDesc.length > 180
@@ -153,7 +144,6 @@ function renderEvent(ev) {
       lines.push(`${indent}📝 ${esc(truncated)}`);
     }
 
-    // Insight bullets
     if (crm.insight?.bullets?.length) {
       const refreshDate = crm.insight.refreshedAt
         ? ` <i>(${esc(crm.insight.refreshedAt.slice(0, 10))})</i>`
@@ -164,7 +154,6 @@ function renderEvent(ev) {
       }
     }
 
-    // Tags (skip Hard Kill/MH/P1/P2/P3 tags — they're already in the tier line)
     const visibleTags = (crm.tags || []).filter(t =>
       !/^(MH|P1|P2|P3|Hard Kill)/i.test(t)
     );
@@ -172,7 +161,6 @@ function renderEvent(ev) {
       lines.push(`${indent}🏷 ${visibleTags.slice(0, 6).map(esc).join(" · ")}`);
     }
   } else {
-    // Not in CRM yet
     lines.push(`${indent}🆕 <i>not in CRM</i> — cron подхватит ночью`);
   }
 
@@ -183,6 +171,57 @@ function renderEvent(ev) {
   return lines.join("\n");
 }
 
+// ── Stale-deals rendering ────────────────────────────────────────────────────
+
+// Compact one-deal format. Negotiations gets a 🔴 plate (deal at risk),
+// other active stages get 🟡 (gone quiet, needs nudge).
+function renderStaleDeal(deal) {
+  const lines = [];
+
+  const stage = deal.stage || "";
+  const isHotStage = stage === "Negotiations" || stage === "Call Scheduled";
+  const emoji = isHotStage ? "🔴" : "🟡";
+
+  // Header: emoji + name + stage + days stale
+  const stagePart = stage ? ` · ${esc(stage)}` : "";
+  const stalePart = deal.daysStale != null ? ` · <b>${deal.daysStale}d тишины</b>` : "";
+  lines.push(`${emoji} <b>${esc(deal.name)}</b>${stagePart}${stalePart}`);
+
+  const indent = "   ";
+
+  // BD context: tier + score + priority + pipeline + channel
+  const t = tierFromCompany(deal);
+  const ctxParts = [];
+  if (t && !t.hardKill) ctxParts.push(`${t.tier} · ${t.score}`);
+  else if (deal.bdScore != null) ctxParts.push(`BD ${deal.bdScore}`);
+  if (deal.priority) ctxParts.push(deal.priority);
+  if (deal.pipeline) ctxParts.push(deal.pipeline);
+  if (ctxParts.length) lines.push(`${indent}<i>${ctxParts.map(esc).join(" · ")}</i>`);
+
+  // Action note (if set in Notion) — extremely high signal, like INXY's "Waiting to fill in DC + NDA"
+  // We don't get Action via current digest, but we can fall back to last-touch info
+  const lastTouch = daysAgo(deal.lastContact);
+  if (lastTouch && lastTouch !== "today") {
+    lines.push(`${indent}📅 last contact: ${esc(lastTouch)} ago`);
+  }
+
+  return lines.join("\n");
+}
+
+// Fetch stale deals from proxy
+async function fetchStaleDeals({ days = 14, limit = 5 } = {}) {
+  try {
+    const r = await axios.get(`${PROXY}/notion/stale-deals`, {
+      params: { days, limit },
+      timeout: 15_000,
+    });
+    return r.data?.deals || [];
+  } catch (err) {
+    console.error("[bot] fetchStaleDeals failed:", err.message);
+    return null;  // null = error (vs [] = empty result)
+  }
+}
+
 // ── /start ────────────────────────────────────────────────────────────────────
 bot.command("start", ctx => guard(ctx, () => {
   return ctx.reply(
@@ -191,7 +230,8 @@ bot.command("start", ctx => guard(ctx, () => {
     `Статус: жив, фичи строим по одной.\n\n` +
     `Доступно сейчас:\n` +
     `/ping — health check\n` +
-    `/today — встречи Anton'а на сегодня (с CRM данными)\n\n` +
+    `/today — встречи Anton'а на сегодня (с CRM данными + stale deals)\n` +
+    `/stale — заглохшие сделки (>14d тишины)\n\n` +
     `Скоро:\n` +
     `• Morning digest (9:00 CET)\n` +
     `• Pre-call briefing (за час до звонка)\n` +
@@ -222,30 +262,48 @@ bot.command("ping", ctx => guard(ctx, () => {
 bot.command("today", ctx => guard(ctx, async () => {
   const loadingMsg = await ctx.reply("⏳ Тяну календарь + CRM...");
   try {
-    // 30s timeout — enrichment can take a few seconds (4 parallel Notion lookups per event)
-    const r = await axios.get(`${PROXY}/calendar/today`, { timeout: 30_000 });
-    const data = r.data;
+    // Run calendar + stale-deals in parallel — no point waiting serially
+    const [calendarRes, stale] = await Promise.all([
+      axios.get(`${PROXY}/calendar/today`, { timeout: 30_000 })
+        .then(r => r.data)
+        .catch(err => ({ ok: false, error: err.message })),
+      fetchStaleDeals({ days: 14, limit: 5 }),
+    ]);
 
-    if (!data.ok) {
+    if (!calendarRes.ok) {
       return ctx.api.editMessageText(
         ctx.chat.id, loadingMsg.message_id,
-        `❌ Calendar error: ${esc(data.error || "unknown")}`
+        `❌ Calendar error: ${esc(calendarRes.error || "unknown")}`
       );
     }
 
-    if (!data.events?.length) {
-      return ctx.api.editMessageText(
-        ctx.chat.id, loadingMsg.message_id,
-        `📅 <b>Сегодня (${esc(data.date)})</b>\n\nКалендарь пустой 🌴`,
-        { parse_mode: "HTML" }
+    const sections = [];
+
+    // Calendar block
+    if (!calendarRes.events?.length) {
+      sections.push(
+        `📅 <b>Сегодня (${esc(calendarRes.date)})</b>\n\nКалендарь пустой 🌴`
+      );
+    } else {
+      const blocks = calendarRes.events.map(renderEvent);
+      sections.push(
+        `📅 <b>Сегодня (${esc(calendarRes.date)})</b>  · <i>${calendarRes.total} встреч</i>\n` +
+        `\n` +
+        blocks.join("\n\n")
       );
     }
 
-    const blocks = data.events.map(renderEvent);
-    const text =
-      `📅 <b>Сегодня (${esc(data.date)})</b>  · <i>${data.total} встреч</i>\n` +
-      `\n` +
-      blocks.join("\n\n");
+    // Stale-deals block (only show if we got results — null = skip silently on fetch error)
+    if (Array.isArray(stale) && stale.length > 0) {
+      const dealBlocks = stale.map(renderStaleDeal);
+      sections.push(
+        `🟡 <b>Заглохли</b>  · <i>${stale.length} сделок &gt;14d</i>\n` +
+        `\n` +
+        dealBlocks.join("\n\n")
+      );
+    }
+
+    const text = sections.join("\n\n━━━━━━━━━━━━━━━\n\n");
 
     return ctx.api.editMessageText(
       ctx.chat.id, loadingMsg.message_id, text,
@@ -261,13 +319,55 @@ bot.command("today", ctx => guard(ctx, async () => {
   }
 }));
 
+// ── /stale ────────────────────────────────────────────────────────────────────
+bot.command("stale", ctx => guard(ctx, async () => {
+  const loadingMsg = await ctx.reply("⏳ Сканирую CRM...");
+  try {
+    const stale = await fetchStaleDeals({ days: 14, limit: 10 });
+
+    if (stale === null) {
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Не удалось получить данные из CRM.`
+      );
+    }
+
+    if (stale.length === 0) {
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `✅ <b>Pipeline здоров</b>\n\nНет сделок без активности &gt;14d среди MH/P1/P2.`,
+        { parse_mode: "HTML" }
+      );
+    }
+
+    const dealBlocks = stale.map(renderStaleDeal);
+    const text =
+      `🟡 <b>Заглохли</b>  · <i>${stale.length} сделок &gt;14d</i>\n` +
+      `\n` +
+      dealBlocks.join("\n\n");
+
+    return ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, text,
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
+    );
+  } catch (err) {
+    const errMsg = err.response?.data?.error || err.message;
+    console.error("[bot /stale] error:", errMsg);
+    return ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id,
+      `❌ Ошибка: ${esc(errMsg)}`
+    );
+  }
+}));
+
 // ── Catch-all for any other text ──────────────────────────────────────────────
 bot.on("message:text", ctx => guard(ctx, () => {
   return ctx.reply(
     `Пока я понимаю только команды:\n` +
     `/start — что я умею\n` +
     `/ping — health check\n` +
-    `/today — встречи Anton'а на сегодня`
+    `/today — встречи Anton'а на сегодня\n` +
+    `/stale — заглохшие сделки`
   );
 }));
 

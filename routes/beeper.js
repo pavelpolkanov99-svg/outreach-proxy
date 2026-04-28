@@ -169,6 +169,206 @@ router.get("/digest", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// /beeper/replies-waiting — heuristic "ждут ответа Anton'а"
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Reuses /beeper/digest internally then filters:
+//   - isSender === false (last msg from someone else)
+//   - hours idle >= hoursIdle threshold
+//
+// Each chat is enriched with optional Notion CRM matches (Company by chat name,
+// Person by lastMsgSender). Matches are NOT required — chats without CRM hits
+// still appear, but get visualTier="secondary" so the bot can render them
+// in a separate visual group.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Match Beeper chat / sender against Notion Companies DB by name (fuzzy contains)
+async function lookupCompanyByName(name) {
+  if (!NOTION_TOKEN || !name) return null;
+  try {
+    // Take the most distinctive word from the chat name as the search key.
+    // E.g. "Hector Ramirez Mateos | Bitso Business" → search for "Bitso".
+    // Heuristic: prefer the LAST segment after | or - or split, drop prefix words like "Plexo <>"
+    const cleanedName = String(name)
+      .replace(/^Plexo\s*[<>x×|]+\s*/i, "")
+      .replace(/^.*\|\s*/, "")
+      .trim();
+    const candidate = cleanedName.split(/\s+/)[0];
+    if (!candidate || candidate.length < 3) return null;
+
+    const r = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+      {
+        filter: { property: "Company name", title: { contains: candidate } },
+        page_size: 3,
+      },
+      { headers: notionHeaders(), timeout: 8000 }
+    );
+    const page = r.data.results?.[0];
+    if (!page) return null;
+    return {
+      pageId: page.id,
+      url:    page.url,
+      name:   page.properties["Company name"]?.title?.[0]?.text?.content || candidate,
+      stage:  page.properties["Stage"]?.status?.name || null,
+      priority: page.properties["Priority"]?.select?.name || null,
+      bdScore: page.properties["BD Score"]?.number ?? null,
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+// Match Beeper sender against Notion People DB by name
+async function lookupPersonByName(name) {
+  if (!NOTION_TOKEN || !name) return null;
+  // Skip generic / known-internal senders
+  if (/anton|pavel|paul|polkanov|titov|@pavel-remide:beeper\.com/i.test(name)) return null;
+  try {
+    const r = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_PEOPLE_DB}/query`,
+      {
+        filter: { property: "Name", title: { contains: name.split(/\s+/)[0] } },
+        page_size: 3,
+      },
+      { headers: notionHeaders(), timeout: 8000 }
+    );
+    const page = r.data.results?.[0];
+    if (!page) return null;
+    const props = page.properties || {};
+    return {
+      pageId:   page.id,
+      url:      page.url,
+      name:     (props["Name"]?.title || []).map(t => t.plain_text || t.text?.content || "").join(""),
+      title:    (props["Role"]?.rich_text || []).map(t => t.plain_text || t.text?.content || "").join("") || null,
+      email:    props["Email"]?.email || null,
+      linkedin: props["LinkedIn"]?.url || null,
+    };
+  } catch (err) {
+    return null;
+  }
+}
+
+// Senders that count as "Anton/Pavel" — last msg from them = Anton already replied.
+// We need to be LIBERAL here because Beeper labels Anton variously across networks:
+//   "Anton CEO RemiDe", "Антон", "@pavel-remide:beeper.com" (sent via Pavel's Beeper account)
+const INTERNAL_SENDER_REGEX = /(anton|antón|антон|^pavel|polkanov|@pavel-remide:beeper\.com|titov|remide)/i;
+
+function isInternalSender(senderName) {
+  if (!senderName) return false;
+  return INTERNAL_SENDER_REGEX.test(senderName);
+}
+
+router.get("/replies-waiting", async (req, res) => {
+  if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
+
+  const hoursIdle = Math.max(0.5, Math.min(168, parseFloat(req.query.hoursIdle) || 4));
+  const limit     = Math.max(1,   Math.min(50,  parseInt(req.query.limit, 10) || 15));
+  const days      = Math.max(1,   Math.min(30,  parseInt(req.query.days,  10) || 7));
+
+  const since      = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const minIdleMs  = hoursIdle * 60 * 60 * 1000;
+  const maxLastMs  = Date.now() - minIdleMs;
+
+  try {
+    // 1) Get raw digest (re-using /digest's logic via direct call)
+    const r = await axios.get(`${BEEPER_URL}/v1/chats?limit=200`, { headers: beeperHeaders(), timeout: 15000 });
+    const items = r.data?.items || [];
+
+    const recent = items.filter(c => {
+      const ts = c.lastMessageAt || c.lastActivityAt || c.updatedAt;
+      return ts ? new Date(ts) > since : false;
+    });
+
+    // 2) Fetch last message per chat (in parallel) and check heuristic
+    const enriched = await Promise.all(recent.map(async c => {
+      let lastMsgText = "", lastMsgSender = "", lastMsgTime = null, isSender = false;
+      try {
+        const msgs = await beeperGetMessages(c.id, 3);
+        const m = msgs[0];
+        if (m) {
+          const sender = m.sender?.fullName || m.sender?.displayName || m.senderName || "?";
+          const text   = m.content?.text || m.content?.body || m.text || m.body || "";
+          lastMsgText   = text.slice(0, 300);
+          lastMsgSender = sender;
+          lastMsgTime   = m.timestamp || null;
+          isSender      = !!(m.isSender) || isInternalSender(sender);
+        }
+      } catch (_) {}
+
+      return {
+        id:           c.id,
+        name:         c.title || c.name || "",
+        type:         c.type,
+        network:      netLabel(c.accountID),
+        networkFull:  networkFromAccountID(c.accountID),
+        accountID:    c.accountID,
+        lastMsgText,
+        lastMsgSender,
+        lastMsgTime,
+        isSender,
+      };
+    }));
+
+    // 3) Filter to "ждут ответа":
+    //    - last msg NOT from Anton/Pavel (isSender===false AND sender doesn't match internal regex)
+    //    - last msg older than hoursIdle threshold
+    //    - has actual text (skip media-only / empty)
+    const filtered = enriched.filter(c => {
+      if (c.isSender) return false;
+      if (!c.lastMsgText || !c.lastMsgText.trim()) return false;
+      if (!c.lastMsgTime) return false;
+      const tsMs = new Date(c.lastMsgTime).getTime();
+      if (isNaN(tsMs)) return false;
+      if (tsMs > maxLastMs) return false;
+      return true;
+    });
+
+    // 4) Sort: oldest pending first (most urgent at top — tells you what's been sitting longest)
+    filtered.sort((a, b) => new Date(a.lastMsgTime) - new Date(b.lastMsgTime));
+
+    // 5) Apply limit
+    const top = filtered.slice(0, limit);
+
+    // 6) Enrich with Notion CRM matches in parallel
+    const withCrm = await Promise.all(top.map(async c => {
+      const [company, person] = await Promise.all([
+        lookupCompanyByName(c.name),
+        lookupPersonByName(c.lastMsgSender),
+      ]);
+
+      // Hours idle (rounded to 1 decimal)
+      const idleMs = Date.now() - new Date(c.lastMsgTime).getTime();
+      const hoursIdleVal = Math.round(idleMs / (60 * 60 * 1000) * 10) / 10;
+
+      // Visual tier:
+      //   primary   — has CRM company match OR 1-on-1 chat
+      //   secondary — group chat without CRM match
+      const visualTier = (company || c.type === "single") ? "primary" : "secondary";
+
+      return {
+        ...c,
+        hoursIdle: hoursIdleVal,
+        notion: company,
+        person,
+        visualTier,
+      };
+    }));
+
+    res.json({
+      ok: true,
+      hoursIdle,
+      since: since.toISOString(),
+      total: withCrm.length,
+      replies: withCrm,
+    });
+  } catch (err) {
+    console.error("[beeper/replies-waiting] error:", err.message);
+    res.status(err.response?.status || 500).json({ error: err.message });
+  }
+});
+
 // ── GET /beeper/messages ──────────────────────────────────────────────────────
 router.get("/messages", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });

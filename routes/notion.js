@@ -622,10 +622,54 @@ function toYmd(d) {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+// Strip Notion-mention markdown syntax that leaks into rich_text plain_text:
+//   [link text](https://url)         → "link text"
+//   www.example.com / bare URLs      → kept as-is (often informative)
+// Also collapses runs of whitespace and trims.
+function stripMarkdownLinks(s) {
+  if (!s) return s;
+  return String(s)
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\s*\n\s*/g, " ")
+    .trim();
+}
+
+// Derive a "shape key" from a task name to detect repeated templates.
+//
+// Examples (input → key):
+//   "Drop discovery card follow — LeoPay"           → "drop discovery card follow"
+//   "Drop discovery card follow — Bitnob"           → "drop discovery card follow"
+//   "Drop discovery card (email +tg)"               → "drop discovery card"
+//   "Drop discovery card + create WA chat"          → "drop discovery card"
+//   "Antarctic Wallet | Create TG group..."         → "antarctic wallet"   (different — not grouped)
+//   "Agora | Patrick Chu: schedule call next week"  → "agora"
+//   "Nium | Keep CRO warm"                          → "nium"
+//
+// Rules:
+//   - Lowercase
+//   - Cut at any of: " — " | " - " | " | " | ":" | " (" | " +" | " ("
+//   - Strip trailing whitespace
+//   - Anything <3 words is too short to be considered a template
+function deriveTaskShapeKey(taskName) {
+  if (!taskName) return null;
+  let s = String(taskName).toLowerCase();
+  // Cut at first delimiter that signals "this is the boilerplate prefix"
+  const delimiterRegex = /\s+[—–-]\s+|\s+\|\s+|:\s+|\s+\(/;
+  const m = s.split(delimiterRegex);
+  s = (m[0] || "").trim();
+  // Word count check — single words (e.g., "agora") aren't useful as shape keys
+  // because they only match themselves. Require at least 3 words for a "template".
+  const words = s.split(/\s+/).filter(Boolean);
+  if (words.length < 3) return null;
+  return s;
+}
+
 router.get("/tasks-today", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
 
-  const limit = Math.max(1, Math.min(50, parseInt(req.query.limit, 10) || 10));
+  const limit  = Math.max(1, Math.min(50, parseInt(req.query.limit, 10) || 10));
+  const noGroup = req.query.group === "0" || req.query.group === "false";
 
   // "today" cutoff — anything with due date <= today (UTC) counts
   const todayYmd = toYmd(new Date());
@@ -652,7 +696,7 @@ router.get("/tasks-today", async (req, res) => {
         sorts: [
           { property: "Due date", direction: "ascending" },
         ],
-        page_size: 100, // pre-sort wide, post-sort + slice in code
+        page_size: 100,
       },
       { headers: notionHeaders() }
     );
@@ -666,7 +710,11 @@ router.get("/tasks-today", async (req, res) => {
       const name = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
 
       const descArr = props["Description"]?.rich_text || [];
-      const description = descArr.map(rt => rt.plain_text || rt.text?.content || "").join("").trim();
+      const descriptionRaw = descArr.map(rt => rt.plain_text || rt.text?.content || "").join("").trim();
+      const descriptionClean = stripMarkdownLinks(descriptionRaw);
+      const description = descriptionClean.length > 200
+        ? descriptionClean.slice(0, 197) + "..."
+        : descriptionClean;
 
       const status   = props["Status"]?.status?.name || null;
       const priority = props["Priority"]?.select?.name || null;
@@ -675,7 +723,6 @@ router.get("/tasks-today", async (req, res) => {
       const companyRel = props["🏢  CRM Companies"]?.relation || [];
       const linkedCompanyId = companyRel[0]?.id || null;
 
-      // daysOverdue = today - dueDate; >0 = late, 0 = today, <0 = future
       let daysOverdue = null;
       if (dueDate) {
         const dueMs = Date.parse(dueDate + "T00:00:00Z");
@@ -689,7 +736,7 @@ router.get("/tasks-today", async (req, res) => {
         id: page.id,
         url: page.url,
         name,
-        description: description.length > 200 ? description.slice(0, 197) + "..." : description,
+        description,
         status,
         priority,
         dueDate,
@@ -712,14 +759,11 @@ router.get("/tasks-today", async (req, res) => {
           const titleArr = props["Company name"]?.title || [];
           const cname = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
           if (cname) companyNameById.set(id, cname);
-        } catch (_) {
-          // Swallow — company name is optional context
-        }
+        } catch (_) { /* swallow */ }
       }));
     }
 
-    // Attach company name to each task
-    const tasks = rawTasks.map(t => ({
+    const allTasks = rawTasks.map(t => ({
       id: t.id,
       url: t.url,
       name: t.name,
@@ -729,23 +773,86 @@ router.get("/tasks-today", async (req, res) => {
       dueDate: t.dueDate,
       daysOverdue: t.daysOverdue,
       companyName: t.linkedCompanyId ? (companyNameById.get(t.linkedCompanyId) || null) : null,
+      shapeKey: deriveTaskShapeKey(t.name),
     }));
 
-    // Final sort: priority asc (High first), then dueDate asc (oldest overdue first)
-    tasks.sort((a, b) => {
-      const pa = TASK_PRIORITY_RANK[a.priority] ?? 99;
-      const pb = TASK_PRIORITY_RANK[b.priority] ?? 99;
+    // Group tasks where shapeKey + dueDate + priority all match.
+    // Build groups; tasks without a shapeKey go straight to "single" output.
+    let displayItems;
+    if (noGroup) {
+      displayItems = allTasks.map(t => ({ kind: "single", task: t }));
+    } else {
+      const groupBuckets = new Map();
+      const ungrouped    = [];
+      for (const t of allTasks) {
+        if (!t.shapeKey) {
+          ungrouped.push(t);
+          continue;
+        }
+        const key = `${t.shapeKey}|${t.dueDate}|${t.priority}`;
+        if (!groupBuckets.has(key)) groupBuckets.set(key, []);
+        groupBuckets.get(key).push(t);
+      }
+
+      displayItems = [];
+      for (const t of ungrouped) {
+        displayItems.push({ kind: "single", task: t });
+      }
+      for (const [_key, members] of groupBuckets) {
+        if (members.length >= 2) {
+          // Group-level fields — take from first member (all share by definition)
+          const first = members[0];
+          // Use the shape phrase as the title (capitalize first letter for readability)
+          const titleCased = first.shapeKey.charAt(0).toUpperCase() + first.shapeKey.slice(1);
+          displayItems.push({
+            kind: "group",
+            template: titleCased,
+            count: members.length,
+            companies: members.map(m => m.companyName || m.name).filter(Boolean),
+            priority: first.priority,
+            dueDate: first.dueDate,
+            daysOverdue: first.daysOverdue,
+            members: members.map(m => ({
+              id: m.id, url: m.url, name: m.name, companyName: m.companyName,
+            })),
+          });
+        } else {
+          // Group of 1 → render as single
+          displayItems.push({ kind: "single", task: members[0] });
+        }
+      }
+    }
+
+    // Sort: priority asc (High first), then dueDate asc (oldest overdue first).
+    // For groups, use group-level priority/dueDate.
+    const itemRank = item => {
+      const p = item.kind === "single" ? item.task.priority : item.priority;
+      const d = item.kind === "single" ? item.task.dueDate  : item.dueDate;
+      return [TASK_PRIORITY_RANK[p] ?? 99, d || "9999-12-31"];
+    };
+    displayItems.sort((a, b) => {
+      const [pa, da] = itemRank(a);
+      const [pb, db] = itemRank(b);
       if (pa !== pb) return pa - pb;
-      const da = a.dueDate || "9999-12-31";
-      const db = b.dueDate || "9999-12-31";
       return da.localeCompare(db);
     });
+
+    // For backwards compat: also expose a flat tasks array (ungrouped)
+    const tasksFlat = allTasks
+      .slice()
+      .sort((a, b) => {
+        const pa = TASK_PRIORITY_RANK[a.priority] ?? 99;
+        const pb = TASK_PRIORITY_RANK[b.priority] ?? 99;
+        if (pa !== pb) return pa - pb;
+        return (a.dueDate || "9999-12-31").localeCompare(b.dueDate || "9999-12-31");
+      });
 
     res.json({
       ok: true,
       asOf: todayYmd,
-      total: tasks.length,
-      tasks: tasks.slice(0, limit),
+      total: allTasks.length,
+      tasks: tasksFlat.slice(0, limit),       // flat (legacy field)
+      items: displayItems.slice(0, limit),    // grouped (preferred)
     });
   } catch (err) {
     res.status(err.response?.status || 500).json({

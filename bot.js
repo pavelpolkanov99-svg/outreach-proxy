@@ -4,7 +4,7 @@ const axios   = require("axios");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY     = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION   = "4.6.0-fcc-task-grouping";
+const VERSION   = "4.7.0-fcc-resilient-today";
 const STARTED_AT = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -41,6 +41,19 @@ function guard(ctx, fn) {
 function esc(text) {
   return String(text || "")
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Wrap a promise with a hard timeout. On timeout, resolves to null (not throws).
+// Used so a single slow upstream can never block the whole digest.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise(resolve => {
+    timer = setTimeout(() => {
+      console.error(`[bot] ${label} timed out after ${ms}ms`);
+      resolve({ __timeout: true });
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 // ── Helpers shared between /today, /stale, /replies, /tasks ──────────────────
@@ -109,7 +122,6 @@ const TASK_PRIORITY_EMOJI = {
   "Low":    "⚪",
 };
 
-// Compose the standard "due" suffix used in both single tasks and groups
 function dueLabel(daysOverdue) {
   if (daysOverdue == null)       return "";
   if (daysOverdue > 0)           return ` · <b>${daysOverdue}d overdue</b>`;
@@ -267,7 +279,6 @@ function renderReply(reply) {
   return lines.join("\n");
 }
 
-// Render a single task (kind: "single")
 function renderTask(task) {
   const lines = [];
 
@@ -290,11 +301,6 @@ function renderTask(task) {
   return lines.join("\n");
 }
 
-// Render a grouped task block (kind: "group")
-//
-// Format:
-//   ⚪ Drop discovery card follow  · <b>×11</b> · today
-//      🏢 LeoPay · LideFlow · Bitnob · Bitlipa · GCA Pay · +6
 function renderTaskGroup(group) {
   const lines = [];
 
@@ -307,7 +313,6 @@ function renderTaskGroup(group) {
 
   lines.push(`${emoji} <b>${esc(titleSafe)}</b>  · <b>×${group.count}</b>${due}`);
 
-  // Companies list — show first 5, then "+N" overflow indicator
   const companies = group.companies || [];
   if (companies.length > 0) {
     const SHOW = 5;
@@ -319,49 +324,61 @@ function renderTaskGroup(group) {
   return lines.join("\n");
 }
 
-// Render any task item (single or group)
 function renderTaskItem(item) {
   if (item.kind === "group") return renderTaskGroup(item);
   return renderTask(item.task);
 }
 
-// ── Fetch helpers ─────────────────────────────────────────────────────────────
+// ── Fetch helpers (raw — no global timeout, the digest wrapper handles it) ───
+
+async function fetchCalendar() {
+  const t0 = Date.now();
+  try {
+    const r = await axios.get(`${PROXY}/calendar/today`, { timeout: 25_000 });
+    console.log(`[bot] calendar fetched in ${Date.now() - t0}ms`);
+    return r.data;
+  } catch (err) {
+    console.error(`[bot] calendar fetch failed in ${Date.now() - t0}ms:`, err.message);
+    return { ok: false, error: err.message };
+  }
+}
 
 async function fetchStaleDeals({ days = 14, limit = 5 } = {}) {
+  const t0 = Date.now();
   try {
     const r = await axios.get(`${PROXY}/notion/stale-deals`, {
       params: { days, limit },
-      timeout: 15_000,
+      timeout: 12_000,
     });
+    console.log(`[bot] stale fetched in ${Date.now() - t0}ms (${r.data?.deals?.length || 0} deals)`);
     return r.data?.deals || [];
   } catch (err) {
-    console.error("[bot] fetchStaleDeals failed:", err.message);
+    console.error(`[bot] stale fetch failed in ${Date.now() - t0}ms:`, err.message);
     return null;
   }
 }
 
 async function fetchRepliesWaiting({ hoursIdle = 4, limit = 15, days = 7 } = {}) {
+  const t0 = Date.now();
   try {
     const r = await axios.get(`${PROXY}/beeper/replies-waiting`, {
       params: { hoursIdle, limit, days },
-      timeout: 30_000,
+      timeout: 25_000,
     });
+    console.log(`[bot] replies fetched in ${Date.now() - t0}ms (${r.data?.replies?.length || 0} replies)`);
     return r.data?.replies || [];
   } catch (err) {
-    console.error("[bot] fetchRepliesWaiting failed:", err.message);
+    console.error(`[bot] replies fetch failed in ${Date.now() - t0}ms:`, err.message);
     return null;
   }
 }
 
-// Returns { items, totalRaw, overdueRaw } where:
-//   items     = grouped display items (from new endpoint shape)
-//   totalRaw  = total individual tasks (pre-grouping)
-//   overdueRaw = count of overdue individual tasks
 async function fetchTasksToday({ limit = 10 } = {}) {
+  const t0 = Date.now();
   try {
     const r = await axios.get(`${PROXY}/notion/tasks-today`, {
       params: { limit },
-      timeout: 15_000,
+      timeout: 12_000,
     });
     const data = r.data || {};
     const items = Array.isArray(data.items) ? data.items
@@ -370,9 +387,10 @@ async function fetchTasksToday({ limit = 10 } = {}) {
     const tasksFlat = Array.isArray(data.tasks) ? data.tasks : [];
     const totalRaw   = data.total ?? tasksFlat.length;
     const overdueRaw = tasksFlat.filter(t => t.daysOverdue > 0).length;
+    console.log(`[bot] tasks fetched in ${Date.now() - t0}ms (${totalRaw} total)`);
     return { items, totalRaw, overdueRaw };
   } catch (err) {
-    console.error("[bot] fetchTasksToday failed:", err.message);
+    console.error(`[bot] tasks fetch failed in ${Date.now() - t0}ms:`, err.message);
     return null;
   }
 }
@@ -417,7 +435,10 @@ bot.command("ping", ctx => guard(ctx, () => {
 
 // Build the tasks block (used by both /today and /tasks)
 function buildTasksSection(tasksData) {
-  if (!tasksData || !tasksData.items?.length) return null;
+  if (!tasksData || tasksData.__timeout) {
+    return `📋 <b>Задачи</b>\n\n<i>⚠️ Notion ответил долго — пропустил блок. Дёрни /tasks отдельно.</i>`;
+  }
+  if (!tasksData.items?.length) return null;
   const { items, totalRaw, overdueRaw } = tasksData;
 
   const counter = overdueRaw > 0
@@ -431,30 +452,85 @@ function buildTasksSection(tasksData) {
   );
 }
 
+function buildRepliesSection(replies) {
+  if (replies && replies.__timeout) {
+    return `💬 <b>Ждут ответа</b>\n\n<i>⚠️ Beeper ответил долго — пропустил блок. Дёрни /replies отдельно.</i>`;
+  }
+  if (!Array.isArray(replies) || replies.length === 0) return null;
+
+  const primary = replies.filter(r => r.visualTier === "primary");
+  const secondary = replies.filter(r => r.visualTier === "secondary");
+
+  const replyParts = [];
+  if (primary.length > 0) {
+    replyParts.push(primary.map(renderReply).join("\n\n"));
+  }
+  if (secondary.length > 0) {
+    if (primary.length > 0) {
+      replyParts.push(`<i>—  остальные  —</i>\n\n` + secondary.map(renderReply).join("\n\n"));
+    } else {
+      replyParts.push(secondary.map(renderReply).join("\n\n"));
+    }
+  }
+
+  return (
+    `💬 <b>Ждут ответа</b>  · <i>${replies.length} чатов &gt;4h</i>\n` +
+    `\n` +
+    replyParts.join("\n\n")
+  );
+}
+
+function buildStaleSection(stale) {
+  if (stale && stale.__timeout) {
+    return `🟡 <b>Заглохли</b>\n\n<i>⚠️ Notion ответил долго — пропустил блок. Дёрни /stale отдельно.</i>`;
+  }
+  if (!Array.isArray(stale) || stale.length === 0) return null;
+
+  const dealBlocks = stale.map(renderStaleDeal);
+  return (
+    `🟡 <b>Заглохли</b>  · <i>${stale.length} сделок &gt;14d</i>\n` +
+    `\n` +
+    dealBlocks.join("\n\n")
+  );
+}
+
 // ── /today ────────────────────────────────────────────────────────────────────
+//
+// Resilient digest. Each upstream gets its own timeout via withTimeout(). If
+// any one source hangs, it returns a "__timeout" sentinel and the corresponding
+// section renders a degraded warning instead of blocking the whole reply.
+//
+// Per-source timeouts (deliberately tight):
+//   calendar  25s — has internal CRM enrichment, can be slow on cold cache
+//   tasks     12s — pure Notion query, should be fast
+//   stale     12s — pure Notion query, should be fast
+//   replies   25s — Beeper digest is the slowest, still hard-cap it
+//
 bot.command("today", ctx => guard(ctx, async () => {
+  const t0 = Date.now();
   const loadingMsg = await ctx.reply("⏳ Тяну календарь, задачи, CRM и мессенджеры...");
   try {
     const [calendarRes, tasksData, stale, replies] = await Promise.all([
-      axios.get(`${PROXY}/calendar/today`, { timeout: 30_000 })
-        .then(r => r.data)
-        .catch(err => ({ ok: false, error: err.message })),
-      fetchTasksToday({ limit: 20 }),
-      fetchStaleDeals({ days: 14, limit: 5 }),
-      fetchRepliesWaiting({ hoursIdle: 4, limit: 8, days: 7 }),
+      withTimeout(fetchCalendar(),                                          25_000, "calendar"),
+      withTimeout(fetchTasksToday({ limit: 20 }),                           12_000, "tasks"),
+      withTimeout(fetchStaleDeals({ days: 14, limit: 5 }),                  12_000, "stale"),
+      withTimeout(fetchRepliesWaiting({ hoursIdle: 4, limit: 8, days: 7 }), 25_000, "replies"),
     ]);
 
-    if (!calendarRes.ok) {
-      return ctx.api.editMessageText(
-        ctx.chat.id, loadingMsg.message_id,
-        `❌ Calendar error: ${esc(calendarRes.error || "unknown")}`
-      );
-    }
+    console.log(`[bot] /today aggregate fetch took ${Date.now() - t0}ms`);
 
     const sections = [];
 
-    // 1. Calendar block
-    if (!calendarRes.events?.length) {
+    // 1. Calendar block — required. If timeout/error, show degraded message.
+    if (calendarRes && calendarRes.__timeout) {
+      sections.push(
+        `📅 <b>Сегодня</b>\n\n<i>⚠️ Календарь ответил долго. Попробуй ещё раз через минуту.</i>`
+      );
+    } else if (!calendarRes || !calendarRes.ok) {
+      sections.push(
+        `📅 <b>Сегодня</b>\n\n<i>❌ Calendar error: ${esc(calendarRes?.error || "unknown")}</i>`
+      );
+    } else if (!calendarRes.events?.length) {
       sections.push(
         `📅 <b>Сегодня (${esc(calendarRes.date)})</b>\n\nКалендарь пустой 🌴`
       );
@@ -471,39 +547,13 @@ bot.command("today", ctx => guard(ctx, async () => {
     const tasksBlock = buildTasksSection(tasksData);
     if (tasksBlock) sections.push(tasksBlock);
 
-    // 3. Replies waiting block (split primary/secondary)
-    if (Array.isArray(replies) && replies.length > 0) {
-      const primary = replies.filter(r => r.visualTier === "primary");
-      const secondary = replies.filter(r => r.visualTier === "secondary");
-
-      const replyParts = [];
-      if (primary.length > 0) {
-        replyParts.push(primary.map(renderReply).join("\n\n"));
-      }
-      if (secondary.length > 0) {
-        if (primary.length > 0) {
-          replyParts.push(`<i>—  остальные  —</i>\n\n` + secondary.map(renderReply).join("\n\n"));
-        } else {
-          replyParts.push(secondary.map(renderReply).join("\n\n"));
-        }
-      }
-
-      sections.push(
-        `💬 <b>Ждут ответа</b>  · <i>${replies.length} чатов &gt;4h</i>\n` +
-        `\n` +
-        replyParts.join("\n\n")
-      );
-    }
+    // 3. Replies waiting block
+    const repliesBlock = buildRepliesSection(replies);
+    if (repliesBlock) sections.push(repliesBlock);
 
     // 4. Stale-deals block
-    if (Array.isArray(stale) && stale.length > 0) {
-      const dealBlocks = stale.map(renderStaleDeal);
-      sections.push(
-        `🟡 <b>Заглохли</b>  · <i>${stale.length} сделок &gt;14d</i>\n` +
-        `\n` +
-        dealBlocks.join("\n\n")
-      );
-    }
+    const staleBlock = buildStaleSection(stale);
+    if (staleBlock) sections.push(staleBlock);
 
     const text = sections.join("\n\n━━━━━━━━━━━━━━━\n\n");
 

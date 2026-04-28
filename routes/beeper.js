@@ -111,7 +111,6 @@ router.get("/recent", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared helper: fetch digest of recent chats with last-message metadata.
-// Used by /digest and /replies-waiting.
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchDigest({ days = 7, limit = 200 } = {}) {
   const since = new Date(Date.now() - parseInt(days) * 24 * 60 * 60 * 1000);
@@ -179,12 +178,46 @@ router.get("/digest", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// /beeper/replies-waiting — heuristic "ждут ответа Anton'а"
+// /beeper/replies-waiting helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Generic seed words that DON'T uniquely identify a company. If chat-name's
-// first word matches one of these, we don't even attempt a Notion lookup.
-// (Was producing false positives like "World Impact Forum" → "Tribu World".)
+const GROUP_PARTICIPANT_LIMIT = 20;
+
+// Fetch participant count for a group via MCP get_chat. Returns null on error
+// (treat as "unknown — keep the chat" rather than dropping).
+async function getParticipantCount(chatID) {
+  try {
+    const rpcBody = {
+      jsonrpc: "2.0", id: Date.now(),
+      method: "tools/call",
+      params: {
+        name: "get_chat",
+        arguments: { chatID, maxParticipantCount: GROUP_PARTICIPANT_LIMIT + 5 }
+      }
+    };
+    const r = await axios.post(
+      `${BEEPER_URL}/v0/mcp`,
+      rpcBody,
+      { headers: beeperMcpHeaders(), timeout: 8000, responseType: "text" }
+    );
+    const result = parseMcpSse(r.data);
+    if (!result) return null;
+    const content = result.content || result;
+    const textBlock = Array.isArray(content) ? content.find(c => c.type === "text") : null;
+    const rawText = textBlock?.text || (typeof content === "string" ? content : null);
+    if (!rawText) return null;
+    let parsed;
+    try { parsed = JSON.parse(rawText); } catch { return null; }
+    // Beeper returns participants as array; if there are more than maxParticipantCount,
+    // it returns the partial list. We requested limit+5, so if length === limit+5 (or +1),
+    // we treat that as ">limit". If length <= limit, we use it directly.
+    const participants = parsed.participants || parsed.members || [];
+    return participants.length;
+  } catch (err) {
+    return null;
+  }
+}
+
 const GENERIC_SEED_WORDS = new Set([
   "world", "global", "international", "africa", "latam", "asia", "europe",
   "the", "a", "an",
@@ -197,8 +230,6 @@ const GENERIC_SEED_WORDS = new Set([
   "beeper", "telegram",
 ]);
 
-// Match Beeper chat / sender against Notion Companies DB by name (fuzzy contains).
-// Stricter than before: requires ≥4 chars AND not a generic seed word.
 async function lookupCompanyByName(name) {
   if (!NOTION_TOKEN || !name) return null;
   try {
@@ -261,7 +292,6 @@ async function lookupPersonByName(name) {
   }
 }
 
-// Senders that count as "Anton/Pavel" — last msg from them = Anton already replied.
 const INTERNAL_SENDER_REGEX = /(anton ceo|antón|^антон$|^pavel|polkanov|@pavel-remide:beeper\.com|titov)/i;
 
 function isInternalSender(senderName) {
@@ -269,25 +299,16 @@ function isInternalSender(senderName) {
   return INTERNAL_SENDER_REGEX.test(senderName);
 }
 
-// Chats that count as "internal noise" — Plexo/RemiDe team rooms, advisor groups,
-// Beeper system rooms. Last messages here aren't "ждут ответа" — they're
-// updates/announcements. Drop entire chat.
 function isInternalChatName(chatName) {
   if (!chatName) return false;
   return /(remide\s*\|.*advisor|plexo\s*\|.*advisor|beeper developer|remide team|plexo team)/i.test(chatName);
 }
 
-// Chats that are clearly bots / mass-broadcast spam.
-// Heuristic: sender name EQUALS chat name (e.g. "Rocket Tech School" sends as
-// "Rocket Tech School" — that's a brand bot, not a person), OR sender contains
-// known spam markers.
 function isBroadcastSpam(chatName, senderName) {
   if (!senderName) return false;
-  // Brand bot: sender == chat name (1-on-1 from the brand itself)
   if (chatName && senderName.toLowerCase().trim() === chatName.toLowerCase().trim()) {
     return true;
   }
-  // Specific known spam patterns
   if (/^(rocket tech school|frontforumfocus)$/i.test(senderName)) return true;
   return false;
 }
@@ -304,10 +325,10 @@ router.get("/replies-waiting", async (req, res) => {
   const maxLastMs  = Date.now() - minIdleMs;
 
   try {
-    // 1) Get raw digest (REUSING fetchDigest — same code path as /digest endpoint)
+    // 1) Get raw digest
     const { since, chats } = await fetchDigest({ days, limit: 200 });
 
-    // 2) Apply heuristic filter, attaching reason for diagnostic
+    // 2) Cheap-filter pass — all rules that don't require extra API calls
     const decisions = chats.map(c => {
       const reasons = [];
       const sentByInternal = isInternalSender(c.lastMsgSender);
@@ -330,11 +351,35 @@ router.get("/replies-waiting", async (req, res) => {
       return { chat: c, included: reasons.length === 0, reasons };
     });
 
+    // 3) Late-stage filter — drop large groups (>20 participants).
+    //    Only fetches participant count for groups that survived all cheap filters,
+    //    so the cost is bounded (typically 2-5 groups → 2-5 parallel MCP calls).
+    const survivors = decisions.filter(d => d.included);
+    const groupSurvivors = survivors.filter(d => d.chat.type === "group");
+
+    const groupSizes = await Promise.all(groupSurvivors.map(async d => ({
+      chatId: d.chat.id,
+      count:  await getParticipantCount(d.chat.id),
+    })));
+    const sizeByChat = new Map(groupSizes.map(g => [g.chatId, g.count]));
+
+    // Apply size filter and record the reason on excluded survivors
+    for (const d of survivors) {
+      if (d.chat.type !== "group") continue;
+      const count = sizeByChat.get(d.chat.id);
+      if (count != null && count > GROUP_PARTICIPANT_LIMIT) {
+        d.included = false;
+        d.reasons.push("large-group-chat");
+        d.chat.participantCount = count;
+      } else if (count != null) {
+        d.chat.participantCount = count;
+      }
+    }
+
     const filtered = decisions
       .filter(d => d.included)
       .map(d => d.chat);
 
-    // 3) Sort: oldest pending first
     filtered.sort((a, b) => new Date(a.lastMsgTime) - new Date(b.lastMsgTime));
 
     const top = filtered.slice(0, limit);
@@ -371,6 +416,7 @@ router.get("/replies-waiting", async (req, res) => {
     if (debug) {
       response.debug = {
         totalChatsScanned: chats.length,
+        groupSizesChecked: groupSizes.length,
         decisionsByReason: decisions
           .filter(d => !d.included)
           .reduce((acc, d) => {
@@ -385,6 +431,7 @@ router.get("/replies-waiting", async (req, res) => {
             sender: d.chat.lastMsgSender,
             timeISO: d.chat.lastMsgTime,
             isSenderFlag: d.chat.isSender,
+            participantCount: d.chat.participantCount ?? null,
             text: (d.chat.lastMsgText || "").slice(0, 80),
             reasons: d.reasons,
           })),

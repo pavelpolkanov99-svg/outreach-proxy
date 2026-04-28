@@ -109,58 +109,67 @@ router.get("/recent", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared helper: fetch digest of recent chats with last-message metadata.
+// Used by /digest and /replies-waiting.
+// ─────────────────────────────────────────────────────────────────────────────
+async function fetchDigest({ days = 7, limit = 200 } = {}) {
+  const since = new Date(Date.now() - parseInt(days) * 24 * 60 * 60 * 1000);
+  const r = await axios.get(`${BEEPER_URL}/v1/chats?limit=${limit}`, { headers: beeperHeaders(), timeout: 15000 });
+  const items = r.data?.items || [];
+
+  const filtered = items.filter(c => {
+    const ts = c.lastMessageAt || c.lastActivityAt || c.updatedAt;
+    return ts ? new Date(ts) > since : true;
+  });
+
+  const chats = await Promise.all(filtered.map(async c => {
+    let lastMsgText = "", lastMsgSender = "", lastMsgTime = null, isSender = false;
+    let fetchError = null;
+    try {
+      const msgs = await beeperGetMessages(c.id, 3);
+      const m = msgs[0];
+      if (m) {
+        const sender = m.sender?.fullName || m.sender?.displayName || m.senderName || "?";
+        const text   = m.content?.text || m.content?.body || m.text || m.body || "";
+        lastMsgText   = text.slice(0, 300);
+        lastMsgSender = sender;
+        lastMsgTime   = m.timestamp || null;
+        isSender      = !!(m.isSender);
+      }
+    } catch (err) {
+      fetchError = err.message;
+    }
+
+    return {
+      id:           c.id,
+      name:         c.title || c.name || "",
+      type:         c.type,
+      network:      netLabel(c.accountID),
+      networkFull:  networkFromAccountID(c.accountID),
+      accountID:    c.accountID,
+      lastMsgText,
+      lastMsgSender,
+      lastMsgTime,
+      isSender,
+      lastActivity: c.lastMessageAt || c.lastActivityAt || null,
+      fetchError,
+    };
+  }));
+
+  return { since: since.toISOString(), chats };
+}
+
 // ── GET /beeper/digest ────────────────────────────────────────────────────────
-// Returns all chats active in the last N days with network label + last message.
-// Used by /comms skill. Uses /v1/chats REST endpoint which has accountID per chat
-// — accountID is the ONLY reliable way to determine network (LI/TG/WA).
-// Query params: days=7 (default), limit=200
 router.get("/digest", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
   const { days = 7, limit = 200 } = req.query;
-  const since = new Date(Date.now() - parseInt(days) * 24 * 60 * 60 * 1000);
   try {
-    const r = await axios.get(`${BEEPER_URL}/v1/chats?limit=${limit}`, { headers: beeperHeaders(), timeout: 15000 });
-    const items = r.data?.items || [];
-
-    const filtered = items.filter(c => {
-      const ts = c.lastMessageAt || c.lastActivityAt || c.updatedAt;
-      return ts ? new Date(ts) > since : true;
-    });
-
-    const chats = await Promise.all(filtered.map(async c => {
-      let lastMsgText = "", lastMsgSender = "", lastMsgTime = null, isSender = false;
-      try {
-        const msgs = await beeperGetMessages(c.id, 3);
-        const m = msgs[0];
-        if (m) {
-          const sender = m.sender?.fullName || m.sender?.displayName || m.senderName || "?";
-          const text   = m.content?.text || m.content?.body || m.text || m.body || "";
-          lastMsgText   = text.slice(0, 300);
-          lastMsgSender = sender;
-          lastMsgTime   = m.timestamp || null;
-          isSender      = !!(m.isSender);
-        }
-      } catch (_) {}
-
-      return {
-        id:           c.id,
-        name:         c.title || c.name || "",
-        type:         c.type,                            // "single" | "group"
-        network:      netLabel(c.accountID),             // "LI" | "TG" | "WA"
-        networkFull:  networkFromAccountID(c.accountID), // "LinkedIn" | "Telegram" | "WhatsApp"
-        accountID:    c.accountID,
-        lastMsgText,
-        lastMsgSender,
-        lastMsgTime,
-        isSender,      // true = Anton sent last, false = incoming
-        lastActivity:  c.lastMessageAt || c.lastActivityAt || null,
-      };
-    }));
-
+    const { since, chats } = await fetchDigest({ days, limit });
     res.json({
       ok: true,
       days: parseInt(days),
-      since: since.toISOString(),
+      since,
       total: chats.length,
       chats,
     });
@@ -172,24 +181,11 @@ router.get("/digest", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // /beeper/replies-waiting — heuristic "ждут ответа Anton'а"
 // ─────────────────────────────────────────────────────────────────────────────
-//
-// Reuses /beeper/digest internally then filters:
-//   - isSender === false (last msg from someone else)
-//   - hours idle >= hoursIdle threshold
-//
-// Each chat is enriched with optional Notion CRM matches (Company by chat name,
-// Person by lastMsgSender). Matches are NOT required — chats without CRM hits
-// still appear, but get visualTier="secondary" so the bot can render them
-// in a separate visual group.
-// ─────────────────────────────────────────────────────────────────────────────
 
 // Match Beeper chat / sender against Notion Companies DB by name (fuzzy contains)
 async function lookupCompanyByName(name) {
   if (!NOTION_TOKEN || !name) return null;
   try {
-    // Take the most distinctive word from the chat name as the search key.
-    // E.g. "Hector Ramirez Mateos | Bitso Business" → search for "Bitso".
-    // Heuristic: prefer the LAST segment after | or - or split, drop prefix words like "Plexo <>"
     const cleanedName = String(name)
       .replace(/^Plexo\s*[<>x×|]+\s*/i, "")
       .replace(/^.*\|\s*/, "")
@@ -220,10 +216,8 @@ async function lookupCompanyByName(name) {
   }
 }
 
-// Match Beeper sender against Notion People DB by name
 async function lookupPersonByName(name) {
   if (!NOTION_TOKEN || !name) return null;
-  // Skip generic / known-internal senders
   if (/anton|pavel|paul|polkanov|titov|@pavel-remide:beeper\.com/i.test(name)) return null;
   try {
     const r = await axios.post(
@@ -251,9 +245,8 @@ async function lookupPersonByName(name) {
 }
 
 // Senders that count as "Anton/Pavel" — last msg from them = Anton already replied.
-// We need to be LIBERAL here because Beeper labels Anton variously across networks:
-//   "Anton CEO RemiDe", "Антон", "@pavel-remide:beeper.com" (sent via Pavel's Beeper account)
-const INTERNAL_SENDER_REGEX = /(anton|antón|антон|^pavel|polkanov|@pavel-remide:beeper\.com|titov|remide)/i;
+// Beeper labels Anton variously: "Anton CEO RemiDe", "Антон", "@pavel-remide:beeper.com"
+const INTERNAL_SENDER_REGEX = /(anton ceo|antón|^антон$|^pavel|polkanov|@pavel-remide:beeper\.com|titov)/i;
 
 function isInternalSender(senderName) {
   if (!senderName) return false;
@@ -266,85 +259,53 @@ router.get("/replies-waiting", async (req, res) => {
   const hoursIdle = Math.max(0.5, Math.min(168, parseFloat(req.query.hoursIdle) || 4));
   const limit     = Math.max(1,   Math.min(50,  parseInt(req.query.limit, 10) || 15));
   const days      = Math.max(1,   Math.min(30,  parseInt(req.query.days,  10) || 7));
+  const debug     = req.query.debug === "1" || req.query.debug === "true";
 
-  const since      = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
   const minIdleMs  = hoursIdle * 60 * 60 * 1000;
   const maxLastMs  = Date.now() - minIdleMs;
 
   try {
-    // 1) Get raw digest (re-using /digest's logic via direct call)
-    const r = await axios.get(`${BEEPER_URL}/v1/chats?limit=200`, { headers: beeperHeaders(), timeout: 15000 });
-    const items = r.data?.items || [];
+    // 1) Get raw digest (REUSING fetchDigest — same code path as /digest endpoint)
+    const { since, chats } = await fetchDigest({ days, limit: 200 });
 
-    const recent = items.filter(c => {
-      const ts = c.lastMessageAt || c.lastActivityAt || c.updatedAt;
-      return ts ? new Date(ts) > since : false;
+    // 2) Apply heuristic filter, attaching reason for diagnostic
+    const decisions = chats.map(c => {
+      const reasons = [];
+      const sentByInternal = isInternalSender(c.lastMsgSender);
+
+      if (c.fetchError)                            reasons.push("msg-fetch-failed");
+      if (c.isSender)                              reasons.push("isSender-flag-true");
+      if (sentByInternal)                          reasons.push("internal-sender-name");
+      if (!c.lastMsgText || !c.lastMsgText.trim()) reasons.push("empty-text");
+      if (!c.lastMsgTime)                          reasons.push("no-timestamp");
+      if (c.lastMsgTime) {
+        const tsMs = new Date(c.lastMsgTime).getTime();
+        if (isNaN(tsMs))               reasons.push("bad-timestamp");
+        else if (tsMs > maxLastMs)     reasons.push("too-recent");
+      }
+
+      return { chat: c, included: reasons.length === 0, reasons };
     });
 
-    // 2) Fetch last message per chat (in parallel) and check heuristic
-    const enriched = await Promise.all(recent.map(async c => {
-      let lastMsgText = "", lastMsgSender = "", lastMsgTime = null, isSender = false;
-      try {
-        const msgs = await beeperGetMessages(c.id, 3);
-        const m = msgs[0];
-        if (m) {
-          const sender = m.sender?.fullName || m.sender?.displayName || m.senderName || "?";
-          const text   = m.content?.text || m.content?.body || m.text || m.body || "";
-          lastMsgText   = text.slice(0, 300);
-          lastMsgSender = sender;
-          lastMsgTime   = m.timestamp || null;
-          isSender      = !!(m.isSender) || isInternalSender(sender);
-        }
-      } catch (_) {}
+    const filtered = decisions
+      .filter(d => d.included)
+      .map(d => d.chat);
 
-      return {
-        id:           c.id,
-        name:         c.title || c.name || "",
-        type:         c.type,
-        network:      netLabel(c.accountID),
-        networkFull:  networkFromAccountID(c.accountID),
-        accountID:    c.accountID,
-        lastMsgText,
-        lastMsgSender,
-        lastMsgTime,
-        isSender,
-      };
-    }));
-
-    // 3) Filter to "ждут ответа":
-    //    - last msg NOT from Anton/Pavel (isSender===false AND sender doesn't match internal regex)
-    //    - last msg older than hoursIdle threshold
-    //    - has actual text (skip media-only / empty)
-    const filtered = enriched.filter(c => {
-      if (c.isSender) return false;
-      if (!c.lastMsgText || !c.lastMsgText.trim()) return false;
-      if (!c.lastMsgTime) return false;
-      const tsMs = new Date(c.lastMsgTime).getTime();
-      if (isNaN(tsMs)) return false;
-      if (tsMs > maxLastMs) return false;
-      return true;
-    });
-
-    // 4) Sort: oldest pending first (most urgent at top — tells you what's been sitting longest)
+    // 3) Sort: oldest pending first
     filtered.sort((a, b) => new Date(a.lastMsgTime) - new Date(b.lastMsgTime));
 
-    // 5) Apply limit
     const top = filtered.slice(0, limit);
 
-    // 6) Enrich with Notion CRM matches in parallel
+    // 4) Enrich with Notion CRM matches
     const withCrm = await Promise.all(top.map(async c => {
       const [company, person] = await Promise.all([
         lookupCompanyByName(c.name),
         lookupPersonByName(c.lastMsgSender),
       ]);
 
-      // Hours idle (rounded to 1 decimal)
       const idleMs = Date.now() - new Date(c.lastMsgTime).getTime();
       const hoursIdleVal = Math.round(idleMs / (60 * 60 * 1000) * 10) / 10;
 
-      // Visual tier:
-      //   primary   — has CRM company match OR 1-on-1 chat
-      //   secondary — group chat without CRM match
       const visualTier = (company || c.type === "single") ? "primary" : "secondary";
 
       return {
@@ -356,13 +317,38 @@ router.get("/replies-waiting", async (req, res) => {
       };
     }));
 
-    res.json({
+    const response = {
       ok: true,
       hoursIdle,
-      since: since.toISOString(),
+      since,
       total: withCrm.length,
       replies: withCrm,
-    });
+    };
+
+    if (debug) {
+      response.debug = {
+        totalChatsScanned: chats.length,
+        decisionsByReason: decisions
+          .filter(d => !d.included)
+          .reduce((acc, d) => {
+            for (const r of d.reasons) acc[r] = (acc[r] || 0) + 1;
+            return acc;
+          }, {}),
+        excludedSamples: decisions
+          .filter(d => !d.included)
+          .slice(0, 20)
+          .map(d => ({
+            name: d.chat.name,
+            sender: d.chat.lastMsgSender,
+            timeISO: d.chat.lastMsgTime,
+            isSenderFlag: d.chat.isSender,
+            text: (d.chat.lastMsgText || "").slice(0, 80),
+            reasons: d.reasons,
+          })),
+      };
+    }
+
+    res.json(response);
   } catch (err) {
     console.error("[beeper/replies-waiting] error:", err.message);
     res.status(err.response?.status || 500).json({ error: err.message });

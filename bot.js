@@ -3,10 +3,15 @@ const axios   = require("axios");
 const cron    = require("node-cron");
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const PROXY     = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION   = "4.9.0-fcc-progressive-today";
-const STARTED_AT = new Date();
+const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
+const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
+const NOTION_TOKEN = process.env.NOTION_TOKEN;  // For direct Notion API calls (bypass proxy)
+const VERSION      = "4.10.0-fcc-direct-notion";
+const STARTED_AT   = new Date();
+
+// Notion DB IDs
+const NOTION_COMPANIES_DB = "f9b59c5b05fa4df18f9569479633fd74";
+const NOTION_TASKS_DB     = "2fa2ac1063c8800b8a92d56de58a6358";
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
 
@@ -41,7 +46,7 @@ function guard(ctx, fn) {
   return fn();
 }
 
-// ── HTML escape (Telegram parse_mode: HTML) ──────────────────────────────────
+// ── HTML escape ──────────────────────────────────────────────────────────────
 function esc(text) {
   return String(text || "")
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -56,6 +61,34 @@ function withTimeout(promise, ms, label) {
     }, ms);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// ── Notion API direct helpers ────────────────────────────────────────────────
+
+const NOTION_API = "https://api.notion.com/v1";
+
+function notionHeaders() {
+  return {
+    "Authorization":  `Bearer ${NOTION_TOKEN}`,
+    "Notion-Version": "2022-06-28",
+    "Content-Type":   "application/json",
+  };
+}
+
+async function notionQuery(dbId, body, timeoutMs = 10_000) {
+  const r = await axios.post(`${NOTION_API}/databases/${dbId}/query`, body, {
+    headers: notionHeaders(),
+    timeout: timeoutMs,
+  });
+  return r.data;
+}
+
+async function notionGetPage(pageId, timeoutMs = 6_000) {
+  const r = await axios.get(`${NOTION_API}/pages/${pageId}`, {
+    headers: notionHeaders(),
+    timeout: timeoutMs,
+  });
+  return r.data;
 }
 
 // ── Helpers shared between /today, /stale, /replies, /tasks ──────────────────
@@ -331,7 +364,266 @@ function renderTaskItem(item) {
   return renderTask(item.task);
 }
 
-// ── Fetch helpers ────────────────────────────────────────────────────────────
+// ── Notion-DIRECT fetch helpers ──────────────────────────────────────────────
+//
+// These bypass our outreach-proxy and go straight to api.notion.com. Avoids
+// the Railway-internal hop where /notion/stale-deals was hanging.
+
+const STALE_ACTIVE_STAGES = [
+  "Communication Started",
+  "Call Scheduled",
+  "initial discussions",
+  "Keeping in the Loop",
+  "Warm discussions",
+  "Negotiations",
+];
+
+async function fetchStaleDealsDirect({ days = 14, limit = 5 } = {}) {
+  if (!NOTION_TOKEN) {
+    console.error("[bot] NOTION_TOKEN not set — fetchStaleDealsDirect unavailable");
+    return null;
+  }
+  const t0 = Date.now();
+  try {
+    const cutoffISO = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const filter = {
+      and: [
+        {
+          or: STALE_ACTIVE_STAGES.map(stage => ({
+            property: "Stage",
+            status:   { equals: stage },
+          })),
+        },
+        {
+          timestamp: "last_edited_time",
+          last_edited_time: { before: cutoffISO },
+        },
+        {
+          or: [
+            { property: "Priority", select: { equals: "High" } },
+            { property: "Priority", select: { equals: "Mid"  } },
+          ],
+        },
+      ],
+    };
+    const data = await notionQuery(NOTION_COMPANIES_DB, {
+      filter,
+      sorts: [{ timestamp: "last_edited_time", direction: "ascending" }],
+      page_size: limit,
+    }, 8_000);
+
+    const deals = (data.results || []).map(page => {
+      const props = page.properties || {};
+      const titleArr = props["Company name"]?.title || [];
+      const name = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
+      const description = (props["Company description"]?.rich_text || [])
+        .map(rt => rt.plain_text || rt.text?.content || "").join("");
+      const tags = (props["Tags"]?.multi_select || []).map(t => t.name);
+      const editedTs = Date.parse(page.last_edited_time);
+      const daysStale = isNaN(editedTs)
+        ? null
+        : Math.floor((Date.now() - editedTs) / (24 * 60 * 60 * 1000));
+
+      return {
+        pageId: page.id,
+        url: page.url,
+        name,
+        description,
+        bdScore:  props["BD Score"]?.number ?? null,
+        stage:    props["Stage"]?.status?.name || null,
+        priority: props["Priority"]?.select?.name || null,
+        tags,
+        lastContact: props["Last Contact"]?.date?.start || null,
+        pipeline:    props["Pipeline"]?.select?.name || null,
+        daysStale,
+      };
+    });
+
+    console.log(`[bot] stale-direct fetched in ${Date.now() - t0}ms (${deals.length} deals)`);
+    return deals;
+  } catch (err) {
+    console.error(`[bot] stale-direct failed in ${Date.now() - t0}ms:`, err.message);
+    return null;
+  }
+}
+
+const TASK_PRIORITY_RANK = { "High": 0, "Medium": 1, "Low": 2 };
+
+function toYmd(d) {
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function stripMarkdownLinks(s) {
+  if (!s) return s;
+  return String(s)
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\s*\n\s*/g, " ")
+    .trim();
+}
+
+function deriveTaskShapeKey(taskName) {
+  if (!taskName) return null;
+  let s = String(taskName).toLowerCase();
+  const delimiterRegex = /\s+[—–-]\s+|\s+\|\s+|:\s+|\s+\(/;
+  const m = s.split(delimiterRegex);
+  s = (m[0] || "").trim();
+  const words = s.split(/\s+/).filter(Boolean);
+  if (words.length < 3) return null;
+  return s;
+}
+
+async function fetchTasksTodayDirect({ limit = 20 } = {}) {
+  if (!NOTION_TOKEN) {
+    console.error("[bot] NOTION_TOKEN not set — fetchTasksTodayDirect unavailable");
+    return null;
+  }
+  const t0 = Date.now();
+  try {
+    const todayYmd = toYmd(new Date());
+    const filter = {
+      and: [
+        { property: "Status",   status: { does_not_equal: "Done" } },
+        { property: "Due date", date:   { on_or_before: todayYmd } },
+      ],
+    };
+
+    const data = await notionQuery(NOTION_TASKS_DB, {
+      filter,
+      sorts: [{ property: "Due date", direction: "ascending" }],
+      page_size: 100,
+    }, 8_000);
+
+    const rawTasks = (data.results || []).map(page => {
+      const props = page.properties || {};
+      const titleArr = props["Task name"]?.title || [];
+      const name = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
+      const descArr = props["Description"]?.rich_text || [];
+      const descriptionRaw = descArr.map(rt => rt.plain_text || rt.text?.content || "").join("").trim();
+      const descriptionClean = stripMarkdownLinks(descriptionRaw);
+      const description = descriptionClean.length > 200
+        ? descriptionClean.slice(0, 197) + "..."
+        : descriptionClean;
+
+      const status   = props["Status"]?.status?.name || null;
+      const priority = props["Priority"]?.select?.name || null;
+      const dueDate  = props["Due date"]?.date?.start || null;
+      const companyRel = props["🏢  CRM Companies"]?.relation || [];
+      const linkedCompanyId = companyRel[0]?.id || null;
+
+      let daysOverdue = null;
+      if (dueDate) {
+        const dueMs = Date.parse(dueDate + "T00:00:00Z");
+        const todayMs = Date.parse(todayYmd + "T00:00:00Z");
+        if (!isNaN(dueMs)) {
+          daysOverdue = Math.round((todayMs - dueMs) / (24 * 60 * 60 * 1000));
+        }
+      }
+
+      return {
+        id: page.id,
+        url: page.url,
+        name,
+        description,
+        status,
+        priority,
+        dueDate,
+        daysOverdue,
+        linkedCompanyId,
+      };
+    });
+
+    // Resolve linked company names in parallel batch
+    const uniqueCompanyIds = [...new Set(rawTasks.map(t => t.linkedCompanyId).filter(Boolean))];
+    const companyNameById = new Map();
+    if (uniqueCompanyIds.length > 0) {
+      await Promise.all(uniqueCompanyIds.map(async (id) => {
+        try {
+          const cr = await notionGetPage(id, 5_000);
+          const props = cr.properties || {};
+          const titleArr = props["Company name"]?.title || [];
+          const cname = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
+          if (cname) companyNameById.set(id, cname);
+        } catch (_) { /* swallow */ }
+      }));
+    }
+
+    const allTasks = rawTasks.map(t => ({
+      id: t.id,
+      url: t.url,
+      name: t.name,
+      description: t.description,
+      status: t.status,
+      priority: t.priority,
+      dueDate: t.dueDate,
+      daysOverdue: t.daysOverdue,
+      companyName: t.linkedCompanyId ? (companyNameById.get(t.linkedCompanyId) || null) : null,
+      shapeKey: deriveTaskShapeKey(t.name),
+    }));
+
+    // Group repeated templates
+    const groupBuckets = new Map();
+    const ungrouped    = [];
+    for (const t of allTasks) {
+      if (!t.shapeKey) {
+        ungrouped.push(t);
+        continue;
+      }
+      const key = `${t.shapeKey}|${t.dueDate}|${t.priority}`;
+      if (!groupBuckets.has(key)) groupBuckets.set(key, []);
+      groupBuckets.get(key).push(t);
+    }
+
+    const items = [];
+    for (const t of ungrouped) {
+      items.push({ kind: "single", task: t });
+    }
+    for (const [_key, members] of groupBuckets) {
+      if (members.length >= 2) {
+        const first = members[0];
+        const titleCased = first.shapeKey.charAt(0).toUpperCase() + first.shapeKey.slice(1);
+        items.push({
+          kind: "group",
+          template: titleCased,
+          count: members.length,
+          companies: members.map(m => m.companyName || m.name).filter(Boolean),
+          priority: first.priority,
+          dueDate: first.dueDate,
+          daysOverdue: first.daysOverdue,
+        });
+      } else {
+        items.push({ kind: "single", task: members[0] });
+      }
+    }
+
+    items.sort((a, b) => {
+      const pa = TASK_PRIORITY_RANK[a.kind === "single" ? a.task.priority : a.priority] ?? 99;
+      const pb = TASK_PRIORITY_RANK[b.kind === "single" ? b.task.priority : b.priority] ?? 99;
+      if (pa !== pb) return pa - pb;
+      const da = (a.kind === "single" ? a.task.dueDate : a.dueDate) || "9999-12-31";
+      const db = (b.kind === "single" ? b.task.dueDate : b.dueDate) || "9999-12-31";
+      return da.localeCompare(db);
+    });
+
+    const totalRaw   = allTasks.length;
+    const overdueRaw = allTasks.filter(t => t.daysOverdue > 0).length;
+
+    console.log(`[bot] tasks-direct fetched in ${Date.now() - t0}ms (${totalRaw} total)`);
+    return {
+      items: items.slice(0, limit),
+      totalRaw,
+      overdueRaw,
+    };
+  } catch (err) {
+    console.error(`[bot] tasks-direct failed in ${Date.now() - t0}ms:`, err.message);
+    return null;
+  }
+}
+
+// ── Proxy-based fetchers (calendar, replies — they need proxy-side enrichment)
 
 async function fetchCalendar() {
   const t0 = Date.now();
@@ -342,21 +634,6 @@ async function fetchCalendar() {
   } catch (err) {
     console.error(`[bot] calendar fetch failed in ${Date.now() - t0}ms:`, err.message);
     return { ok: false, error: err.message };
-  }
-}
-
-async function fetchStaleDeals({ days = 14, limit = 5 } = {}) {
-  const t0 = Date.now();
-  try {
-    const r = await axios.get(`${PROXY}/notion/stale-deals`, {
-      params: { days, limit },
-      timeout: 12_000,
-    });
-    console.log(`[bot] stale fetched in ${Date.now() - t0}ms (${r.data?.deals?.length || 0} deals)`);
-    return r.data?.deals || [];
-  } catch (err) {
-    console.error(`[bot] stale fetch failed in ${Date.now() - t0}ms:`, err.message);
-    return null;
   }
 }
 
@@ -371,28 +648,6 @@ async function fetchRepliesWaiting({ hoursIdle = 4, limit = 15, days = 7 } = {})
     return r.data?.replies || [];
   } catch (err) {
     console.error(`[bot] replies fetch failed in ${Date.now() - t0}ms:`, err.message);
-    return null;
-  }
-}
-
-async function fetchTasksToday({ limit = 10 } = {}) {
-  const t0 = Date.now();
-  try {
-    const r = await axios.get(`${PROXY}/notion/tasks-today`, {
-      params: { limit },
-      timeout: 12_000,
-    });
-    const data = r.data || {};
-    const items = Array.isArray(data.items) ? data.items
-                : Array.isArray(data.tasks) ? data.tasks.map(t => ({ kind: "single", task: t }))
-                : [];
-    const tasksFlat = Array.isArray(data.tasks) ? data.tasks : [];
-    const totalRaw   = data.total ?? tasksFlat.length;
-    const overdueRaw = tasksFlat.filter(t => t.daysOverdue > 0).length;
-    console.log(`[bot] tasks fetched in ${Date.now() - t0}ms (${totalRaw} total)`);
-    return { items, totalRaw, overdueRaw };
-  } catch (err) {
-    console.error(`[bot] tasks fetch failed in ${Date.now() - t0}ms:`, err.message);
     return null;
   }
 }
@@ -477,32 +732,25 @@ function buildStaleSection(stale) {
   );
 }
 
-// Compose digest from already-fetched data (used by morning push cron).
 function composeTodayDigest({ calendarRes, tasksData, stale, replies }, { header } = {}) {
   const sections = [];
   if (header) sections.push(header);
-
   sections.push(buildCalendarSection(calendarRes));
-
   const tasksBlock = buildTasksSection(tasksData);
   if (tasksBlock) sections.push(tasksBlock);
-
   const repliesBlock = buildRepliesSection(replies);
   if (repliesBlock) sections.push(repliesBlock);
-
   const staleBlock = buildStaleSection(stale);
   if (staleBlock) sections.push(staleBlock);
-
   return sections.join("\n\n━━━━━━━━━━━━━━━\n\n");
 }
 
-// Used by morning cron only — parallel fetch (since cron has no UX concerns)
 async function fetchTodayDigestData() {
   const t0 = Date.now();
   const [calendarRes, tasksData, stale, replies] = await Promise.all([
     withTimeout(fetchCalendar(),                                          25_000, "calendar"),
-    withTimeout(fetchTasksToday({ limit: 20 }),                           12_000, "tasks"),
-    withTimeout(fetchStaleDeals({ days: 14, limit: 5 }),                  12_000, "stale"),
+    withTimeout(fetchTasksTodayDirect({ limit: 20 }),                     10_000, "tasks"),
+    withTimeout(fetchStaleDealsDirect({ days: 14, limit: 5 }),            10_000, "stale"),
     withTimeout(fetchRepliesWaiting({ hoursIdle: 4, limit: 8, days: 7 }), 25_000, "replies"),
   ]);
   console.log(`[bot] aggregate digest fetch took ${Date.now() - t0}ms`);
@@ -523,11 +771,7 @@ bot.command("start", ctx => guard(ctx, () => {
     `/replies — кто ждёт ответа Anton'а (>4h)\n\n` +
     `Авто:\n` +
     `• Утренний дайджест каждый день в 08:30 CET\n` +
-    `• CRM auto-prewarm в 23:00 и 08:00 CET\n\n` +
-    `Скоро:\n` +
-    `• Pre-call briefing (за час до звонка)\n` +
-    `• Post-call follow-up (через 15 мин после)\n` +
-    `• Loop's nudge`
+    `• CRM auto-prewarm в 23:00 и 08:00 CET`
   );
 }));
 
@@ -546,33 +790,18 @@ bot.command("ping", ctx => guard(ctx, () => {
     `Версия: ${VERSION}\n` +
     `Server time: ${now.toISOString()}\n` +
     `Uptime: ${uptimeStr}\n` +
+    `Notion direct: ${NOTION_TOKEN ? "✅" : "❌ NOTION_TOKEN not set"}\n` +
     `Your TG ID: ${ctx.from?.id}`
   );
 }));
 
 // ── /today — PROGRESSIVE RENDERING ───────────────────────────────────────────
-//
-// Sequential fetches with edits between each phase. The user sees the message
-// update as each block resolves, so they always know what's happening — and if
-// something hangs, the last visible status line tells us exactly which block
-// is the culprit.
-//
-// Phases:
-//   1. fetch calendar     → render calendar block + spinner "тяну задачи..."
-//   2. fetch tasks        → render +tasks + spinner "тяну заглохшие сделки..."
-//   3. fetch stale        → render +stale + spinner "тяну Beeper..."
-//   4. fetch replies      → final render
-//
-// Each phase has a hard timeout via withTimeout(). If a fetch resolves to
-// __timeout, the section shows ⚠️ but the rest of the digest still works.
 bot.command("today", ctx => guard(ctx, async () => {
   const t0 = Date.now();
   const loadingMsg = await ctx.reply("⏳ Тяну календарь...");
   const chatId = ctx.chat.id;
   const msgId = loadingMsg.message_id;
 
-  // Helper to safely edit the message — never throws (Telegram errors get
-  // logged; we don't want them to break the digest).
   async function safeEdit(text, opts = {}) {
     try {
       await ctx.api.editMessageText(chatId, msgId, text, {
@@ -593,19 +822,19 @@ bot.command("today", ctx => guard(ctx, async () => {
   sections.push(buildCalendarSection(calendarRes));
   await safeEdit(sections.join(SEPARATOR) + SEPARATOR + "⏳ <i>Тяну задачи...</i>");
 
-  // Phase 2: tasks
-  const tasksData = await withTimeout(fetchTasksToday({ limit: 20 }), 12_000, "tasks");
+  // Phase 2: tasks (direct Notion)
+  const tasksData = await withTimeout(fetchTasksTodayDirect({ limit: 20 }), 10_000, "tasks");
   const tasksBlock = buildTasksSection(tasksData);
   if (tasksBlock) sections.push(tasksBlock);
   await safeEdit(sections.join(SEPARATOR) + SEPARATOR + "⏳ <i>Тяну заглохшие сделки...</i>");
 
-  // Phase 3: stale
-  const stale = await withTimeout(fetchStaleDeals({ days: 14, limit: 5 }), 12_000, "stale");
+  // Phase 3: stale (direct Notion)
+  const stale = await withTimeout(fetchStaleDealsDirect({ days: 14, limit: 5 }), 10_000, "stale");
   const staleBlock = buildStaleSection(stale);
   if (staleBlock) sections.push(staleBlock);
   await safeEdit(sections.join(SEPARATOR) + SEPARATOR + "⏳ <i>Тяну Beeper...</i>");
 
-  // Phase 4: replies (last because Beeper is usually slowest)
+  // Phase 4: replies (still through proxy — needs Beeper integration)
   const replies = await withTimeout(
     fetchRepliesWaiting({ hoursIdle: 4, limit: 8, days: 7 }),
     25_000,
@@ -613,7 +842,6 @@ bot.command("today", ctx => guard(ctx, async () => {
   );
   const repliesBlock = buildRepliesSection(replies);
   if (repliesBlock) {
-    // Insert replies block before stale (consistent with morning push order)
     if (staleBlock) {
       sections.splice(sections.length - 1, 0, repliesBlock);
     } else {
@@ -629,7 +857,7 @@ bot.command("today", ctx => guard(ctx, async () => {
 bot.command("tasks", ctx => guard(ctx, async () => {
   const loadingMsg = await ctx.reply("⏳ Сканирую Tasks Tracker...");
   try {
-    const tasksData = await fetchTasksToday({ limit: 30 });
+    const tasksData = await fetchTasksTodayDirect({ limit: 30 });
 
     if (tasksData === null) {
       return ctx.api.editMessageText(
@@ -666,7 +894,7 @@ bot.command("tasks", ctx => guard(ctx, async () => {
 bot.command("stale", ctx => guard(ctx, async () => {
   const loadingMsg = await ctx.reply("⏳ Сканирую CRM...");
   try {
-    const stale = await fetchStaleDeals({ days: 14, limit: 10 });
+    const stale = await fetchStaleDealsDirect({ days: 14, limit: 10 });
 
     if (stale === null) {
       return ctx.api.editMessageText(
@@ -810,6 +1038,7 @@ console.log("[cron] morning push registered (08:30 Europe/Prague, every day)");
 // ── Start ─────────────────────────────────────────────────────────────────────
 console.log(`[bot] Loop OS FCC ${VERSION} starting...`);
 console.log(`[bot] Proxy URL: ${PROXY}`);
+console.log(`[bot] Notion direct: ${NOTION_TOKEN ? "configured" : "MISSING — set NOTION_TOKEN env"}`);
 console.log(`[bot] Morning push recipients: ${MORNING_PUSH_USERS.join(",") || "(none)"}`);
 bot.start().then(() => {
   console.log(`[bot] Loop OS FCC ${VERSION} started at ${STARTED_AT.toISOString()}`);

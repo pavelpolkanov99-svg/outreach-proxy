@@ -4,7 +4,7 @@ const axios   = require("axios");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY     = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION   = "4.3.0-fcc-stale-deals";
+const VERSION   = "4.4.0-fcc-replies";
 const STARTED_AT = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -43,9 +43,8 @@ function esc(text) {
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// ── Helpers shared between /today and /stale ─────────────────────────────────
+// ── Helpers shared between /today, /stale, /replies ──────────────────────────
 
-// Days since ISO date string, returns string like "2d", "3w", "1mo"
 function daysAgo(isoDate) {
   if (!isoDate) return null;
   const ts = Date.parse(isoDate);
@@ -56,6 +55,17 @@ function daysAgo(isoDate) {
   if (days < 14) return `${days}d`;
   if (days < 60) return `${Math.floor(days / 7)}w`;
   return `${Math.floor(days / 30)}mo`;
+}
+
+// Format hours idle into compact string. Used for replies-waiting.
+function formatIdle(hours) {
+  if (hours == null) return "?";
+  if (hours < 1) return `${Math.round(hours * 60)}min`;
+  if (hours < 24) return `${Math.round(hours)}h`;
+  const days = hours / 24;
+  if (days < 14) return `${Math.round(days)}d`;
+  if (days < 60) return `${Math.round(days / 7)}w`;
+  return `${Math.round(days / 30)}mo`;
 }
 
 // Map "High"/"Mid"/"Low" + bdScore → tier emoji + label
@@ -90,6 +100,15 @@ const HK_DESCRIPTIONS = {
   "HK-10": "Compliance/analytics SaaS",
   "HK-11": "Media/news/research",
 };
+
+// Network emoji map for messenger badges
+const NET_BADGE = {
+  "LI": "💼", "LinkedIn": "💼",
+  "TG": "✈️", "Telegram": "✈️",
+  "WA": "💚", "WhatsApp": "💚",
+};
+
+// ── Render helpers ───────────────────────────────────────────────────────────
 
 // Render one event into HTML lines for Telegram
 function renderEvent(ev) {
@@ -171,8 +190,6 @@ function renderEvent(ev) {
   return lines.join("\n");
 }
 
-// ── Stale-deals rendering ────────────────────────────────────────────────────
-
 // Compact one-deal format. Negotiations gets a 🔴 plate (deal at risk),
 // other active stages get 🟡 (gone quiet, needs nudge).
 function renderStaleDeal(deal) {
@@ -182,14 +199,12 @@ function renderStaleDeal(deal) {
   const isHotStage = stage === "Negotiations" || stage === "Call Scheduled";
   const emoji = isHotStage ? "🔴" : "🟡";
 
-  // Header: emoji + name + stage + days stale
   const stagePart = stage ? ` · ${esc(stage)}` : "";
-  const stalePart = deal.daysStale != null ? ` · <b>${deal.daysStale}d тишины</b>` : "";
+  const stalePart = deal.daysStale != null ? ` · <b>${deal.daysStale}d</b>` : "";
   lines.push(`${emoji} <b>${esc(deal.name)}</b>${stagePart}${stalePart}`);
 
   const indent = "   ";
 
-  // BD context: tier + score + priority + pipeline + channel
   const t = tierFromCompany(deal);
   const ctxParts = [];
   if (t && !t.hardKill) ctxParts.push(`${t.tier} · ${t.score}`);
@@ -198,8 +213,6 @@ function renderStaleDeal(deal) {
   if (deal.pipeline) ctxParts.push(deal.pipeline);
   if (ctxParts.length) lines.push(`${indent}<i>${ctxParts.map(esc).join(" · ")}</i>`);
 
-  // Action note (if set in Notion) — extremely high signal, like INXY's "Waiting to fill in DC + NDA"
-  // We don't get Action via current digest, but we can fall back to last-touch info
   const lastTouch = daysAgo(deal.lastContact);
   if (lastTouch && lastTouch !== "today") {
     lines.push(`${indent}📅 last contact: ${esc(lastTouch)} ago`);
@@ -208,7 +221,62 @@ function renderStaleDeal(deal) {
   return lines.join("\n");
 }
 
-// Fetch stale deals from proxy
+// Render one reply-waiting chat
+//
+// Format:
+//   💼 Sithira Dewasurendra · LinkedIn · 6h
+//      "Hi Anton, hope you are doing well..."
+//      🟢 Stride · MH · 13.4 · Negotiations
+//
+//   ✈️ WTG & Plexo · Telegram (group) · 4h
+//      Matthias: "sure"
+//
+function renderReply(reply) {
+  const lines = [];
+
+  const networkBadge = NET_BADGE[reply.networkFull] || NET_BADGE[reply.network] || "💬";
+  const idle = formatIdle(reply.hoursIdle);
+  const typeMark = reply.type === "group" ? " <i>(group)</i>" : "";
+  const networkLabel = reply.networkFull || reply.network || "Chat";
+
+  // Header — chat name + network + idle
+  lines.push(`${networkBadge} <b>${esc(reply.name)}</b> · ${esc(networkLabel)}${typeMark} · <b>${esc(idle)}</b>`);
+
+  const indent = "   ";
+
+  // Sender + snippet (skip sender for 1-on-1s — name is in the header)
+  const snippet = reply.lastMsgText || "";
+  const trimmed = snippet.length > 200
+    ? snippet.slice(0, 197).replace(/\s+\S*$/, "") + "..."
+    : snippet;
+
+  if (reply.type === "group" && reply.lastMsgSender) {
+    lines.push(`${indent}<b>${esc(reply.lastMsgSender)}</b>: <i>"${esc(trimmed)}"</i>`);
+  } else if (trimmed) {
+    lines.push(`${indent}<i>"${esc(trimmed)}"</i>`);
+  }
+
+  // CRM context if matched
+  if (reply.notion) {
+    const t = tierFromCompany(reply.notion);
+    const parts = [];
+    parts.push(`🟢 <b>${esc(reply.notion.name)}</b>`);
+    if (t && !t.hardKill) parts.push(`${t.tier} · ${t.score}`);
+    else if (reply.notion.bdScore != null) parts.push(`BD ${reply.notion.bdScore}`);
+    if (reply.notion.stage) parts.push(esc(reply.notion.stage));
+    lines.push(`${indent}${parts.join(" · ")}`);
+  }
+
+  // Person title from Notion People match
+  if (reply.person?.title) {
+    lines.push(`${indent}👤 ${esc(reply.person.title)}`);
+  }
+
+  return lines.join("\n");
+}
+
+// ── Fetch helpers ─────────────────────────────────────────────────────────────
+
 async function fetchStaleDeals({ days = 14, limit = 5 } = {}) {
   try {
     const r = await axios.get(`${PROXY}/notion/stale-deals`, {
@@ -218,7 +286,20 @@ async function fetchStaleDeals({ days = 14, limit = 5 } = {}) {
     return r.data?.deals || [];
   } catch (err) {
     console.error("[bot] fetchStaleDeals failed:", err.message);
-    return null;  // null = error (vs [] = empty result)
+    return null;
+  }
+}
+
+async function fetchRepliesWaiting({ hoursIdle = 4, limit = 15, days = 7 } = {}) {
+  try {
+    const r = await axios.get(`${PROXY}/beeper/replies-waiting`, {
+      params: { hoursIdle, limit, days },
+      timeout: 30_000,  // Beeper digest can be slow on cold cache
+    });
+    return r.data?.replies || [];
+  } catch (err) {
+    console.error("[bot] fetchRepliesWaiting failed:", err.message);
+    return null;
   }
 }
 
@@ -230,12 +311,14 @@ bot.command("start", ctx => guard(ctx, () => {
     `Статус: жив, фичи строим по одной.\n\n` +
     `Доступно сейчас:\n` +
     `/ping — health check\n` +
-    `/today — встречи Anton'а на сегодня (с CRM данными + stale deals)\n` +
-    `/stale — заглохшие сделки (>14d тишины)\n\n` +
+    `/today — встречи + stale deals + replies waiting\n` +
+    `/stale — заглохшие сделки (>14d тишины)\n` +
+    `/replies — кто ждёт ответа Anton'а (>4h)\n\n` +
     `Скоро:\n` +
-    `• Morning digest (9:00 CET)\n` +
     `• Pre-call briefing (за час до звонка)\n` +
-    `• Post-call follow-up (через 15 мин после)`
+    `• Post-call follow-up (через 15 мин после)\n` +
+    `• Tasks today\n` +
+    `• Loop's nudge`
   );
 }));
 
@@ -260,14 +343,15 @@ bot.command("ping", ctx => guard(ctx, () => {
 
 // ── /today ────────────────────────────────────────────────────────────────────
 bot.command("today", ctx => guard(ctx, async () => {
-  const loadingMsg = await ctx.reply("⏳ Тяну календарь + CRM...");
+  const loadingMsg = await ctx.reply("⏳ Тяну календарь, CRM и мессенджеры...");
   try {
-    // Run calendar + stale-deals in parallel — no point waiting serially
-    const [calendarRes, stale] = await Promise.all([
+    // Calendar + stale + replies — all in parallel for fastest response
+    const [calendarRes, stale, replies] = await Promise.all([
       axios.get(`${PROXY}/calendar/today`, { timeout: 30_000 })
         .then(r => r.data)
         .catch(err => ({ ok: false, error: err.message })),
       fetchStaleDeals({ days: 14, limit: 5 }),
+      fetchRepliesWaiting({ hoursIdle: 4, limit: 8, days: 7 }),
     ]);
 
     if (!calendarRes.ok) {
@@ -279,7 +363,7 @@ bot.command("today", ctx => guard(ctx, async () => {
 
     const sections = [];
 
-    // Calendar block
+    // 1. Calendar block
     if (!calendarRes.events?.length) {
       sections.push(
         `📅 <b>Сегодня (${esc(calendarRes.date)})</b>\n\nКалендарь пустой 🌴`
@@ -293,7 +377,31 @@ bot.command("today", ctx => guard(ctx, async () => {
       );
     }
 
-    // Stale-deals block (only show if we got results — null = skip silently on fetch error)
+    // 2. Replies waiting block (split primary/secondary)
+    if (Array.isArray(replies) && replies.length > 0) {
+      const primary = replies.filter(r => r.visualTier === "primary");
+      const secondary = replies.filter(r => r.visualTier === "secondary");
+
+      const replyParts = [];
+      if (primary.length > 0) {
+        replyParts.push(primary.map(renderReply).join("\n\n"));
+      }
+      if (secondary.length > 0) {
+        if (primary.length > 0) {
+          replyParts.push(`<i>—  остальные  —</i>\n\n` + secondary.map(renderReply).join("\n\n"));
+        } else {
+          replyParts.push(secondary.map(renderReply).join("\n\n"));
+        }
+      }
+
+      sections.push(
+        `💬 <b>Ждут ответа</b>  · <i>${replies.length} чатов &gt;4h</i>\n` +
+        `\n` +
+        replyParts.join("\n\n")
+      );
+    }
+
+    // 3. Stale-deals block
     if (Array.isArray(stale) && stale.length > 0) {
       const dealBlocks = stale.map(renderStaleDeal);
       sections.push(
@@ -360,14 +468,70 @@ bot.command("stale", ctx => guard(ctx, async () => {
   }
 }));
 
+// ── /replies ──────────────────────────────────────────────────────────────────
+bot.command("replies", ctx => guard(ctx, async () => {
+  const loadingMsg = await ctx.reply("⏳ Сканирую мессенджеры...");
+  try {
+    const replies = await fetchRepliesWaiting({ hoursIdle: 4, limit: 15, days: 7 });
+
+    if (replies === null) {
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Не удалось получить данные из Beeper.`
+      );
+    }
+
+    if (replies.length === 0) {
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `✅ <b>Inbox чист</b>\n\nНет чатов где Anton ещё не ответил &gt;4h.`,
+        { parse_mode: "HTML" }
+      );
+    }
+
+    const primary = replies.filter(r => r.visualTier === "primary");
+    const secondary = replies.filter(r => r.visualTier === "secondary");
+
+    const parts = [];
+    if (primary.length > 0) {
+      parts.push(primary.map(renderReply).join("\n\n"));
+    }
+    if (secondary.length > 0) {
+      if (primary.length > 0) {
+        parts.push(`<i>—  остальные  —</i>\n\n` + secondary.map(renderReply).join("\n\n"));
+      } else {
+        parts.push(secondary.map(renderReply).join("\n\n"));
+      }
+    }
+
+    const text =
+      `💬 <b>Ждут ответа</b>  · <i>${replies.length} чатов &gt;4h</i>\n` +
+      `\n` +
+      parts.join("\n\n");
+
+    return ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, text,
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
+    );
+  } catch (err) {
+    const errMsg = err.response?.data?.error || err.message;
+    console.error("[bot /replies] error:", errMsg);
+    return ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id,
+      `❌ Ошибка: ${esc(errMsg)}`
+    );
+  }
+}));
+
 // ── Catch-all for any other text ──────────────────────────────────────────────
 bot.on("message:text", ctx => guard(ctx, () => {
   return ctx.reply(
     `Пока я понимаю только команды:\n` +
     `/start — что я умею\n` +
     `/ping — health check\n` +
-    `/today — встречи Anton'а на сегодня\n` +
-    `/stale — заглохшие сделки`
+    `/today — встречи + stale + replies\n` +
+    `/stale — заглохшие сделки\n` +
+    `/replies — ждут ответа`
   );
 }));
 

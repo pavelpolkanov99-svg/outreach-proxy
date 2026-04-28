@@ -183,6 +183,38 @@ router.get("/digest", async (req, res) => {
 
 const GROUP_PARTICIPANT_LIMIT = 20;
 
+// Parse "Chat on X with A, B, C, & N others." style text from Beeper get_chat
+// into a participant count. Returns null if no count signal found.
+//
+// Examples:
+//   "Chat on WA with +1, +2, +3, & 22 others."  → 3 + 22 = 25
+//   "Chat on TG with Alice, Bob, & 1 other."    → 2 + 1 = 3
+//   "Chat on TG with Alice, Bob, Charlie."      → 3
+//   "Chat on TG with Alice."                    → 1
+function parseParticipantCountFromText(rawText) {
+  if (!rawText || typeof rawText !== "string") return null;
+
+  // Look for "with [...stuff...]" up to first sentence-ending period
+  const withMatch = rawText.match(/with\s+([^.]+)\.?/i);
+  if (!withMatch) return null;
+  const listPart = withMatch[1].trim();
+
+  // Pattern A: "X, Y, Z, & N others" or "X, Y, & N other"
+  const othersMatch = listPart.match(/&\s+(\d+)\s+others?/i);
+  if (othersMatch) {
+    const namedBeforeOthers = listPart
+      .split(/&\s+\d+\s+others?/i)[0]
+      .split(",")
+      .map(s => s.trim())
+      .filter(Boolean);
+    return namedBeforeOthers.length + parseInt(othersMatch[1], 10);
+  }
+
+  // Pattern B: just a comma-separated name list, no "others"
+  const names = listPart.split(",").map(s => s.trim()).filter(Boolean);
+  return names.length || null;
+}
+
 // Fetch participant count for a group via MCP get_chat. Returns null on error
 // (treat as "unknown — keep the chat" rather than dropping).
 async function getParticipantCount(chatID) {
@@ -206,13 +238,19 @@ async function getParticipantCount(chatID) {
     const textBlock = Array.isArray(content) ? content.find(c => c.type === "text") : null;
     const rawText = textBlock?.text || (typeof content === "string" ? content : null);
     if (!rawText) return null;
-    let parsed;
-    try { parsed = JSON.parse(rawText); } catch { return null; }
-    // Beeper returns participants as array; if there are more than maxParticipantCount,
-    // it returns the partial list. We requested limit+5, so if length === limit+5 (or +1),
-    // we treat that as ">limit". If length <= limit, we use it directly.
-    const participants = parsed.participants || parsed.members || [];
-    return participants.length;
+
+    // Beeper returns plain text describing the chat — parse it directly.
+    // Falls back to JSON parsing for older / structured responses.
+    const fromText = parseParticipantCountFromText(rawText);
+    if (fromText != null) return fromText;
+
+    try {
+      const parsed = JSON.parse(rawText);
+      const participants = parsed.participants || parsed.members || [];
+      return Array.isArray(participants) ? participants.length : null;
+    } catch {
+      return null;
+    }
   } catch (err) {
     return null;
   }
@@ -352,8 +390,6 @@ router.get("/replies-waiting", async (req, res) => {
     });
 
     // 3) Late-stage filter — drop large groups (>20 participants).
-    //    Only fetches participant count for groups that survived all cheap filters,
-    //    so the cost is bounded (typically 2-5 groups → 2-5 parallel MCP calls).
     const survivors = decisions.filter(d => d.included);
     const groupSurvivors = survivors.filter(d => d.chat.type === "group");
 
@@ -363,7 +399,6 @@ router.get("/replies-waiting", async (req, res) => {
     })));
     const sizeByChat = new Map(groupSizes.map(g => [g.chatId, g.count]));
 
-    // Apply size filter and record the reason on excluded survivors
     for (const d of survivors) {
       if (d.chat.type !== "group") continue;
       const count = sizeByChat.get(d.chat.id);
@@ -417,6 +452,7 @@ router.get("/replies-waiting", async (req, res) => {
       response.debug = {
         totalChatsScanned: chats.length,
         groupSizesChecked: groupSizes.length,
+        groupSizes: groupSizes.map(g => ({ chatId: g.chatId, count: g.count })),
         decisionsByReason: decisions
           .filter(d => !d.included)
           .reduce((acc, d) => {

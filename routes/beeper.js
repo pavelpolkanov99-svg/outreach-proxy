@@ -182,7 +182,23 @@ router.get("/digest", async (req, res) => {
 // /beeper/replies-waiting — heuristic "ждут ответа Anton'а"
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Match Beeper chat / sender against Notion Companies DB by name (fuzzy contains)
+// Generic seed words that DON'T uniquely identify a company. If chat-name's
+// first word matches one of these, we don't even attempt a Notion lookup.
+// (Was producing false positives like "World Impact Forum" → "Tribu World".)
+const GENERIC_SEED_WORDS = new Set([
+  "world", "global", "international", "africa", "latam", "asia", "europe",
+  "the", "a", "an",
+  "blockchain", "crypto", "fintech", "tech", "ai",
+  "venture", "ventures", "capital", "startup", "startups",
+  "community", "group", "forum", "initiatives", "network",
+  "news", "feed", "channel",
+  "intl", "i18n",
+  "rocket", "school",
+  "beeper", "telegram",
+]);
+
+// Match Beeper chat / sender against Notion Companies DB by name (fuzzy contains).
+// Stricter than before: requires ≥4 chars AND not a generic seed word.
 async function lookupCompanyByName(name) {
   if (!NOTION_TOKEN || !name) return null;
   try {
@@ -191,7 +207,8 @@ async function lookupCompanyByName(name) {
       .replace(/^.*\|\s*/, "")
       .trim();
     const candidate = cleanedName.split(/\s+/)[0];
-    if (!candidate || candidate.length < 3) return null;
+    if (!candidate || candidate.length < 4) return null;
+    if (GENERIC_SEED_WORDS.has(candidate.toLowerCase())) return null;
 
     const r = await axios.post(
       `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
@@ -245,12 +262,34 @@ async function lookupPersonByName(name) {
 }
 
 // Senders that count as "Anton/Pavel" — last msg from them = Anton already replied.
-// Beeper labels Anton variously: "Anton CEO RemiDe", "Антон", "@pavel-remide:beeper.com"
 const INTERNAL_SENDER_REGEX = /(anton ceo|antón|^антон$|^pavel|polkanov|@pavel-remide:beeper\.com|titov)/i;
 
 function isInternalSender(senderName) {
   if (!senderName) return false;
   return INTERNAL_SENDER_REGEX.test(senderName);
+}
+
+// Chats that count as "internal noise" — Plexo/RemiDe team rooms, advisor groups,
+// Beeper system rooms. Last messages here aren't "ждут ответа" — they're
+// updates/announcements. Drop entire chat.
+function isInternalChatName(chatName) {
+  if (!chatName) return false;
+  return /(remide\s*\|.*advisor|plexo\s*\|.*advisor|beeper developer|remide team|plexo team)/i.test(chatName);
+}
+
+// Chats that are clearly bots / mass-broadcast spam.
+// Heuristic: sender name EQUALS chat name (e.g. "Rocket Tech School" sends as
+// "Rocket Tech School" — that's a brand bot, not a person), OR sender contains
+// known spam markers.
+function isBroadcastSpam(chatName, senderName) {
+  if (!senderName) return false;
+  // Brand bot: sender == chat name (1-on-1 from the brand itself)
+  if (chatName && senderName.toLowerCase().trim() === chatName.toLowerCase().trim()) {
+    return true;
+  }
+  // Specific known spam patterns
+  if (/^(rocket tech school|frontforumfocus)$/i.test(senderName)) return true;
+  return false;
 }
 
 router.get("/replies-waiting", async (req, res) => {
@@ -272,10 +311,14 @@ router.get("/replies-waiting", async (req, res) => {
     const decisions = chats.map(c => {
       const reasons = [];
       const sentByInternal = isInternalSender(c.lastMsgSender);
+      const internalChat   = isInternalChatName(c.name);
+      const broadcast      = isBroadcastSpam(c.name, c.lastMsgSender);
 
       if (c.fetchError)                            reasons.push("msg-fetch-failed");
       if (c.isSender)                              reasons.push("isSender-flag-true");
       if (sentByInternal)                          reasons.push("internal-sender-name");
+      if (internalChat)                            reasons.push("internal-chat-room");
+      if (broadcast)                               reasons.push("broadcast-spam");
       if (!c.lastMsgText || !c.lastMsgText.trim()) reasons.push("empty-text");
       if (!c.lastMsgTime)                          reasons.push("no-timestamp");
       if (c.lastMsgTime) {

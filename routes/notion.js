@@ -527,22 +527,10 @@ router.post("/update-insight", async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Stale-deals — pipeline hygiene digest
 // ─────────────────────────────────────────────────────────────────────────────
-//
-// Returns deals that have gone quiet:
-//  - Stage in active engagement bucket
-//  - last_edited_time older than N days
-//  - Priority in [High, Mid] (P3/no-priority too noisy)
-//  - Sort: oldest stale first
-//  - Limit (default 5)
-// ─────────────────────────────────────────────────────────────────────────────
 
 const STALE_DEFAULT_DAYS = 14;
 const STALE_DEFAULT_LIMIT = 5;
 
-// Stages that count as "actively engaged" — i.e. customer has interacted with us.
-// Outbound stages (cold email sent, intro) are NOT here — those have their own
-// follow-up logic and don't belong in stale-deals.
-// Terminal stages (Win/Lost/Not relevant/DELETE) also excluded.
 const STALE_ACTIVE_STAGES = [
   "Communication Started",
   "Call Scheduled",
@@ -558,26 +546,22 @@ router.get("/stale-deals", async (req, res) => {
   const days  = Math.max(1, Math.min(365, parseInt(req.query.days,  10) || STALE_DEFAULT_DAYS));
   const limit = Math.max(1, Math.min(50,  parseInt(req.query.limit, 10) || STALE_DEFAULT_LIMIT));
 
-  // Cutoff = now - N days (ISO)
   const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
   const cutoffISO = new Date(cutoffMs).toISOString();
 
   try {
     const filter = {
       and: [
-        // Stage in [active engagement bucket]
         {
           or: STALE_ACTIVE_STAGES.map(stage => ({
             property: "Stage",
             status:   { equals: stage },
           })),
         },
-        // last_edited_time before cutoff
         {
           timestamp: "last_edited_time",
           last_edited_time: { before: cutoffISO },
         },
-        // Priority in [High, Mid]
         {
           or: [
             { property: "Priority", select: { equals: "High" } },
@@ -614,6 +598,154 @@ router.get("/stale-deals", async (req, res) => {
       cutoffISO,
       total: deals.length,
       deals,
+    });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({
+      error: err.response?.data?.message || err.message,
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tasks today — open tasks due today or overdue (Notion Tasks Tracker DB)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const NOTION_TASKS_DB = "2fa2ac1063c8800b8a92d56de58a6358";
+
+const TASK_PRIORITY_RANK = { "High": 0, "Medium": 1, "Low": 2 };
+
+// Ymd helper — formats a Date as YYYY-MM-DD without timezone arithmetic surprises
+function toYmd(d) {
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+router.get("/tasks-today", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+
+  const limit = Math.max(1, Math.min(50, parseInt(req.query.limit, 10) || 10));
+
+  // "today" cutoff — anything with due date <= today (UTC) counts
+  const todayYmd = toYmd(new Date());
+
+  try {
+    // Filter: Status != "Done" AND Due date is on or before today
+    const filter = {
+      and: [
+        {
+          property: "Status",
+          status: { does_not_equal: "Done" },
+        },
+        {
+          property: "Due date",
+          date: { on_or_before: todayYmd },
+        },
+      ],
+    };
+
+    const r = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_TASKS_DB}/query`,
+      {
+        filter,
+        sorts: [
+          { property: "Due date", direction: "ascending" },
+        ],
+        page_size: 100, // pre-sort wide, post-sort + slice in code
+      },
+      { headers: notionHeaders() }
+    );
+
+    // Extract task essentials. Capture linked Company page IDs separately so we
+    // can resolve their names with one parallel batch.
+    const rawTasks = r.data.results.map(page => {
+      const props = page.properties || {};
+
+      const titleArr = props["Task name"]?.title || [];
+      const name = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
+
+      const descArr = props["Description"]?.rich_text || [];
+      const description = descArr.map(rt => rt.plain_text || rt.text?.content || "").join("").trim();
+
+      const status   = props["Status"]?.status?.name || null;
+      const priority = props["Priority"]?.select?.name || null;
+
+      const dueDate  = props["Due date"]?.date?.start || null;
+      const companyRel = props["🏢  CRM Companies"]?.relation || [];
+      const linkedCompanyId = companyRel[0]?.id || null;
+
+      // daysOverdue = today - dueDate; >0 = late, 0 = today, <0 = future
+      let daysOverdue = null;
+      if (dueDate) {
+        const dueMs = Date.parse(dueDate + "T00:00:00Z");
+        const todayMs = Date.parse(todayYmd + "T00:00:00Z");
+        if (!isNaN(dueMs)) {
+          daysOverdue = Math.round((todayMs - dueMs) / (24 * 60 * 60 * 1000));
+        }
+      }
+
+      return {
+        id: page.id,
+        url: page.url,
+        name,
+        description: description.length > 200 ? description.slice(0, 197) + "..." : description,
+        status,
+        priority,
+        dueDate,
+        daysOverdue,
+        linkedCompanyId,
+      };
+    });
+
+    // Resolve linked company names in one parallel batch
+    const uniqueCompanyIds = [...new Set(rawTasks.map(t => t.linkedCompanyId).filter(Boolean))];
+    const companyNameById = new Map();
+    if (uniqueCompanyIds.length > 0) {
+      await Promise.all(uniqueCompanyIds.map(async (id) => {
+        try {
+          const cr = await axios.get(
+            `https://api.notion.com/v1/pages/${id}`,
+            { headers: notionHeaders(), timeout: 6000 }
+          );
+          const props = cr.data.properties || {};
+          const titleArr = props["Company name"]?.title || [];
+          const cname = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
+          if (cname) companyNameById.set(id, cname);
+        } catch (_) {
+          // Swallow — company name is optional context
+        }
+      }));
+    }
+
+    // Attach company name to each task
+    const tasks = rawTasks.map(t => ({
+      id: t.id,
+      url: t.url,
+      name: t.name,
+      description: t.description,
+      status: t.status,
+      priority: t.priority,
+      dueDate: t.dueDate,
+      daysOverdue: t.daysOverdue,
+      companyName: t.linkedCompanyId ? (companyNameById.get(t.linkedCompanyId) || null) : null,
+    }));
+
+    // Final sort: priority asc (High first), then dueDate asc (oldest overdue first)
+    tasks.sort((a, b) => {
+      const pa = TASK_PRIORITY_RANK[a.priority] ?? 99;
+      const pb = TASK_PRIORITY_RANK[b.priority] ?? 99;
+      if (pa !== pb) return pa - pb;
+      const da = a.dueDate || "9999-12-31";
+      const db = b.dueDate || "9999-12-31";
+      return da.localeCompare(db);
+    });
+
+    res.json({
+      ok: true,
+      asOf: todayYmd,
+      total: tasks.length,
+      tasks: tasks.slice(0, limit),
     });
   } catch (err) {
     res.status(err.response?.status || 500).json({

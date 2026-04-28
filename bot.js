@@ -1,15 +1,21 @@
 const { Bot } = require("grammy");
 const axios   = require("axios");
+const cron    = require("node-cron");
 
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY     = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION   = "4.7.0-fcc-resilient-today";
+const VERSION   = "4.8.0-fcc-morning-push";
 const STARTED_AT = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
 
 const ALLOWED_USERS = (process.env.ALLOWED_USERS || "")
+  .split(",").map(s => parseInt(s.trim())).filter(Boolean);
+
+// Morning push recipients — defaults to ALLOWED_USERS, overridable via env.
+// Until Anton onboards, only Pavel (156632707) gets the morning push.
+const MORNING_PUSH_USERS = (process.env.MORNING_PUSH_USERS || "156632707")
   .split(",").map(s => parseInt(s.trim())).filter(Boolean);
 
 const bot = new Bot(BOT_TOKEN);
@@ -43,8 +49,6 @@ function esc(text) {
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// Wrap a promise with a hard timeout. On timeout, resolves to null (not throws).
-// Used so a single slow upstream can never block the whole digest.
 function withTimeout(promise, ms, label) {
   let timer;
   const timeout = new Promise(resolve => {
@@ -395,45 +399,26 @@ async function fetchTasksToday({ limit = 10 } = {}) {
   }
 }
 
-// ── /start ────────────────────────────────────────────────────────────────────
-bot.command("start", ctx => guard(ctx, () => {
-  return ctx.reply(
-    `🤖 Loop OS — Founder Command Center\n\n` +
-    `Версия: ${VERSION}\n` +
-    `Статус: жив, фичи строим по одной.\n\n` +
-    `Доступно сейчас:\n` +
-    `/ping — health check\n` +
-    `/today — встречи + tasks + replies + stale\n` +
-    `/tasks — открытые задачи (сегодня + просрочены)\n` +
-    `/stale — заглохшие сделки (>14d тишины)\n` +
-    `/replies — кто ждёт ответа Anton'а (>4h)\n\n` +
-    `Скоро:\n` +
-    `• Pre-call briefing (за час до звонка)\n` +
-    `• Post-call follow-up (через 15 мин после)\n` +
-    `• Loop's nudge`
+// ── Section builders ─────────────────────────────────────────────────────────
+
+function buildCalendarSection(calendarRes) {
+  if (calendarRes && calendarRes.__timeout) {
+    return `📅 <b>Сегодня</b>\n\n<i>⚠️ Календарь ответил долго. Попробуй ещё раз через минуту.</i>`;
+  }
+  if (!calendarRes || !calendarRes.ok) {
+    return `📅 <b>Сегодня</b>\n\n<i>❌ Calendar error: ${esc(calendarRes?.error || "unknown")}</i>`;
+  }
+  if (!calendarRes.events?.length) {
+    return `📅 <b>Сегодня (${esc(calendarRes.date)})</b>\n\nКалендарь пустой 🌴`;
+  }
+  const blocks = calendarRes.events.map(renderEvent);
+  return (
+    `📅 <b>Сегодня (${esc(calendarRes.date)})</b>  · <i>${calendarRes.total} встреч</i>\n` +
+    `\n` +
+    blocks.join("\n\n")
   );
-}));
+}
 
-// ── /ping ─────────────────────────────────────────────────────────────────────
-bot.command("ping", ctx => guard(ctx, () => {
-  const now = new Date();
-  const uptimeSec = Math.floor((now - STARTED_AT) / 1000);
-  const uptimeStr = uptimeSec < 60
-    ? `${uptimeSec}s`
-    : uptimeSec < 3600
-      ? `${Math.floor(uptimeSec / 60)}m ${uptimeSec % 60}s`
-      : `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m`;
-
-  return ctx.reply(
-    `🏓 pong\n\n` +
-    `Версия: ${VERSION}\n` +
-    `Server time: ${now.toISOString()}\n` +
-    `Uptime: ${uptimeStr}\n` +
-    `Your TG ID: ${ctx.from?.id}`
-  );
-}));
-
-// Build the tasks block (used by both /today and /tasks)
 function buildTasksSection(tasksData) {
   if (!tasksData || tasksData.__timeout) {
     return `📋 <b>Задачи</b>\n\n<i>⚠️ Notion ответил долго — пропустил блок. Дёрни /tasks отдельно.</i>`;
@@ -494,68 +479,87 @@ function buildStaleSection(stale) {
   );
 }
 
-// ── /today ────────────────────────────────────────────────────────────────────
-//
-// Resilient digest. Each upstream gets its own timeout via withTimeout(). If
-// any one source hangs, it returns a "__timeout" sentinel and the corresponding
-// section renders a degraded warning instead of blocking the whole reply.
-//
-// Per-source timeouts (deliberately tight):
-//   calendar  25s — has internal CRM enrichment, can be slow on cold cache
-//   tasks     12s — pure Notion query, should be fast
-//   stale     12s — pure Notion query, should be fast
-//   replies   25s — Beeper digest is the slowest, still hard-cap it
-//
-bot.command("today", ctx => guard(ctx, async () => {
+// Fetch all four data sources in parallel with per-source timeouts.
+// Used by /today command and the morning push cron.
+async function fetchTodayDigestData() {
   const t0 = Date.now();
+  const [calendarRes, tasksData, stale, replies] = await Promise.all([
+    withTimeout(fetchCalendar(),                                          25_000, "calendar"),
+    withTimeout(fetchTasksToday({ limit: 20 }),                           12_000, "tasks"),
+    withTimeout(fetchStaleDeals({ days: 14, limit: 5 }),                  12_000, "stale"),
+    withTimeout(fetchRepliesWaiting({ hoursIdle: 4, limit: 8, days: 7 }), 25_000, "replies"),
+  ]);
+  console.log(`[bot] aggregate digest fetch took ${Date.now() - t0}ms`);
+  return { calendarRes, tasksData, stale, replies };
+}
+
+// Compose the full /today digest text from fetched data.
+function composeTodayDigest({ calendarRes, tasksData, stale, replies }, { header } = {}) {
+  const sections = [];
+
+  if (header) sections.push(header);
+
+  sections.push(buildCalendarSection(calendarRes));
+
+  const tasksBlock = buildTasksSection(tasksData);
+  if (tasksBlock) sections.push(tasksBlock);
+
+  const repliesBlock = buildRepliesSection(replies);
+  if (repliesBlock) sections.push(repliesBlock);
+
+  const staleBlock = buildStaleSection(stale);
+  if (staleBlock) sections.push(staleBlock);
+
+  return sections.join("\n\n━━━━━━━━━━━━━━━\n\n");
+}
+
+// ── /start ────────────────────────────────────────────────────────────────────
+bot.command("start", ctx => guard(ctx, () => {
+  return ctx.reply(
+    `🤖 Loop OS — Founder Command Center\n\n` +
+    `Версия: ${VERSION}\n` +
+    `Статус: жив, фичи строим по одной.\n\n` +
+    `Доступно сейчас:\n` +
+    `/ping — health check\n` +
+    `/today — встречи + tasks + replies + stale\n` +
+    `/tasks — открытые задачи (сегодня + просрочены)\n` +
+    `/stale — заглохшие сделки (>14d тишины)\n` +
+    `/replies — кто ждёт ответа Anton'а (>4h)\n\n` +
+    `Авто:\n` +
+    `• Утренний дайджест каждый день в 08:30 CET\n` +
+    `• CRM auto-prewarm в 23:00 и 08:00 CET\n\n` +
+    `Скоро:\n` +
+    `• Pre-call briefing (за час до звонка)\n` +
+    `• Post-call follow-up (через 15 мин после)\n` +
+    `• Loop's nudge`
+  );
+}));
+
+// ── /ping ─────────────────────────────────────────────────────────────────────
+bot.command("ping", ctx => guard(ctx, () => {
+  const now = new Date();
+  const uptimeSec = Math.floor((now - STARTED_AT) / 1000);
+  const uptimeStr = uptimeSec < 60
+    ? `${uptimeSec}s`
+    : uptimeSec < 3600
+      ? `${Math.floor(uptimeSec / 60)}m ${uptimeSec % 60}s`
+      : `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m`;
+
+  return ctx.reply(
+    `🏓 pong\n\n` +
+    `Версия: ${VERSION}\n` +
+    `Server time: ${now.toISOString()}\n` +
+    `Uptime: ${uptimeStr}\n` +
+    `Your TG ID: ${ctx.from?.id}`
+  );
+}));
+
+// ── /today ────────────────────────────────────────────────────────────────────
+bot.command("today", ctx => guard(ctx, async () => {
   const loadingMsg = await ctx.reply("⏳ Тяну календарь, задачи, CRM и мессенджеры...");
   try {
-    const [calendarRes, tasksData, stale, replies] = await Promise.all([
-      withTimeout(fetchCalendar(),                                          25_000, "calendar"),
-      withTimeout(fetchTasksToday({ limit: 20 }),                           12_000, "tasks"),
-      withTimeout(fetchStaleDeals({ days: 14, limit: 5 }),                  12_000, "stale"),
-      withTimeout(fetchRepliesWaiting({ hoursIdle: 4, limit: 8, days: 7 }), 25_000, "replies"),
-    ]);
-
-    console.log(`[bot] /today aggregate fetch took ${Date.now() - t0}ms`);
-
-    const sections = [];
-
-    // 1. Calendar block — required. If timeout/error, show degraded message.
-    if (calendarRes && calendarRes.__timeout) {
-      sections.push(
-        `📅 <b>Сегодня</b>\n\n<i>⚠️ Календарь ответил долго. Попробуй ещё раз через минуту.</i>`
-      );
-    } else if (!calendarRes || !calendarRes.ok) {
-      sections.push(
-        `📅 <b>Сегодня</b>\n\n<i>❌ Calendar error: ${esc(calendarRes?.error || "unknown")}</i>`
-      );
-    } else if (!calendarRes.events?.length) {
-      sections.push(
-        `📅 <b>Сегодня (${esc(calendarRes.date)})</b>\n\nКалендарь пустой 🌴`
-      );
-    } else {
-      const blocks = calendarRes.events.map(renderEvent);
-      sections.push(
-        `📅 <b>Сегодня (${esc(calendarRes.date)})</b>  · <i>${calendarRes.total} встреч</i>\n` +
-        `\n` +
-        blocks.join("\n\n")
-      );
-    }
-
-    // 2. Tasks today block
-    const tasksBlock = buildTasksSection(tasksData);
-    if (tasksBlock) sections.push(tasksBlock);
-
-    // 3. Replies waiting block
-    const repliesBlock = buildRepliesSection(replies);
-    if (repliesBlock) sections.push(repliesBlock);
-
-    // 4. Stale-deals block
-    const staleBlock = buildStaleSection(stale);
-    if (staleBlock) sections.push(staleBlock);
-
-    const text = sections.join("\n\n━━━━━━━━━━━━━━━\n\n");
+    const data = await fetchTodayDigestData();
+    const text = composeTodayDigest(data);
 
     return ctx.api.editMessageText(
       ctx.chat.id, loadingMsg.message_id, text,
@@ -722,9 +726,48 @@ bot.catch(err => {
   console.error("[bot] Error:", err.message);
 });
 
+// ── Morning push cron ────────────────────────────────────────────────────────
+// Runs every weekday at 08:30 Europe/Prague — half hour after the prewarm
+// cron at 08:00 so Notion Insights are fresh by the time the digest is built.
+//
+// Sends to MORNING_PUSH_USERS env (default: Pavel only). To onboard Anton:
+// set MORNING_PUSH_USERS env to "<anton-tg-id>,156632707".
+async function sendMorningPush() {
+  if (MORNING_PUSH_USERS.length === 0) {
+    console.log("[cron] morning push skipped — no recipients");
+    return;
+  }
+  console.log(`[cron] morning push start, recipients: ${MORNING_PUSH_USERS.join(",")}`);
+  try {
+    const data = await fetchTodayDigestData();
+    const header = `☀️ <b>Доброе утро!</b> Дайджест на сегодня.`;
+    const text = composeTodayDigest(data, { header });
+
+    for (const userId of MORNING_PUSH_USERS) {
+      try {
+        await bot.api.sendMessage(userId, text, {
+          parse_mode: "HTML",
+          link_preview_options: { is_disabled: true },
+        });
+        console.log(`[cron] morning push sent to ${userId}`);
+      } catch (err) {
+        console.error(`[cron] morning push to ${userId} failed:`, err.message);
+      }
+    }
+  } catch (err) {
+    console.error("[cron] morning push aggregate failed:", err.message);
+  }
+}
+
+// 08:30 Europe/Prague every day. Skip Sat/Sun if Anton wants — currently runs
+// every day for now (it's easier to remove a section than build one).
+cron.schedule("30 8 * * *", sendMorningPush, { timezone: "Europe/Prague" });
+console.log("[cron] morning push registered (08:30 Europe/Prague, every day)");
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 console.log(`[bot] Loop OS FCC ${VERSION} starting...`);
 console.log(`[bot] Proxy URL: ${PROXY}`);
+console.log(`[bot] Morning push recipients: ${MORNING_PUSH_USERS.join(",") || "(none)"}`);
 bot.start().then(() => {
   console.log(`[bot] Loop OS FCC ${VERSION} started at ${STARTED_AT.toISOString()}`);
 }).catch(err => {

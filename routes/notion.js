@@ -379,9 +379,6 @@ router.post("/check-duplicates", async (req, res) => {
 // Insight cache helpers — read/write Loop's Insight field on Companies pages
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Format used inside the Insight rich_text field.
-//   First line: "Refreshed: 2026-04-27 23:00 UTC"
-//   Then one bullet per line: "• fact one (Apr 2026)"
 function formatInsightText(refreshedAt, bullets) {
   const ts = new Date(refreshedAt || new Date()).toISOString().replace("T", " ").slice(0, 16) + " UTC";
   const head = `Refreshed: ${ts}`;
@@ -389,14 +386,11 @@ function formatInsightText(refreshedAt, bullets) {
   return body ? `${head}\n${body}` : head;
 }
 
-// Parse the Insight field text into { refreshedAt, bullets }.
-// Returns null if field is empty or does not match expected format.
 function parseInsightText(plainText) {
   if (!plainText || typeof plainText !== "string") return null;
   const lines = plainText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
   if (!lines.length) return null;
 
-  // First line: "Refreshed: 2026-04-27 23:00 UTC"
   const headMatch = lines[0].match(/^Refreshed:\s*(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::\d{2})?(?:\s*UTC)?\s*$/i);
   let refreshedAt = null;
   let bulletStart = 0;
@@ -415,7 +409,6 @@ function parseInsightText(plainText) {
   return { refreshedAt, bullets };
 }
 
-// Helper: extract company info we want for digest enrichment.
 function extractCompanyDigest(page) {
   const props = page.properties || {};
   const titleArr = props["Company name"]?.title || [];
@@ -438,18 +431,18 @@ function extractCompanyDigest(page) {
     description,
     bdScore: props["BD Score"]?.number ?? null,
     stage: props["Stage"]?.status?.name || null,
-    priority: props["Priority"]?.select?.name || null,  // "High" | "Mid" | "Low"
+    priority: props["Priority"]?.select?.name || null,
     industry: props["Industry"]?.select?.name || null,
     location: (props["Location"]?.rich_text || []).map(rt => rt.plain_text || rt.text?.content || "").join("") || null,
     tags,
     lastContact: props["Last Contact"]?.date?.start || null,
+    lastEditedTime: page.last_edited_time || null,
     pipeline: props["Pipeline"]?.select?.name || null,
     type: (props["Type"]?.multi_select || []).map(t => t.name),
     insight,
   };
 }
 
-// Normalize a domain for matching: strip protocol, www, trailing slash, lowercase.
 function normalizeDomain(input) {
   if (!input) return null;
   let s = String(input).toLowerCase().trim();
@@ -463,16 +456,12 @@ function normalizeDomain(input) {
 }
 
 // ── GET /notion/insight-by-domain ────────────────────────────────────────────
-// Look up a company in the CRM by website domain. Returns digest-shaped record:
-// { found: true, company: {...} }  OR  { found: false }
 router.get("/insight-by-domain", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   const domain = normalizeDomain(req.query.domain);
   if (!domain) return res.status(400).json({ error: "domain query param required" });
 
   try {
-    // Notion's url filter doesn't support 'contains' on URLs — use it on text instead.
-    // But Website is a url field, so we do a 'contains' on the value (Notion supports this for url).
     const r = await axios.post(
       `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
       {
@@ -484,7 +473,6 @@ router.get("/insight-by-domain", async (req, res) => {
 
     if (!r.data.results.length) return res.json({ found: false, domain });
 
-    // Prefer the most recently edited active record (skip Lost/DELETE/Not relevant)
     const skipStages = new Set(["Lost", "DELETE", "Not relevant"]);
     const active = r.data.results
       .map(extractCompanyDigest)
@@ -498,9 +486,6 @@ router.get("/insight-by-domain", async (req, res) => {
 });
 
 // ── POST /notion/update-insight ──────────────────────────────────────────────
-// Write Loop-managed insights to the Insight rich_text field.
-// Body: { pageId?: string, name?: string, bullets: string[], refreshedAt?: ISO }
-// Either pageId or name must be supplied.
 router.post("/update-insight", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
   const { pageId: bodyPageId, name, refreshedAt } = req.body || {};
@@ -536,6 +521,104 @@ router.post("/update-insight", async (req, res) => {
     res.json({ ok: true, pageId, bulletsWritten: bullets.length, length: text.length });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Stale-deals — pipeline hygiene digest
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Returns deals that have gone quiet:
+//  - Stage in active engagement bucket
+//  - last_edited_time older than N days
+//  - Priority in [High, Mid] (P3/no-priority too noisy)
+//  - Sort: oldest stale first
+//  - Limit (default 5)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const STALE_DEFAULT_DAYS = 14;
+const STALE_DEFAULT_LIMIT = 5;
+
+// Stages that count as "actively engaged" — i.e. customer has interacted with us.
+// Outbound stages (cold email sent, intro) are NOT here — those have their own
+// follow-up logic and don't belong in stale-deals.
+// Terminal stages (Win/Lost/Not relevant/DELETE) also excluded.
+const STALE_ACTIVE_STAGES = [
+  "Communication Started",
+  "Call Scheduled",
+  "initial discussions",
+  "Keeping in the Loop",
+  "Warm discussions",
+  "Negotiations",
+];
+
+router.get("/stale-deals", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+
+  const days  = Math.max(1, Math.min(365, parseInt(req.query.days,  10) || STALE_DEFAULT_DAYS));
+  const limit = Math.max(1, Math.min(50,  parseInt(req.query.limit, 10) || STALE_DEFAULT_LIMIT));
+
+  // Cutoff = now - N days (ISO)
+  const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
+  const cutoffISO = new Date(cutoffMs).toISOString();
+
+  try {
+    const filter = {
+      and: [
+        // Stage in [active engagement bucket]
+        {
+          or: STALE_ACTIVE_STAGES.map(stage => ({
+            property: "Stage",
+            status:   { equals: stage },
+          })),
+        },
+        // last_edited_time before cutoff
+        {
+          timestamp: "last_edited_time",
+          last_edited_time: { before: cutoffISO },
+        },
+        // Priority in [High, Mid]
+        {
+          or: [
+            { property: "Priority", select: { equals: "High" } },
+            { property: "Priority", select: { equals: "Mid"  } },
+          ],
+        },
+      ],
+    };
+
+    const r = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+      {
+        filter,
+        sorts: [
+          { timestamp: "last_edited_time", direction: "ascending" },
+        ],
+        page_size: limit,
+      },
+      { headers: notionHeaders() }
+    );
+
+    const deals = r.data.results.map(page => {
+      const digest = extractCompanyDigest(page);
+      const editedTs = Date.parse(digest.lastEditedTime || page.last_edited_time);
+      const daysStale = isNaN(editedTs)
+        ? null
+        : Math.floor((Date.now() - editedTs) / (24 * 60 * 60 * 1000));
+      return { ...digest, daysStale };
+    });
+
+    res.json({
+      ok: true,
+      cutoffDays: days,
+      cutoffISO,
+      total: deals.length,
+      deals,
+    });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({
+      error: err.response?.data?.message || err.message,
+    });
   }
 });
 

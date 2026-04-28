@@ -4,7 +4,7 @@ const axios   = require("axios");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY     = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION   = "4.5.0-fcc-tasks";
+const VERSION   = "4.6.0-fcc-task-grouping";
 const STARTED_AT = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -57,7 +57,6 @@ function daysAgo(isoDate) {
   return `${Math.floor(days / 30)}mo`;
 }
 
-// Format hours idle into compact string. Used for replies-waiting.
 function formatIdle(hours) {
   if (hours == null) return "?";
   if (hours < 1) return `${Math.round(hours * 60)}min`;
@@ -68,8 +67,6 @@ function formatIdle(hours) {
   return `${Math.round(days / 30)}mo`;
 }
 
-// Map "High"/"Mid"/"Low" + bdScore → tier emoji + label
-// Scoring is on /17 scale: MH ≥9, P1 ≥7.5, P2 5-7.4, P3 3-4.9
 function tierFromCompany(company) {
   if (!company) return null;
   const tags = company.tags || [];
@@ -86,7 +83,6 @@ function tierFromCompany(company) {
   return { tier: "P3", emoji: "⚪", score };
 }
 
-// Hard Kill description from tag code
 const HK_DESCRIPTIONS = {
   "HK-1":  "RWA tokenization only",
   "HK-2":  "DeFi-native, no KYC",
@@ -101,23 +97,28 @@ const HK_DESCRIPTIONS = {
   "HK-11": "Media/news/research",
 };
 
-// Network emoji map for messenger badges
 const NET_BADGE = {
   "LI": "💼", "LinkedIn": "💼",
   "TG": "✈️", "Telegram": "✈️",
   "WA": "💚", "WhatsApp": "💚",
 };
 
-// Task priority emoji
 const TASK_PRIORITY_EMOJI = {
   "High":   "🔴",
   "Medium": "🟡",
   "Low":    "⚪",
 };
 
+// Compose the standard "due" suffix used in both single tasks and groups
+function dueLabel(daysOverdue) {
+  if (daysOverdue == null)       return "";
+  if (daysOverdue > 0)           return ` · <b>${daysOverdue}d overdue</b>`;
+  if (daysOverdue === 0)         return " · <b>today</b>";
+  return ` · in ${Math.abs(daysOverdue)}d`;
+}
+
 // ── Render helpers ───────────────────────────────────────────────────────────
 
-// Render one event into HTML lines for Telegram
 function renderEvent(ev) {
   const lines = [];
   const time  = ev.timeRange;
@@ -197,8 +198,6 @@ function renderEvent(ev) {
   return lines.join("\n");
 }
 
-// Compact one-deal format. Negotiations gets a 🔴 plate (deal at risk),
-// other active stages get 🟡 (gone quiet, needs nudge).
 function renderStaleDeal(deal) {
   const lines = [];
 
@@ -228,7 +227,6 @@ function renderStaleDeal(deal) {
   return lines.join("\n");
 }
 
-// Render one reply-waiting chat
 function renderReply(reply) {
   const lines = [];
 
@@ -269,40 +267,15 @@ function renderReply(reply) {
   return lines.join("\n");
 }
 
-// Render one task
-//
-// Format:
-//   🔴 Sign Dfns contract  · 3d overdue
-//      Donald sent DocuSign for review and signing.
-//      🏢 Dfns
-//
-//   🟡 Reply Anupam (Nium)  · today
-//      Brief warm update re corridors after Money 20/20.
-//      🏢 Nium
-//
-//   ⚪ Update Notion stage for Belo  · today
-//
+// Render a single task (kind: "single")
 function renderTask(task) {
   const lines = [];
 
   const emoji = TASK_PRIORITY_EMOJI[task.priority] || "⚪";
+  const due = dueLabel(task.daysOverdue);
 
-  // Due label: "X days overdue" / "today" / formatted date
-  let dueLabel;
-  if (task.daysOverdue == null) {
-    dueLabel = "";
-  } else if (task.daysOverdue > 0) {
-    dueLabel = ` · <b>${task.daysOverdue}d overdue</b>`;
-  } else if (task.daysOverdue === 0) {
-    dueLabel = " · <b>today</b>";
-  } else {
-    // future task that snuck in (shouldn't happen with on_or_before today filter)
-    dueLabel = ` · in ${Math.abs(task.daysOverdue)}d`;
-  }
-
-  // Truncate task name to fit in one line nicely
   const nameSafe = task.name.length > 80 ? task.name.slice(0, 77) + "..." : task.name;
-  lines.push(`${emoji} <b>${esc(nameSafe)}</b>${dueLabel}`);
+  lines.push(`${emoji} <b>${esc(nameSafe)}</b>${due}`);
 
   const indent = "   ";
 
@@ -315,6 +288,41 @@ function renderTask(task) {
   }
 
   return lines.join("\n");
+}
+
+// Render a grouped task block (kind: "group")
+//
+// Format:
+//   ⚪ Drop discovery card follow  · <b>×11</b> · today
+//      🏢 LeoPay · LideFlow · Bitnob · Bitlipa · GCA Pay · +6
+function renderTaskGroup(group) {
+  const lines = [];
+
+  const emoji = TASK_PRIORITY_EMOJI[group.priority] || "⚪";
+  const due = dueLabel(group.daysOverdue);
+
+  const titleSafe = group.template.length > 80
+    ? group.template.slice(0, 77) + "..."
+    : group.template;
+
+  lines.push(`${emoji} <b>${esc(titleSafe)}</b>  · <b>×${group.count}</b>${due}`);
+
+  // Companies list — show first 5, then "+N" overflow indicator
+  const companies = group.companies || [];
+  if (companies.length > 0) {
+    const SHOW = 5;
+    const visible = companies.slice(0, SHOW).map(esc);
+    const overflow = companies.length > SHOW ? ` · +${companies.length - SHOW}` : "";
+    lines.push(`   🏢 ${visible.join(" · ")}${overflow}`);
+  }
+
+  return lines.join("\n");
+}
+
+// Render any task item (single or group)
+function renderTaskItem(item) {
+  if (item.kind === "group") return renderTaskGroup(item);
+  return renderTask(item.task);
 }
 
 // ── Fetch helpers ─────────────────────────────────────────────────────────────
@@ -345,13 +353,24 @@ async function fetchRepliesWaiting({ hoursIdle = 4, limit = 15, days = 7 } = {})
   }
 }
 
+// Returns { items, totalRaw, overdueRaw } where:
+//   items     = grouped display items (from new endpoint shape)
+//   totalRaw  = total individual tasks (pre-grouping)
+//   overdueRaw = count of overdue individual tasks
 async function fetchTasksToday({ limit = 10 } = {}) {
   try {
     const r = await axios.get(`${PROXY}/notion/tasks-today`, {
       params: { limit },
       timeout: 15_000,
     });
-    return r.data?.tasks || [];
+    const data = r.data || {};
+    const items = Array.isArray(data.items) ? data.items
+                : Array.isArray(data.tasks) ? data.tasks.map(t => ({ kind: "single", task: t }))
+                : [];
+    const tasksFlat = Array.isArray(data.tasks) ? data.tasks : [];
+    const totalRaw   = data.total ?? tasksFlat.length;
+    const overdueRaw = tasksFlat.filter(t => t.daysOverdue > 0).length;
+    return { items, totalRaw, overdueRaw };
   } catch (err) {
     console.error("[bot] fetchTasksToday failed:", err.message);
     return null;
@@ -396,16 +415,31 @@ bot.command("ping", ctx => guard(ctx, () => {
   );
 }));
 
+// Build the tasks block (used by both /today and /tasks)
+function buildTasksSection(tasksData) {
+  if (!tasksData || !tasksData.items?.length) return null;
+  const { items, totalRaw, overdueRaw } = tasksData;
+
+  const counter = overdueRaw > 0
+    ? `<i>${totalRaw} задач · ${overdueRaw} просрочено</i>`
+    : `<i>${totalRaw} задач на сегодня</i>`;
+
+  return (
+    `📋 <b>Задачи</b>  · ${counter}\n` +
+    `\n` +
+    items.map(renderTaskItem).join("\n\n")
+  );
+}
+
 // ── /today ────────────────────────────────────────────────────────────────────
 bot.command("today", ctx => guard(ctx, async () => {
   const loadingMsg = await ctx.reply("⏳ Тяну календарь, задачи, CRM и мессенджеры...");
   try {
-    // Calendar + tasks + stale + replies — all in parallel for fastest response
-    const [calendarRes, tasks, stale, replies] = await Promise.all([
+    const [calendarRes, tasksData, stale, replies] = await Promise.all([
       axios.get(`${PROXY}/calendar/today`, { timeout: 30_000 })
         .then(r => r.data)
         .catch(err => ({ ok: false, error: err.message })),
-      fetchTasksToday({ limit: 10 }),
+      fetchTasksToday({ limit: 20 }),
       fetchStaleDeals({ days: 14, limit: 5 }),
       fetchRepliesWaiting({ hoursIdle: 4, limit: 8, days: 7 }),
     ]);
@@ -434,19 +468,8 @@ bot.command("today", ctx => guard(ctx, async () => {
     }
 
     // 2. Tasks today block
-    if (Array.isArray(tasks) && tasks.length > 0) {
-      const overdueCount = tasks.filter(t => t.daysOverdue > 0).length;
-      const todayCount   = tasks.filter(t => t.daysOverdue === 0).length;
-      const counter = overdueCount > 0
-        ? `<i>${tasks.length} задач · ${overdueCount} просрочено</i>`
-        : `<i>${tasks.length} задач на сегодня</i>`;
-      const taskBlocks = tasks.map(renderTask);
-      sections.push(
-        `📋 <b>Задачи</b>  · ${counter}\n` +
-        `\n` +
-        taskBlocks.join("\n\n")
-      );
-    }
+    const tasksBlock = buildTasksSection(tasksData);
+    if (tasksBlock) sections.push(tasksBlock);
 
     // 3. Replies waiting block (split primary/secondary)
     if (Array.isArray(replies) && replies.length > 0) {
@@ -502,16 +525,16 @@ bot.command("today", ctx => guard(ctx, async () => {
 bot.command("tasks", ctx => guard(ctx, async () => {
   const loadingMsg = await ctx.reply("⏳ Сканирую Tasks Tracker...");
   try {
-    const tasks = await fetchTasksToday({ limit: 20 });
+    const tasksData = await fetchTasksToday({ limit: 30 });
 
-    if (tasks === null) {
+    if (tasksData === null) {
       return ctx.api.editMessageText(
         ctx.chat.id, loadingMsg.message_id,
         `❌ Не удалось получить задачи из Notion.`
       );
     }
 
-    if (tasks.length === 0) {
+    if (!tasksData.items.length) {
       return ctx.api.editMessageText(
         ctx.chat.id, loadingMsg.message_id,
         `✅ <b>Все задачи под контролем</b>\n\nНи одной задачи на сегодня или просроченной.`,
@@ -519,15 +542,7 @@ bot.command("tasks", ctx => guard(ctx, async () => {
       );
     }
 
-    const overdueCount = tasks.filter(t => t.daysOverdue > 0).length;
-    const counter = overdueCount > 0
-      ? `<i>${tasks.length} задач · ${overdueCount} просрочено</i>`
-      : `<i>${tasks.length} задач на сегодня</i>`;
-
-    const text =
-      `📋 <b>Задачи</b>  · ${counter}\n` +
-      `\n` +
-      tasks.map(renderTask).join("\n\n");
+    const text = buildTasksSection(tasksData);
 
     return ctx.api.editMessageText(
       ctx.chat.id, loadingMsg.message_id, text,

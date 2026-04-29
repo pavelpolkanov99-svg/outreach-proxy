@@ -5,7 +5,7 @@ const cron    = require("node-cron");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.11.0-fcc-no-beeper";
+const VERSION      = "4.12.0-fcc-resilient";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -15,6 +15,12 @@ const ALLOWED_USERS = (process.env.ALLOWED_USERS || "")
 
 const MORNING_PUSH_USERS = (process.env.MORNING_PUSH_USERS || "156632707")
   .split(",").map(s => parseInt(s.trim())).filter(Boolean);
+
+// Anton TG ID (optional). If set, /digest can forward to him on demand.
+// To enable: set ANTON_TG_ID env var on cooperative-freedom service.
+const ANTON_TG_ID = process.env.ANTON_TG_ID
+  ? parseInt(process.env.ANTON_TG_ID.trim(), 10)
+  : null;
 
 const bot = new Bot(BOT_TOKEN);
 
@@ -99,6 +105,12 @@ const HK_DESCRIPTIONS = {
   "HK-9":  "Payroll / HR cross-border",
   "HK-10": "Compliance/analytics SaaS",
   "HK-11": "Media/news/research",
+};
+
+const NET_BADGE = {
+  "LI": "💼", "LinkedIn": "💼",
+  "TG": "✈️", "Telegram": "✈️",
+  "WA": "💚", "WhatsApp": "💚",
 };
 
 const TASK_PRIORITY_EMOJI = {
@@ -261,7 +273,45 @@ function renderTaskItem(item) {
   return renderTask(item.task);
 }
 
-// ── Fetch helpers (all via proxy now) ────────────────────────────────────────
+function renderCompletedTask(task) {
+  const lines = [];
+  const completedDate = task.completedAt ? daysAgo(task.completedAt) : null;
+  const dateLabel = completedDate ? ` · <i>${completedDate}</i>` : "";
+  const nameSafe = task.name.length > 80 ? task.name.slice(0, 77) + "..." : task.name;
+  lines.push(`✅ ${esc(nameSafe)}${dateLabel}`);
+  if (task.companyName) {
+    lines.push(`   🏢 ${esc(task.companyName)}`);
+  }
+  return lines.join("\n");
+}
+
+function renderReply(reply) {
+  const lines = [];
+  const networkBadge = NET_BADGE[reply.networkFull] || NET_BADGE[reply.network] || "💬";
+  const idle = reply.hoursIdle != null ? `${Math.round(reply.hoursIdle)}h` : "?";
+  const networkLabel = reply.networkFull || reply.network || "Chat";
+
+  lines.push(`${networkBadge} <b>${esc(reply.name)}</b> · ${esc(networkLabel)} · <b>${idle}</b>`);
+
+  const indent = "   ";
+  const snippet = (reply.lastMsgText || "").slice(0, 200);
+  if (snippet) {
+    lines.push(`${indent}<i>"${esc(snippet)}"</i>`);
+  }
+
+  if (reply.notion?.name) {
+    const t = tierFromCompany(reply.notion);
+    const parts = [`🟢 <b>${esc(reply.notion.name)}</b>`];
+    if (t && !t.hardKill) parts.push(`${t.tier} · ${t.score}`);
+    else if (reply.notion.bdScore != null) parts.push(`BD ${reply.notion.bdScore}`);
+    if (reply.notion.stage) parts.push(esc(reply.notion.stage));
+    lines.push(`${indent}${parts.join(" · ")}`);
+  }
+
+  return lines.join("\n");
+}
+
+// ── Fetch helpers ────────────────────────────────────────────────────────────
 
 async function fetchCalendar() {
   const t0 = Date.now();
@@ -312,6 +362,54 @@ async function fetchTasksToday({ limit = 20 } = {}) {
   }
 }
 
+async function fetchTasksCompleted({ days = 3, limit = 20 } = {}) {
+  const t0 = Date.now();
+  try {
+    const r = await axios.get(`${PROXY}/notion/tasks-completed`, {
+      params: { days, limit },
+      timeout: 12_000,
+    });
+    const tasks = Array.isArray(r.data?.tasks) ? r.data.tasks : [];
+    console.log(`[bot] completed-tasks fetched in ${Date.now() - t0}ms (${tasks.length})`);
+    return tasks;
+  } catch (err) {
+    console.error(`[bot] completed-tasks fetch failed in ${Date.now() - t0}ms:`, err.message);
+    return null;
+  }
+}
+
+// Try Beeper first; fall back to Messaging Hub if Beeper is offline.
+// Returns: { source: "beeper" | "messaging-hub", replies: [...] } or null on total failure.
+async function fetchRepliesWaitingResilient({ hoursIdle = 4, limit = 8, days = 7 } = {}) {
+  const t0 = Date.now();
+
+  // Try Beeper first
+  try {
+    const r = await axios.get(`${PROXY}/beeper/replies-waiting`, {
+      params: { hoursIdle, limit, days },
+      timeout: 15_000,
+    });
+    console.log(`[bot] beeper replies fetched in ${Date.now() - t0}ms`);
+    return { source: "beeper", replies: r.data?.replies || [] };
+  } catch (err) {
+    console.warn(`[bot] beeper failed in ${Date.now() - t0}ms (will fallback to hub):`, err.message);
+  }
+
+  // Beeper failed — fall back to Messaging Hub
+  const t1 = Date.now();
+  try {
+    const r = await axios.get(`${PROXY}/messaging-hub/replies-waiting`, {
+      params: { hoursIdle, limit, days },
+      timeout: 12_000,
+    });
+    console.log(`[bot] hub replies fetched in ${Date.now() - t1}ms`);
+    return { source: "messaging-hub", replies: r.data?.replies || [] };
+  } catch (err) {
+    console.error(`[bot] hub fetch failed in ${Date.now() - t1}ms:`, err.message);
+    return null;
+  }
+}
+
 // ── Section builders ─────────────────────────────────────────────────────────
 
 function buildCalendarSection(calendarRes) {
@@ -332,21 +430,59 @@ function buildCalendarSection(calendarRes) {
   );
 }
 
-function buildTasksSection(tasksData) {
+// New unified tasks section with completed-fallback.
+//
+// Logic:
+//   - If tasksData has overdue/today items → render normally.
+//   - If tasksData is empty AND completedTasks list is non-empty → show completed.
+//   - If both empty → return null (skip section entirely).
+function buildTasksSectionResilient(tasksData, completedTasks) {
   if (!tasksData || tasksData.__timeout) {
     return `📋 <b>Задачи</b>\n\n<i>⚠️ Notion не ответил по задачам.</i>`;
   }
-  if (!tasksData.items?.length) return null;
-  const { items, totalRaw, overdueRaw } = tasksData;
 
-  const counter = overdueRaw > 0
-    ? `<i>${totalRaw} задач · ${overdueRaw} просрочено</i>`
-    : `<i>${totalRaw} задач на сегодня</i>`;
+  // Has open/overdue tasks — render normally
+  if (tasksData.items?.length) {
+    const { items, totalRaw, overdueRaw } = tasksData;
+    const counter = overdueRaw > 0
+      ? `<i>${totalRaw} задач · ${overdueRaw} просрочено</i>`
+      : `<i>${totalRaw} задач на сегодня</i>`;
+    return (
+      `📋 <b>Задачи</b>  · ${counter}\n` +
+      `\n` +
+      items.map(renderTaskItem).join("\n\n")
+    );
+  }
+
+  // No open tasks — show completed fallback if available
+  if (Array.isArray(completedTasks) && completedTasks.length > 0) {
+    const top = completedTasks.slice(0, 8);
+    const overflow = completedTasks.length > top.length
+      ? `\n\n<i>...и ещё ${completedTasks.length - top.length} закрытых задач</i>`
+      : "";
+    return (
+      `✅ <b>Все задачи под контролем</b>  · <i>${completedTasks.length} закрыто за 3 дня</i>\n` +
+      `\n` +
+      top.map(renderCompletedTask).join("\n") +
+      overflow
+    );
+  }
+
+  // Nothing to show
+  return null;
+}
+
+function buildRepliesSection(repliesResult) {
+  if (!repliesResult) return null;
+  const { source, replies } = repliesResult;
+  if (!Array.isArray(replies) || replies.length === 0) return null;
+
+  const sourceLabel = source === "messaging-hub" ? " · <i>из Messaging Hub</i>" : "";
 
   return (
-    `📋 <b>Задачи</b>  · ${counter}\n` +
+    `💬 <b>Ждут ответа</b>  · <i>${replies.length} чатов &gt;4h</i>${sourceLabel}\n` +
     `\n` +
-    items.map(renderTaskItem).join("\n\n")
+    replies.map(renderReply).join("\n\n")
   );
 }
 
@@ -364,26 +500,58 @@ function buildStaleSection(stale) {
   );
 }
 
-function composeTodayDigest({ calendarRes, tasksData, stale }, { header } = {}) {
+// Stale-data warning — shown at TOP of digest when replies came from Hub
+const HUB_FALLBACK_DISCLAIMER =
+  `⚠️ <b>Внимание Anton</b>: данные мессенджеров могут быть частично неактуальными — ` +
+  `Pavel сейчас не подключен к Beeper. Когда подключение восстановится, Pavel пришлёт ` +
+  `актуальную сводку вручную.`;
+
+function composeTodayDigest(
+  { calendarRes, tasksData, stale, repliesResult, completedTasks },
+  { header, withDisclaimer = false } = {}
+) {
   const sections = [];
   if (header) sections.push(header);
+  if (withDisclaimer && repliesResult?.source === "messaging-hub") {
+    sections.push(HUB_FALLBACK_DISCLAIMER);
+  }
+
   sections.push(buildCalendarSection(calendarRes));
-  const tasksBlock = buildTasksSection(tasksData);
+
+  const tasksBlock = buildTasksSectionResilient(tasksData, completedTasks);
   if (tasksBlock) sections.push(tasksBlock);
+
+  const repliesBlock = buildRepliesSection(repliesResult);
+  if (repliesBlock) sections.push(repliesBlock);
+
   const staleBlock = buildStaleSection(stale);
   if (staleBlock) sections.push(staleBlock);
+
   return sections.join("\n\n━━━━━━━━━━━━━━━\n\n");
 }
 
 async function fetchTodayDigestData() {
   const t0 = Date.now();
-  const [calendarRes, tasksData, stale] = await Promise.all([
-    withTimeout(fetchCalendar(),                             20_000, "calendar"),
-    withTimeout(fetchTasksToday({ limit: 20 }),              15_000, "tasks"),
-    withTimeout(fetchStaleDeals({ days: 14, limit: 5 }),     15_000, "stale"),
+  const [calendarRes, tasksData, stale, repliesResult] = await Promise.all([
+    withTimeout(fetchCalendar(),                                                    20_000, "calendar"),
+    withTimeout(fetchTasksToday({ limit: 20 }),                                     15_000, "tasks"),
+    withTimeout(fetchStaleDeals({ days: 14, limit: 5 }),                            15_000, "stale"),
+    withTimeout(fetchRepliesWaitingResilient({ hoursIdle: 4, limit: 8, days: 7 }), 30_000, "replies"),
   ]);
+
+  // Only fetch completed-tasks fallback if open-tasks list is empty
+  let completedTasks = null;
+  if (tasksData && !tasksData.__timeout && (!tasksData.items || tasksData.items.length === 0)) {
+    completedTasks = await withTimeout(
+      fetchTasksCompleted({ days: 3, limit: 20 }),
+      12_000,
+      "completed-tasks"
+    );
+    if (completedTasks?.__timeout) completedTasks = null;
+  }
+
   console.log(`[bot] digest data fetched in ${Date.now() - t0}ms`);
-  return { calendarRes, tasksData, stale };
+  return { calendarRes, tasksData, stale, repliesResult, completedTasks };
 }
 
 // ── Commands ─────────────────────────────────────────────────────────────────
@@ -394,10 +562,11 @@ bot.command("start", ctx => guard(ctx, () => {
     `Версия: ${VERSION}\n\n` +
     `Команды:\n` +
     `/ping — health check\n` +
-    `/today — встречи + задачи + заглохшие сделки\n` +
+    `/today — встречи + задачи + сделки + replies\n` +
+    `/digest — собрать дайджест и переслать Anton'у\n` +
     `/tasks — открытые задачи\n` +
     `/stale — заглохшие сделки (>14d)\n` +
-    `/replies — ждут ответа Anton'а (через Beeper)\n\n` +
+    `/replies — ждут ответа Anton'а\n\n` +
     `Авто:\n` +
     `• Утренний дайджест 08:30 CET\n` +
     `• CRM auto-prewarm 23:00 и 08:00 CET`
@@ -418,17 +587,17 @@ bot.command("ping", ctx => guard(ctx, () => {
     `Версия: ${VERSION}\n` +
     `Uptime: ${uptimeStr}\n` +
     `Server: ${now.toISOString()}\n` +
+    `Anton TG ID: ${ANTON_TG_ID || "не задан (env ANTON_TG_ID)"}\n` +
     `Your TG ID: ${ctx.from?.id}`
   );
 }));
 
-// /today — single fetch, single edit
 bot.command("today", ctx => guard(ctx, async () => {
   const t0 = Date.now();
   const loadingMsg = await ctx.reply("⏳ Тяну дайджест...");
   try {
     const data = await fetchTodayDigestData();
-    const text = composeTodayDigest(data);
+    const text = composeTodayDigest(data, { withDisclaimer: false });
 
     await ctx.api.editMessageText(
       ctx.chat.id, loadingMsg.message_id, text,
@@ -447,6 +616,47 @@ bot.command("today", ctx => guard(ctx, async () => {
   }
 }));
 
+// /digest — manually compose digest and forward to Anton (with hub-fallback warning if needed)
+bot.command("digest", ctx => guard(ctx, async () => {
+  const loadingMsg = await ctx.reply("⏳ Собираю дайджест для Anton'а...");
+
+  if (!ANTON_TG_ID) {
+    return ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id,
+      `❌ ANTON_TG_ID не задан в env. Пока пришлю только тебе для теста.`
+    );
+  }
+
+  try {
+    const data = await fetchTodayDigestData();
+    const header = `☀️ <b>Дайджест от Loop OS</b> (отправлен Pavel вручную)`;
+    const text = composeTodayDigest(data, { header, withDisclaimer: true });
+
+    // Send to Anton
+    await bot.api.sendMessage(ANTON_TG_ID, text, {
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+    });
+
+    const hubNote = data.repliesResult?.source === "messaging-hub"
+      ? `\n\n⚠️ Replies взяты из Messaging Hub (Beeper offline) — Anton получил предупреждение.`
+      : "";
+
+    await ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id,
+      `✅ Дайджест отправлен Anton'у (TG ID ${ANTON_TG_ID}).${hubNote}`,
+      { parse_mode: "HTML" }
+    );
+  } catch (err) {
+    const errMsg = err.response?.data?.error || err.message;
+    console.error("[bot /digest] error:", errMsg);
+    await ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id,
+      `❌ Ошибка: ${esc(errMsg)}`
+    );
+  }
+}));
+
 bot.command("tasks", ctx => guard(ctx, async () => {
   const loadingMsg = await ctx.reply("⏳ Сканирую Tasks Tracker...");
   try {
@@ -458,13 +668,29 @@ bot.command("tasks", ctx => guard(ctx, async () => {
       );
     }
     if (!tasksData.items.length) {
+      // Fall back to completed tasks
+      const completed = await fetchTasksCompleted({ days: 3, limit: 20 });
+      if (Array.isArray(completed) && completed.length > 0) {
+        const top = completed.slice(0, 10);
+        const overflow = completed.length > top.length
+          ? `\n\n<i>...и ещё ${completed.length - top.length}</i>`
+          : "";
+        const text =
+          `✅ <b>Все задачи под контролем</b>  · <i>${completed.length} закрыто за 3 дня</i>\n\n` +
+          top.map(renderCompletedTask).join("\n") +
+          overflow;
+        return ctx.api.editMessageText(
+          ctx.chat.id, loadingMsg.message_id, text,
+          { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
+        );
+      }
       return ctx.api.editMessageText(
         ctx.chat.id, loadingMsg.message_id,
-        `✅ <b>Все задачи под контролем</b>\n\nНи одной задачи на сегодня или просроченной.`,
+        `✅ <b>Все задачи под контролем</b>\n\nНи открытых задач, ни закрытых за 3 дня.`,
         { parse_mode: "HTML" }
       );
     }
-    const text = buildTasksSection(tasksData);
+    const text = buildTasksSectionResilient(tasksData, null);
     return ctx.api.editMessageText(
       ctx.chat.id, loadingMsg.message_id, text,
       { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
@@ -513,43 +739,39 @@ bot.command("stale", ctx => guard(ctx, async () => {
 }));
 
 bot.command("replies", ctx => guard(ctx, async () => {
-  const loadingMsg = await ctx.reply("⏳ Сканирую мессенджеры (Beeper)...");
+  const loadingMsg = await ctx.reply("⏳ Сканирую мессенджеры...");
   try {
-    const r = await axios.get(`${PROXY}/beeper/replies-waiting`, {
-      params: { hoursIdle: 4, limit: 15, days: 7 },
-      timeout: 30_000,
-    });
-    const replies = r.data?.replies || [];
-    if (replies.length === 0) {
+    const result = await fetchRepliesWaitingResilient({ hoursIdle: 4, limit: 15, days: 7 });
+    if (!result) {
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Beeper и Messaging Hub оба недоступны.`
+      );
+    }
+    if (result.replies.length === 0) {
       return ctx.api.editMessageText(
         ctx.chat.id, loadingMsg.message_id,
         `✅ <b>Inbox чист</b>\n\nНет чатов где Anton ещё не ответил &gt;4h.`,
         { parse_mode: "HTML" }
       );
     }
-    const text = `💬 <b>Ждут ответа</b>  · <i>${replies.length} чатов &gt;4h</i>\n\n` +
-      replies.map(rep => {
-        const idle = rep.hoursIdle != null ? `${Math.round(rep.hoursIdle)}h` : "?";
-        const net = rep.networkFull || rep.network || "Chat";
-        const snippet = (rep.lastMsgText || "").slice(0, 150);
-        return `<b>${esc(rep.name)}</b> · ${esc(net)} · ${idle}\n   <i>"${esc(snippet)}"</i>`;
-      }).join("\n\n");
+    const block = buildRepliesSection(result);
     return ctx.api.editMessageText(
-      ctx.chat.id, loadingMsg.message_id, text,
+      ctx.chat.id, loadingMsg.message_id, block,
       { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
     );
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
     return ctx.api.editMessageText(
       ctx.chat.id, loadingMsg.message_id,
-      `❌ Beeper недоступен: ${esc(errMsg)}`
+      `❌ Ошибка: ${esc(errMsg)}`
     );
   }
 }));
 
 bot.on("message:text", ctx => guard(ctx, () => {
   return ctx.reply(
-    `Команды:\n/start  /ping  /today  /tasks  /stale  /replies`
+    `Команды:\n/start  /ping  /today  /digest  /tasks  /stale  /replies`
   );
 }));
 
@@ -567,7 +789,8 @@ async function sendMorningPush() {
   try {
     const data = await fetchTodayDigestData();
     const header = `☀️ <b>Доброе утро!</b> Дайджест на сегодня.`;
-    const text = composeTodayDigest(data, { header });
+    // Morning push always shows the disclaimer when replies came from Hub
+    const text = composeTodayDigest(data, { header, withDisclaimer: true });
     for (const userId of MORNING_PUSH_USERS) {
       try {
         await bot.api.sendMessage(userId, text, {
@@ -590,6 +813,7 @@ console.log("[cron] morning push registered (08:30 Europe/Prague, every day)");
 // ── Start ─────────────────────────────────────────────────────────────────────
 console.log(`[bot] Loop OS FCC ${VERSION} starting...`);
 console.log(`[bot] Proxy URL: ${PROXY}`);
+console.log(`[bot] Anton TG ID: ${ANTON_TG_ID || "(not set)"}`);
 console.log(`[bot] Morning push recipients: ${MORNING_PUSH_USERS.join(",") || "(none)"}`);
 bot.start().then(() => {
   console.log(`[bot] Loop OS FCC ${VERSION} started at ${STARTED_AT.toISOString()}`);

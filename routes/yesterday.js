@@ -16,6 +16,7 @@ const router = express.Router();
 
 const MESSAGES_HUB_DB     = "8617a441c4254b41be671a1e65946a03";
 const NOTION_COMPANIES_DB = "f9b59c5b05fa4df18f9569479633fd74";
+const NOTION_PEOPLE_DB    = "f36b2a0f0ab241cebbdbd1d0874a55be";
 const ANTHROPIC_KEY       = process.env.ANTHROPIC_API_KEY;
 
 const LATE_STAGES = new Set([
@@ -103,27 +104,133 @@ function extractLookupCandidate(chatName) {
   return candidate;
 }
 
+// Extract a person-name candidate from a chat name. Different from
+// extractLookupCandidate which prefers the company-side after "|".
+// For people lookup we want the FULL person name (typically before "|"
+// or the whole name for direct DMs).
+//
+//   "Patrick Chu | Agora"  → "Patrick Chu"  (person side, before |)
+//   "Maximilian Bruckner"  → "Maximilian Bruckner"
+//   "Renna Ba | Morph"     → "Renna Ba"
+//   "Plexo <> Bridge"      → null (no person hint)
+//   "Hector Ramirez | Bitso Business" → "Hector Ramirez"
+function extractPersonCandidate(chatName) {
+  if (!chatName) return null;
+  let s = String(chatName).trim();
+
+  // Skip group-chat patterns
+  if (/^Plexo\s*[<>x×|]/i.test(s)) return null;
+
+  // Take left side of "|" / "—" / "–" if present
+  const sepMatch = s.match(/^(.+?)\s*[|—–]\s*/);
+  if (sepMatch && sepMatch[1].trim().length >= 3) {
+    s = sepMatch[1].trim();
+  }
+
+  // Person should be 2+ words (first + last name)
+  const tokens = s.split(/\s+/).filter(Boolean);
+  if (tokens.length < 1) return null;
+  // Single-token names are still usable (e.g. "Modupe", "Polina")
+  // but skip if it's a generic word
+  if (tokens.length === 1 && GENERIC_SEED_WORDS.has(tokens[0].toLowerCase())) return null;
+
+  return tokens.slice(0, 3).join(" "); // First 3 tokens max — drops emoji/badges
+}
+
+// Resolve a Notion company page by ID — returns {name, stage, bdScore} or null.
+// Used by People-fallback path.
+async function resolveCompanyPage(pageId) {
+  try {
+    const r = await axios.get(
+      `https://api.notion.com/v1/pages/${pageId}`,
+      { headers: notionHeaders(), timeout: 6_000 }
+    );
+    const props = r.data.properties || {};
+    const titleArr = props["Company name"]?.title || [];
+    const cname = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
+    const stage = props["Stage"]?.status?.name || null;
+    const bdScore = props["BD Score"]?.number ?? null;
+    const skipStages = new Set(["Lost", "DELETE", "Not relevant"]);
+    if (stage && skipStages.has(stage)) return null;
+    return { name: cname, stage, bdScore };
+  } catch (err) {
+    console.warn(`[yesterday/lookup] resolveCompanyPage(${pageId}) failed:`, err.message);
+    return null;
+  }
+}
+
+// Look up a person in People DB by name — returns linked Company stage info.
+// Falls back to null if not found, person has no Company relation, or company
+// is in a skip-stage.
+async function lookupPersonStage(personCandidate) {
+  if (!NOTION_TOKEN || !personCandidate) return null;
+  try {
+    // Search by first token (more permissive for fuzzy matches)
+    const firstToken = personCandidate.split(/\s+/)[0];
+    if (!firstToken || firstToken.length < 3) return null;
+
+    const r = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_PEOPLE_DB}/query`,
+      {
+        filter: { property: "Name", title: { contains: firstToken } },
+        page_size: 5,
+      },
+      { headers: notionHeaders(), timeout: 8_000 }
+    );
+
+    if (!r.data.results.length) return null;
+
+    // Prefer the one whose name CONTAINS the full personCandidate (case-insensitive)
+    const lowerCandidate = personCandidate.toLowerCase();
+    const exactMatch = r.data.results.find(page => {
+      const titleArr = page.properties?.Name?.title || [];
+      const fullName = titleArr.map(t => t.plain_text || t.text?.content || "").join("").toLowerCase();
+      return fullName.includes(lowerCandidate) || lowerCandidate.includes(fullName);
+    });
+    const person = exactMatch || r.data.results[0];
+
+    const companyRel = person.properties?.Company?.relation || [];
+    if (!companyRel.length) return null;
+
+    // First linked company — resolve it
+    const companyInfo = await resolveCompanyPage(companyRel[0].id);
+    return companyInfo;
+  } catch (err) {
+    console.warn(`[yesterday/lookup] person lookup failed for "${personCandidate}":`, err.message);
+    return null;
+  }
+}
+
 async function batchLookupCRMStages(chatNames) {
   if (!NOTION_TOKEN) return new Map();
 
   const result = new Map();
   const candidateToChatNames = new Map();
+  const personCandidateToChatNames = new Map();
 
   for (const name of chatNames) {
     const cand = extractLookupCandidate(name);
-    if (!cand) {
-      result.set(name, null);
-      continue;
+    if (cand) {
+      const key = cand.toLowerCase();
+      if (!candidateToChatNames.has(key)) {
+        candidateToChatNames.set(key, { candidate: cand, names: [] });
+      }
+      candidateToChatNames.get(key).names.push(name);
     }
-    const key = cand.toLowerCase();
-    if (!candidateToChatNames.has(key)) {
-      candidateToChatNames.set(key, { candidate: cand, names: [] });
+    // Always also try person-lookup as a fallback later
+    const personCand = extractPersonCandidate(name);
+    if (personCand) {
+      const pKey = personCand.toLowerCase();
+      if (!personCandidateToChatNames.has(pKey)) {
+        personCandidateToChatNames.set(pKey, { candidate: personCand, names: [] });
+      }
+      personCandidateToChatNames.get(pKey).names.push(name);
     }
-    candidateToChatNames.get(key).names.push(name);
   }
 
-  console.log(`[yesterday/lookup] ${chatNames.length} chats → ${candidateToChatNames.size} unique candidates`);
+  console.log(`[yesterday/lookup] ${chatNames.length} chats → ${candidateToChatNames.size} company candidates, ${personCandidateToChatNames.size} person candidates`);
 
+  // ── PASS 1: Company-name lookup ──
   await Promise.all([...candidateToChatNames.values()].map(async ({ candidate, names }) => {
     try {
       const r = await axios.post(
@@ -145,17 +252,45 @@ async function batchLookupCRMStages(chatNames) {
       }).filter(c => !skipStages.has(c.stage));
 
       const best = candidates[0] || null;
-      console.log(`[yesterday/lookup] "${candidate}" → ${best ? `"${best.name}" (${best.stage})` : "NO MATCH"}`);
-      for (const chatName of names) {
-        result.set(chatName, best);
+      if (best) {
+        console.log(`[yesterday/lookup] company "${candidate}" → "${best.name}" (${best.stage})`);
+        for (const chatName of names) {
+          result.set(chatName, best);
+        }
       }
     } catch (err) {
-      console.warn(`[yesterday/lookup] failed for "${candidate}":`, err.message);
-      for (const chatName of names) {
-        result.set(chatName, null);
-      }
+      console.warn(`[yesterday/lookup] company lookup failed for "${candidate}":`, err.message);
     }
   }));
+
+  // ── PASS 2: People-fallback for chats not yet matched ──
+  // For each chat that didn't get a Company match, try People DB lookup.
+  const unmatchedPersonLookups = [];
+  for (const [pKey, { candidate, names }] of personCandidateToChatNames) {
+    const allNamesAlreadyMatched = names.every(n => result.has(n));
+    if (allNamesAlreadyMatched) continue;
+    unmatchedPersonLookups.push({ candidate, names });
+  }
+
+  if (unmatchedPersonLookups.length > 0) {
+    console.log(`[yesterday/lookup] trying People-fallback for ${unmatchedPersonLookups.length} candidates`);
+    await Promise.all(unmatchedPersonLookups.map(async ({ candidate, names }) => {
+      const stageInfo = await lookupPersonStage(candidate);
+      if (stageInfo) {
+        console.log(`[yesterday/lookup] person "${candidate}" → "${stageInfo.name}" (${stageInfo.stage})`);
+        for (const chatName of names) {
+          if (!result.has(chatName)) result.set(chatName, stageInfo);
+        }
+      } else {
+        console.log(`[yesterday/lookup] person "${candidate}" → NO MATCH`);
+      }
+    }));
+  }
+
+  // Fill nulls for chats that didn't match anything
+  for (const name of chatNames) {
+    if (!result.has(name)) result.set(name, null);
+  }
 
   return result;
 }
@@ -198,26 +333,6 @@ function getYesterdayWindow() {
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// fetchYesterdayFromBeeper — v3.18.2 fix
-//
-// PREVIOUS BUG: filtered chats by `c.lastMessageAt || c.lastActivityAt` from
-// /v1/chats response, but Beeper's REST endpoint actually returns these
-// fields as null/undefined for many chats. Result: all 200 chats dropped at
-// stage 1, totalBefore=0, "Активности не было".
-//
-// NEW LOGIC:
-//   1) Get all chats from /v1/chats (no time-based pre-filter)
-//   2) Drop SKIP_CHAT_NAME_REGEX matches (community/spam channels) early
-//   3) For top N most likely candidates (sorted by any available time
-//      hint, fallback to insertion order from Beeper which is recency-based),
-//      fetch their messages and filter messages by yesterday window timestamp
-//   4) Keep chats that have at least one in-window message
-//
-// Cap N at 60 to keep latency acceptable. Beeper returns chats in recency
-// order so first 60 will cover yesterday + day before easily.
-// ─────────────────────────────────────────────────────────────────────────────
-
 const MAX_CHATS_TO_INSPECT = 60;
 
 async function fetchYesterdayFromBeeper({ startISO, endISO }) {
@@ -231,7 +346,6 @@ async function fetchYesterdayFromBeeper({ startISO, endISO }) {
 
   console.log(`[yesterday/beeper] /v1/chats returned ${items.length} chats`);
 
-  // Drop SKIP_REGEX matches early — saves message fetches for spam channels
   const candidates = items.filter(c => {
     const name = c.title || c.name || "";
     if (SKIP_CHAT_NAME_REGEX.test(name)) return false;
@@ -240,17 +354,13 @@ async function fetchYesterdayFromBeeper({ startISO, endISO }) {
 
   console.log(`[yesterday/beeper] ${candidates.length} after skip-regex (was ${items.length})`);
 
-  // Sort by best-available time hint, fallback to original Beeper order
-  // (which is recency-based — newest first).
-  // Note: even if lastMessageAt is null for some, this gives a reasonable
-  // ordering; we then take top N.
   const sorted = candidates.slice().sort((a, b) => {
     const ta = Date.parse(a.lastMessageAt || a.lastActivityAt || a.updatedAt || 0);
     const tb = Date.parse(b.lastMessageAt || b.lastActivityAt || b.updatedAt || 0);
     if (!isNaN(ta) && !isNaN(tb)) return tb - ta;
     if (!isNaN(ta)) return -1;
     if (!isNaN(tb)) return 1;
-    return 0; // both unknown, preserve order
+    return 0;
   });
 
   const toInspect = sorted.slice(0, MAX_CHATS_TO_INSPECT);
@@ -303,14 +413,11 @@ async function fetchYesterdayFromBeeper({ startISO, endISO }) {
   if (survived.length > 0) {
     console.log(`[yesterday/beeper] survivors: ${survived.slice(0, 10).map(c => `"${c.name}"`).join(", ")}`);
   }
-  // Diagnostic: if zero survived, log a few sample chat msg-totals to see
-  // whether messages aren't being fetched, or parsing is failing.
   if (survived.length === 0 && enriched.length > 0) {
     const samples = enriched.slice(0, 5).map(c => `"${c.name}" msgs=${c._msgsTotal} parseFailures=${c._parseFailures}`);
     console.log(`[yesterday/beeper] ZERO survivors — samples: ${samples.join(", ")}`);
   }
 
-  // Strip diagnostic fields before returning
   return survived.map(({ _msgsTotal, _parseFailures, ...rest }) => rest);
 }
 
@@ -481,12 +588,50 @@ function pickTopChats(group, n = 3) {
   });
 }
 
+// Non-AI fallback summary — generates simple bullets from items metadata
+// without calling Anthropic. Used when AI is unavailable / errored.
+//
+// Strategy: highlight outbound (Anton initiated something) and high-stage
+// inbound (counterparty in Negotiations/Call Scheduled responded). Keep it
+// short and factual — no inferences.
+function generateFallbackSummary(items) {
+  if (!items.length) return { bullets: [], skipped: true, fallback: true };
+
+  // Sort items by importance: stage rank first, then outbound count, then chat name
+  const ranked = items.slice().sort((a, b) => {
+    const stageA = a.crm?.stage ? (STAGE_RANK[a.crm.stage] || 0) : 0;
+    const stageB = b.crm?.stage ? (STAGE_RANK[b.crm.stage] || 0) : 0;
+    if (stageA !== stageB) return stageB - stageA;
+    const outA = a.messages.filter(m => m.direction === "out").length;
+    const outB = b.messages.filter(m => m.direction === "out").length;
+    return outB - outA;
+  });
+
+  const bullets = [];
+  for (const item of ranked.slice(0, 5)) {
+    const stageInfo = item.crm?.stage
+      ? `${item.crm.companyName || item.chatName.split(/\s*[|—–]\s*/)[0]}, ${item.crm.stage}`
+      : item.chatName;
+
+    const outbound = item.messages.filter(m => m.direction === "out");
+    const inbound  = item.messages.filter(m => m.direction === "in");
+
+    if (outbound.length > 0 && inbound.length === 0) {
+      bullets.push(`Anton отправил сообщение: ${stageInfo}`);
+    } else if (inbound.length > 0 && outbound.length === 0) {
+      bullets.push(`Входящее от ${stageInfo} — нужен ответ`);
+    } else {
+      bullets.push(`Активный диалог: ${stageInfo} (${outbound.length} out, ${inbound.length} in)`);
+    }
+  }
+
+  return { bullets, fallback: true };
+}
+
 async function summarizeNetwork(networkHeader, items) {
   if (!ANTHROPIC_KEY) {
-    return {
-      bullets: ["⚠️ ANTHROPIC_API_KEY не задан — AI-summary недоступен"],
-      error: "no-api-key",
-    };
+    console.log(`[yesterday/summary] no ANTHROPIC_KEY — using fallback for ${networkHeader}`);
+    return generateFallbackSummary(items);
   }
   if (items.length === 0) {
     return { bullets: [], skipped: true };
@@ -556,10 +701,10 @@ ${conversationText}
     return { bullets };
   } catch (err) {
     console.error(`[yesterday/summary] AI failed for ${networkHeader}:`, err.message);
-    return {
-      bullets: ["⚠️ AI summary недоступен — см. список чатов ниже"],
-      error: err.message,
-    };
+    // Fallback to non-AI summary instead of error message
+    const fallback = generateFallbackSummary(items);
+    fallback.aiError = err.message;
+    return fallback;
   }
 }
 
@@ -651,19 +796,26 @@ router.get("/summary", async (req, res) => {
 
   let filteredChats = chats;
   let dropped = 0;
-  if (lateStagesOnly && chats.length > 0) {
+  let crmMap = new Map();
+  if (chats.length > 0) {
+    // Always run CRM lookup — even when filter is off — so topChats can show stage
     const chatNames = chats.map(c => c.name).filter(Boolean);
-    const crmMap = await batchLookupCRMStages(chatNames);
+    crmMap = await batchLookupCRMStages(chatNames);
     const enriched = chats.map(c => ({ ...c, crm: crmMap.get(c.name) || null }));
-    filteredChats = filterByImportance(enriched);
-    dropped = totalBeforeFilter - filteredChats.length;
-    console.log(`[yesterday] CRM filter: ${totalBeforeFilter} → ${filteredChats.length} (dropped ${dropped})`);
-    if (dropped > 0) {
-      const droppedSamples = enriched
-        .filter(c => c.crm && c.crm.stage && !LATE_STAGES.has(c.crm.stage))
-        .slice(0, 10)
-        .map(c => `"${c.name}" (${c.crm.stage})`);
-      console.log(`[yesterday] dropped samples: ${droppedSamples.join(", ")}`);
+
+    if (lateStagesOnly) {
+      filteredChats = filterByImportance(enriched);
+      dropped = totalBeforeFilter - filteredChats.length;
+      console.log(`[yesterday] CRM filter: ${totalBeforeFilter} → ${filteredChats.length} (dropped ${dropped})`);
+      if (dropped > 0) {
+        const droppedSamples = enriched
+          .filter(c => c.crm && c.crm.stage && !LATE_STAGES.has(c.crm.stage))
+          .slice(0, 10)
+          .map(c => `"${c.name}" (${c.crm.stage})`);
+        console.log(`[yesterday] dropped samples: ${droppedSamples.join(", ")}`);
+      }
+    } else {
+      filteredChats = enriched;
     }
   }
 

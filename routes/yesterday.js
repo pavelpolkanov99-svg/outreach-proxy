@@ -198,6 +198,28 @@ function getYesterdayWindow() {
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// fetchYesterdayFromBeeper — v3.18.2 fix
+//
+// PREVIOUS BUG: filtered chats by `c.lastMessageAt || c.lastActivityAt` from
+// /v1/chats response, but Beeper's REST endpoint actually returns these
+// fields as null/undefined for many chats. Result: all 200 chats dropped at
+// stage 1, totalBefore=0, "Активности не было".
+//
+// NEW LOGIC:
+//   1) Get all chats from /v1/chats (no time-based pre-filter)
+//   2) Drop SKIP_CHAT_NAME_REGEX matches (community/spam channels) early
+//   3) For top N most likely candidates (sorted by any available time
+//      hint, fallback to insertion order from Beeper which is recency-based),
+//      fetch their messages and filter messages by yesterday window timestamp
+//   4) Keep chats that have at least one in-window message
+//
+// Cap N at 60 to keep latency acceptable. Beeper returns chats in recency
+// order so first 60 will cover yesterday + day before easily.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MAX_CHATS_TO_INSPECT = 60;
+
 async function fetchYesterdayFromBeeper({ startISO, endISO }) {
   if (!BEEPER_TOKEN) throw new Error("BEEPER_TOKEN not set");
 
@@ -209,34 +231,45 @@ async function fetchYesterdayFromBeeper({ startISO, endISO }) {
 
   console.log(`[yesterday/beeper] /v1/chats returned ${items.length} chats`);
 
-  const startMs = Date.parse(startISO);
-  const endMs = Date.parse(endISO);
-  const recentChats = items.filter(c => {
-    const ts = c.lastMessageAt || c.lastActivityAt || c.updatedAt;
-    if (!ts) return false;
-    const tsMs = Date.parse(ts);
-    return !isNaN(tsMs) && tsMs >= startMs && tsMs < endMs;
+  // Drop SKIP_REGEX matches early — saves message fetches for spam channels
+  const candidates = items.filter(c => {
+    const name = c.title || c.name || "";
+    if (SKIP_CHAT_NAME_REGEX.test(name)) return false;
+    return true;
   });
 
-  console.log(`[yesterday/beeper] ${recentChats.length} chats in yesterday window (${startISO} → ${endISO})`);
-  if (recentChats.length > 0) {
-    console.log(`[yesterday/beeper] in-window chats: ${recentChats.slice(0, 10).map(c => `"${c.title || c.name}" @ ${c.lastMessageAt || c.lastActivityAt}`).join(", ")}`);
-  }
+  console.log(`[yesterday/beeper] ${candidates.length} after skip-regex (was ${items.length})`);
 
-  const enriched = await Promise.all(recentChats.map(async c => {
+  // Sort by best-available time hint, fallback to original Beeper order
+  // (which is recency-based — newest first).
+  // Note: even if lastMessageAt is null for some, this gives a reasonable
+  // ordering; we then take top N.
+  const sorted = candidates.slice().sort((a, b) => {
+    const ta = Date.parse(a.lastMessageAt || a.lastActivityAt || a.updatedAt || 0);
+    const tb = Date.parse(b.lastMessageAt || b.lastActivityAt || b.updatedAt || 0);
+    if (!isNaN(ta) && !isNaN(tb)) return tb - ta;
+    if (!isNaN(ta)) return -1;
+    if (!isNaN(tb)) return 1;
+    return 0; // both unknown, preserve order
+  });
+
+  const toInspect = sorted.slice(0, MAX_CHATS_TO_INSPECT);
+  console.log(`[yesterday/beeper] inspecting top ${toInspect.length} chats for messages`);
+
+  const startMs = Date.parse(startISO);
+  const endMs = Date.parse(endISO);
+
+  const enriched = await Promise.all(toInspect.map(async c => {
     let messagesYesterday = [];
     let msgsTotal = 0;
-    let msgsFirstTs = null;
-    let msgsLastTs = null;
     let parseFailures = 0;
     try {
       const msgs = await beeperGetMessages(c.id, 8);
       msgsTotal = msgs.length;
-      if (msgs[0]) msgsFirstTs = msgs[0].timestamp;
-      if (msgs[msgs.length - 1]) msgsLastTs = msgs[msgs.length - 1].timestamp;
 
       messagesYesterday = msgs.filter(m => {
-        const tsMs = Date.parse(m.timestamp || 0);
+        const ts = m.timestamp;
+        const tsMs = typeof ts === "number" ? ts : Date.parse(ts || 0);
         if (isNaN(tsMs)) {
           parseFailures++;
           return false;
@@ -252,8 +285,6 @@ async function fetchYesterdayFromBeeper({ startISO, endISO }) {
       console.warn(`[yesterday/beeper] msg fetch failed for "${c.title || c.name}":`, e.message);
     }
 
-    console.log(`[yesterday/beeper] "${c.title || c.name}": fetched ${msgsTotal} msgs (firstTs=${msgsFirstTs}, lastTs=${msgsLastTs}, parseFailures=${parseFailures}) → ${messagesYesterday.length} in window`);
-
     return {
       id: c.id,
       name: c.title || c.name || "",
@@ -261,17 +292,26 @@ async function fetchYesterdayFromBeeper({ startISO, endISO }) {
       accountID: c.accountID,
       networkFull: networkFromAccountID(c.accountID),
       messagesYesterday,
+      _msgsTotal: msgsTotal,
+      _parseFailures: parseFailures,
     };
   }));
 
-  const survived = enriched.filter(c =>
-    c.messagesYesterday.length > 0 &&
-    !SKIP_CHAT_NAME_REGEX.test(c.name)
-  );
+  const survived = enriched.filter(c => c.messagesYesterday.length > 0);
 
-  console.log(`[yesterday/beeper] after msg-filter + skip-regex: ${survived.length}/${enriched.length} chats`);
+  console.log(`[yesterday/beeper] ${survived.length}/${enriched.length} chats have messages in window`);
+  if (survived.length > 0) {
+    console.log(`[yesterday/beeper] survivors: ${survived.slice(0, 10).map(c => `"${c.name}"`).join(", ")}`);
+  }
+  // Diagnostic: if zero survived, log a few sample chat msg-totals to see
+  // whether messages aren't being fetched, or parsing is failing.
+  if (survived.length === 0 && enriched.length > 0) {
+    const samples = enriched.slice(0, 5).map(c => `"${c.name}" msgs=${c._msgsTotal} parseFailures=${c._parseFailures}`);
+    console.log(`[yesterday/beeper] ZERO survivors — samples: ${samples.join(", ")}`);
+  }
 
-  return survived;
+  // Strip diagnostic fields before returning
+  return survived.map(({ _msgsTotal, _parseFailures, ...rest }) => rest);
 }
 
 async function fetchYesterdayFromHub({ startISO, endISO }) {

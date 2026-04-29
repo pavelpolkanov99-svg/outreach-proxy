@@ -5,7 +5,7 @@ const cron    = require("node-cron");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.15.0-message-splitting";
+const VERSION      = "4.16.0-stale-snippets";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -62,15 +62,7 @@ function withTimeout(promise, ms, label) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Message splitting — Telegram has a 4096-char hard limit on message bodies,
-// and digests with the yesterday-summary block routinely exceed that.
-//
-// Strategy: split on the section separator "━━━━━━━━━━━━━━━" (3 newlines on
-// each side). If a single section is somehow still too long after splitting,
-// fall back to a hard slice with a continuation marker.
-//
-// MAX_MESSAGE_LEN — 4000 leaves headroom for HTML entity expansion at parse
-// time and the occasional emoji that occupies more bytes than expected.
+// Message splitting — Telegram has a 4096-char hard limit on message bodies.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MAX_MESSAGE_LEN = 4000;
@@ -84,7 +76,6 @@ function splitForTelegram(text) {
   let current = "";
 
   for (const section of sections) {
-    // If adding this section would overflow, flush current chunk first.
     const wouldBe = current
       ? current + SECTION_SEP + section
       : section;
@@ -93,24 +84,20 @@ function splitForTelegram(text) {
       continue;
     }
 
-    // Flush current
     if (current) {
       chunks.push(current);
       current = "";
     }
 
-    // Section alone fits
     if (section.length <= MAX_MESSAGE_LEN) {
       current = section;
       continue;
     }
 
-    // Section is itself too big — hard-slice it with continuation markers.
     let remaining = section;
     while (remaining.length > MAX_MESSAGE_LEN) {
-      // Try to find a newline before the cutoff to slice cleanly
       let cutAt = remaining.lastIndexOf("\n", MAX_MESSAGE_LEN);
-      if (cutAt < MAX_MESSAGE_LEN / 2) cutAt = MAX_MESSAGE_LEN; // no good newline; hard cut
+      if (cutAt < MAX_MESSAGE_LEN / 2) cutAt = MAX_MESSAGE_LEN;
       chunks.push(remaining.slice(0, cutAt));
       remaining = remaining.slice(cutAt).trimStart();
     }
@@ -121,8 +108,6 @@ function splitForTelegram(text) {
   return chunks;
 }
 
-// Edit the loading message with the first chunk, then send rest as new messages.
-// Returns the array of message_ids that were created/edited.
 async function editAndSplit(ctx, loadingMsg, fullText, opts = {}) {
   const chunks = splitForTelegram(fullText);
   const sendOpts = {
@@ -131,18 +116,15 @@ async function editAndSplit(ctx, loadingMsg, fullText, opts = {}) {
     ...opts,
   };
 
-  // First chunk replaces the loading message
   await ctx.api.editMessageText(
     ctx.chat.id, loadingMsg.message_id, chunks[0], sendOpts
   );
 
-  // Subsequent chunks as new messages
   for (let i = 1; i < chunks.length; i++) {
     await ctx.api.sendMessage(ctx.chat.id, chunks[i], sendOpts);
   }
 }
 
-// Send digest as a series of split messages to a user (used by morning push and /digest→Anton path).
 async function sendSplit(userId, fullText, opts = {}) {
   const chunks = splitForTelegram(fullText);
   const sendOpts = {
@@ -304,6 +286,16 @@ function renderEvent(ev) {
   return lines.join("\n");
 }
 
+// Stale-deal block. New layout (v4.16):
+//
+//   🟡 <b>Belo</b> · Negotiations
+//      MH · 9 · Partnership
+//      📅 Нет активности 25д
+//      💬 "last activity snippet from Notes / People"
+//
+// `daysStale` is shown on its own line as the headline complaint.
+// `lastActivitySnippet` (from /notion/stale-deals-enriched) is shown
+// below it when available — answers the question "что было 25 дней назад?"
 function renderStaleDeal(deal) {
   const lines = [];
   const stage = deal.stage || "";
@@ -311,8 +303,7 @@ function renderStaleDeal(deal) {
   const emoji = isHotStage ? "🔴" : "🟡";
 
   const stagePart = stage ? ` · ${esc(stage)}` : "";
-  const stalePart = deal.daysStale != null ? ` · <b>${deal.daysStale}d</b>` : "";
-  lines.push(`${emoji} <b>${esc(deal.name)}</b>${stagePart}${stalePart}`);
+  lines.push(`${emoji} <b>${esc(deal.name)}</b>${stagePart}`);
 
   const indent = "   ";
   const t = tierFromCompany(deal);
@@ -323,9 +314,14 @@ function renderStaleDeal(deal) {
   if (deal.pipeline) ctxParts.push(deal.pipeline);
   if (ctxParts.length) lines.push(`${indent}<i>${ctxParts.map(esc).join(" · ")}</i>`);
 
-  const lastTouch = daysAgo(deal.lastContact);
-  if (lastTouch && lastTouch !== "today") {
-    lines.push(`${indent}📅 last contact: ${esc(lastTouch)} ago`);
+  // Activity gap line — always show if we have daysStale
+  if (deal.daysStale != null) {
+    lines.push(`${indent}📅 <b>Нет активности ${deal.daysStale}д</b>`);
+  }
+
+  // Last activity snippet from Notes (or null)
+  if (deal.lastActivitySnippet) {
+    lines.push(`${indent}💬 <i>"${esc(deal.lastActivitySnippet)}"</i>`);
   }
 
   return lines.join("\n");
@@ -424,17 +420,31 @@ async function fetchCalendar() {
   }
 }
 
+// Switched to /stale-deals-enriched (v3.17) which adds `lastActivitySnippet`.
+// Falls back to /stale-deals if enriched endpoint fails.
 async function fetchStaleDeals({ days = 14, limit = 5 } = {}) {
   const t0 = Date.now();
+  try {
+    const r = await axios.get(`${PROXY}/notion/stale-deals-enriched`, {
+      params: { days, limit },
+      timeout: 18_000,
+    });
+    console.log(`[bot] stale-enriched fetched in ${Date.now() - t0}ms`);
+    return r.data?.deals || [];
+  } catch (err) {
+    console.warn(`[bot] stale-enriched failed in ${Date.now() - t0}ms (will try plain):`, err.message);
+  }
+
+  const t1 = Date.now();
   try {
     const r = await axios.get(`${PROXY}/notion/stale-deals`, {
       params: { days, limit },
       timeout: 15_000,
     });
-    console.log(`[bot] stale fetched in ${Date.now() - t0}ms`);
+    console.log(`[bot] stale (plain) fetched in ${Date.now() - t1}ms`);
     return r.data?.deals || [];
   } catch (err) {
-    console.error(`[bot] stale fetch failed in ${Date.now() - t0}ms:`, err.message);
+    console.error(`[bot] stale (plain) failed in ${Date.now() - t1}ms:`, err.message);
     return null;
   }
 }
@@ -695,7 +705,7 @@ async function fetchTodayDigestData() {
   const [calendarRes, tasksData, stale, repliesResult, yesterdaySummary] = await Promise.all([
     withTimeout(fetchCalendar(),                                                    20_000, "calendar"),
     withTimeout(fetchTasksToday({ limit: 20 }),                                     15_000, "tasks"),
-    withTimeout(fetchStaleDeals({ days: 14, limit: 5 }),                            15_000, "stale"),
+    withTimeout(fetchStaleDeals({ days: 14, limit: 5 }),                            20_000, "stale"),
     withTimeout(fetchRepliesWaitingResilient({ hoursIdle: 4, limit: 8, days: 7 }), 30_000, "replies"),
     withTimeout(fetchYesterdaySummary(),                                            65_000, "yesterday"),
   ]);

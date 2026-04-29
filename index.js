@@ -29,6 +29,7 @@ app.use("/calendar",       require("./routes/calendar"));
 app.use("/webhook",        require("./routes/webhooks"));
 app.use("/mcp",            require("./routes/mcp")); // ← Custom Connector endpoint for claude.ai
 app.use("/messaging-hub",  require("./routes/messaging-hub")); // ← Beeper fallback (Notion source)
+app.use("/yesterday",      require("./routes/yesterday"));     // ← "What happened yesterday" digest
 
 // ── Beeper sync job (mounted under /beeper/*) ─────────────────────────────────
 const beeperSync = require("./jobs/beeper-sync");
@@ -50,9 +51,9 @@ app.get("/health", (_, res) => res.json({
   calendar: GOOGLE_OAUTH,
   apollo:   !!process.env.APOLLO_KEY,
   mcp:      true,
-  version:  "3.15.0",
+  version:  "3.16.0",
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.15.0", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.16.0", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

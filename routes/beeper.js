@@ -183,23 +183,13 @@ router.get("/digest", async (req, res) => {
 
 const GROUP_PARTICIPANT_LIMIT = 20;
 
-// Parse "Chat on X with A, B, C, & N others." style text from Beeper get_chat
-// into a participant count. Returns null if no count signal found.
-//
-// Examples:
-//   "Chat on WA with +1, +2, +3, & 22 others."  → 3 + 22 = 25
-//   "Chat on TG with Alice, Bob, & 1 other."    → 2 + 1 = 3
-//   "Chat on TG with Alice, Bob, Charlie."      → 3
-//   "Chat on TG with Alice."                    → 1
 function parseParticipantCountFromText(rawText) {
   if (!rawText || typeof rawText !== "string") return null;
 
-  // Look for "with [...stuff...]" up to first sentence-ending period
   const withMatch = rawText.match(/with\s+([^.]+)\.?/i);
   if (!withMatch) return null;
   const listPart = withMatch[1].trim();
 
-  // Pattern A: "X, Y, Z, & N others" or "X, Y, & N other"
   const othersMatch = listPart.match(/&\s+(\d+)\s+others?/i);
   if (othersMatch) {
     const namedBeforeOthers = listPart
@@ -210,13 +200,10 @@ function parseParticipantCountFromText(rawText) {
     return namedBeforeOthers.length + parseInt(othersMatch[1], 10);
   }
 
-  // Pattern B: just a comma-separated name list, no "others"
   const names = listPart.split(",").map(s => s.trim()).filter(Boolean);
   return names.length || null;
 }
 
-// Fetch participant count for a group via MCP get_chat. Returns null on error
-// (treat as "unknown — keep the chat" rather than dropping).
 async function getParticipantCount(chatID) {
   try {
     const rpcBody = {
@@ -239,8 +226,6 @@ async function getParticipantCount(chatID) {
     const rawText = textBlock?.text || (typeof content === "string" ? content : null);
     if (!rawText) return null;
 
-    // Beeper returns plain text describing the chat — parse it directly.
-    // Falls back to JSON parsing for older / structured responses.
     const fromText = parseParticipantCountFromText(rawText);
     if (fromText != null) return fromText;
 
@@ -330,16 +315,93 @@ async function lookupPersonByName(name) {
   }
 }
 
-const INTERNAL_SENDER_REGEX = /(anton ceo|antón|^антон$|^pavel|polkanov|@pavel-remide:beeper\.com|titov)/i;
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal-sender detection.
+//
+// EXPANDED in v3.17: previously this only matched obvious sender names like
+// "Anton" or "Pavel". But Beeper's LinkedIn bridge sometimes labels Anton's
+// outbound messages with sender like "beeper.com" or "@anton-titov:beeper.com",
+// which slipped through. Patrick Chu in /replies showed Anton's reply
+// "Hi Patrick, Thanks! Will book within today" labelled as inbound — that's
+// exactly this bug.
+//
+// Fix is two-pronged:
+//   1) Match more sender patterns (anything starting "@anton" / "anton" /
+//      "anton-titov" / "beeper.com" / matrix-style mxid for Anton)
+//   2) Heuristic-fallback by message TEXT — if the message starts with a
+//      common outbound greeting addressed to someone whose name is in the
+//      chat name, it's almost certainly Anton sending. This catches the
+//      Beeper-bridge metadata bug without needing to fix Beeper itself.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const INTERNAL_SENDER_REGEX = /(anton ceo|antón|^антон$|^pavel|polkanov|@pavel-remide:beeper\.com|titov|^anton$|@anton|anton[-\s]*titov|^beeper\.com$|beeper\.com:|^paul$)/i;
 
 function isInternalSender(senderName) {
   if (!senderName) return false;
   return INTERNAL_SENDER_REGEX.test(senderName);
 }
 
+// Given a chat name like "Patrick Chu" or "Patrick Chu | Agora", extract
+// the first-name token to use for outbound-text heuristic. Bails out for
+// generic / system chat names.
+function chatFirstName(chatName) {
+  if (!chatName) return null;
+  // Take part before "|" or "—" if present
+  const beforeSep = chatName.split(/\s*[|—–-]\s*/)[0].trim();
+  // First token, alphabetic only
+  const first = beforeSep.split(/\s+/)[0];
+  if (!first || first.length < 2) return null;
+  if (GENERIC_SEED_WORDS.has(first.toLowerCase())) return null;
+  if (/^(plexo|remide|chat|group)$/i.test(first)) return null;
+  return first;
+}
+
+// Heuristic: does the message text look like Anton sending an outbound message,
+// even if sender metadata didn't flag it as such?
+//
+// Returns true when:
+//   - text starts with "Hi <First>", "Hey <First>", "Hello <First>", followed
+//     by content typical of Anton's voice (Thanks/will/feel free/let me/etc),
+//     where <First> is the first name of the chat counterpart.
+//   - text contains a phrase strongly associated with Anton's outreach
+//     (Calendly link, "feel free to grab a free slot", etc.)
+function looksOutboundByText(text, chatName) {
+  if (!text) return false;
+  const t = text.trim();
+  if (!t) return false;
+
+  // Phrase-based: links to Anton's Calendly, recognizable outbound CTAs
+  if (/calendly\.com\/plex0/i.test(t)) return true;
+  if (/feel free to (grab|pick) a (free )?slot/i.test(t)) return true;
+  if (/will book within today/i.test(t)) return true;
+
+  // Greeting-based: "Hi <First>" or "Hey <First>" or "Hello <First>" addressed
+  // to the chat counterpart's first name.
+  const counterpart = chatFirstName(chatName);
+  if (counterpart) {
+    const greetingRe = new RegExp(
+      `^(hi|hey|hello|good\\s+(morning|afternoon|evening))\\s*[,!]?\\s*${counterpart}\\b`,
+      "i"
+    );
+    if (greetingRe.test(t)) return true;
+  }
+
+  return false;
+}
+
+// Internal/team chat rooms — drop these from "ждут ответа" entirely.
+// Expanded in v3.17 to cover community/spam channel NAMES too (not just senders).
 function isInternalChatName(chatName) {
   if (!chatName) return false;
-  return /(remide\s*\|.*advisor|plexo\s*\|.*advisor|beeper developer|remide team|plexo team)/i.test(chatName);
+  // Internal Plexo/RemiDe rooms
+  if (/(remide\s*\|.*advisor|plexo\s*\|.*advisor|beeper developer|remide team|plexo team)/i.test(chatName)) {
+    return true;
+  }
+  // Community & spam channels (chat NAME pattern, not sender)
+  if (/(rocket tech school|frontforumfocus|world impact|africa stablecoin community|deals global investment|blockchain.*tech news|latam venture talks|дедушка)/i.test(chatName)) {
+    return true;
+  }
+  return false;
 }
 
 function isBroadcastSpam(chatName, senderName) {
@@ -363,19 +425,21 @@ router.get("/replies-waiting", async (req, res) => {
   const maxLastMs  = Date.now() - minIdleMs;
 
   try {
-    // 1) Get raw digest
     const { since, chats } = await fetchDigest({ days, limit: 200 });
 
-    // 2) Cheap-filter pass — all rules that don't require extra API calls
     const decisions = chats.map(c => {
       const reasons = [];
       const sentByInternal = isInternalSender(c.lastMsgSender);
       const internalChat   = isInternalChatName(c.name);
       const broadcast      = isBroadcastSpam(c.name, c.lastMsgSender);
+      // NEW: text-based outbound detection — catches Beeper-bridge metadata
+      // bugs where sender label doesn't reflect that Anton actually sent.
+      const outboundByText = looksOutboundByText(c.lastMsgText, c.name);
 
       if (c.fetchError)                            reasons.push("msg-fetch-failed");
       if (c.isSender)                              reasons.push("isSender-flag-true");
       if (sentByInternal)                          reasons.push("internal-sender-name");
+      if (outboundByText)                          reasons.push("outbound-by-text");
       if (internalChat)                            reasons.push("internal-chat-room");
       if (broadcast)                               reasons.push("broadcast-spam");
       if (!c.lastMsgText || !c.lastMsgText.trim()) reasons.push("empty-text");
@@ -389,7 +453,6 @@ router.get("/replies-waiting", async (req, res) => {
       return { chat: c, included: reasons.length === 0, reasons };
     });
 
-    // 3) Late-stage filter — drop large groups (>20 participants).
     const survivors = decisions.filter(d => d.included);
     const groupSurvivors = survivors.filter(d => d.chat.type === "group");
 
@@ -419,7 +482,6 @@ router.get("/replies-waiting", async (req, res) => {
 
     const top = filtered.slice(0, limit);
 
-    // 4) Enrich with Notion CRM matches
     const withCrm = await Promise.all(top.map(async c => {
       const [company, person] = await Promise.all([
         lookupCompanyByName(c.name),

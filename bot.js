@@ -5,7 +5,7 @@ const cron    = require("node-cron");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.12.0-fcc-resilient";
+const VERSION      = "4.13.0-pavel-only-digest";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -16,8 +16,9 @@ const ALLOWED_USERS = (process.env.ALLOWED_USERS || "")
 const MORNING_PUSH_USERS = (process.env.MORNING_PUSH_USERS || "156632707")
   .split(",").map(s => parseInt(s.trim())).filter(Boolean);
 
-// Anton TG ID (optional). If set, /digest can forward to him on demand.
-// To enable: set ANTON_TG_ID env var on cooperative-freedom service.
+// Anton TG ID (optional). If set, /digest forwards the digest to him.
+// If not set, /digest sends the digest only to the requester (Pavel) for testing.
+// To enable Anton delivery: set ANTON_TG_ID env var on cooperative-freedom service.
 const ANTON_TG_ID = process.env.ANTON_TG_ID
   ? parseInt(process.env.ANTON_TG_ID.trim(), 10)
   : null;
@@ -500,7 +501,8 @@ function buildStaleSection(stale) {
   );
 }
 
-// Stale-data warning — shown at TOP of digest when replies came from Hub
+// Stale-data warning — shown at TOP of digest when replies came from Hub.
+// Currently only injected by the morning push cron (per Pavel's directive).
 const HUB_FALLBACK_DISCLAIMER =
   `⚠️ <b>Внимание Anton</b>: данные мессенджеров могут быть частично неактуальными — ` +
   `Pavel сейчас не подключен к Beeper. Когда подключение восстановится, Pavel пришлёт ` +
@@ -563,7 +565,7 @@ bot.command("start", ctx => guard(ctx, () => {
     `Команды:\n` +
     `/ping — health check\n` +
     `/today — встречи + задачи + сделки + replies\n` +
-    `/digest — собрать дайджест и переслать Anton'у\n` +
+    `/digest — собрать дайджест (для Anton'а или для теста)\n` +
     `/tasks — открытые задачи\n` +
     `/stale — заглохшие сделки (>14d)\n` +
     `/replies — ждут ответа Anton'а\n\n` +
@@ -596,6 +598,9 @@ bot.command("today", ctx => guard(ctx, async () => {
   const t0 = Date.now();
   const loadingMsg = await ctx.reply("⏳ Тяну дайджест...");
   try {
+    // Manual /today: NO disclaimer regardless of fallback (Pavel sees the
+    // "из Messaging Hub" tag on the section header instead — that's enough
+    // signal for him).
     const data = await fetchTodayDigestData();
     const text = composeTodayDigest(data, { withDisclaimer: false });
 
@@ -616,37 +621,54 @@ bot.command("today", ctx => guard(ctx, async () => {
   }
 }));
 
-// /digest — manually compose digest and forward to Anton (with hub-fallback warning if needed)
+// /digest — manually compose digest. Behaviour:
+//   - If ANTON_TG_ID is set: send digest to Anton (with hub-fallback disclaimer
+//     prepended if replies came from Hub) AND send Pavel a confirmation note.
+//   - If ANTON_TG_ID is NOT set: send digest to the requester (Pavel) for
+//     testing — same content as Anton would receive, including the disclaimer
+//     when Beeper is offline. No confirmation note (the digest itself is the
+//     test artifact).
 bot.command("digest", ctx => guard(ctx, async () => {
-  const loadingMsg = await ctx.reply("⏳ Собираю дайджест для Anton'а...");
-
-  if (!ANTON_TG_ID) {
-    return ctx.api.editMessageText(
-      ctx.chat.id, loadingMsg.message_id,
-      `❌ ANTON_TG_ID не задан в env. Пока пришлю только тебе для теста.`
-    );
-  }
+  const requesterId = ctx.from?.id;
+  const loadingMsg = await ctx.reply(
+    ANTON_TG_ID
+      ? "⏳ Собираю дайджест для Anton'а..."
+      : "⏳ Собираю дайджест (тестовый — пришлю только тебе)..."
+  );
 
   try {
     const data = await fetchTodayDigestData();
-    const header = `☀️ <b>Дайджест от Loop OS</b> (отправлен Pavel вручную)`;
-    const text = composeTodayDigest(data, { header, withDisclaimer: true });
 
-    // Send to Anton
-    await bot.api.sendMessage(ANTON_TG_ID, text, {
-      parse_mode: "HTML",
-      link_preview_options: { is_disabled: true },
-    });
+    if (ANTON_TG_ID) {
+      // Production path: send to Anton, confirm to Pavel
+      const header = `☀️ <b>Дайджест от Loop OS</b> (отправлен Pavel вручную)`;
+      const text = composeTodayDigest(data, { header, withDisclaimer: true });
 
-    const hubNote = data.repliesResult?.source === "messaging-hub"
-      ? `\n\n⚠️ Replies взяты из Messaging Hub (Beeper offline) — Anton получил предупреждение.`
-      : "";
+      await bot.api.sendMessage(ANTON_TG_ID, text, {
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+      });
 
-    await ctx.api.editMessageText(
-      ctx.chat.id, loadingMsg.message_id,
-      `✅ Дайджест отправлен Anton'у (TG ID ${ANTON_TG_ID}).${hubNote}`,
-      { parse_mode: "HTML" }
-    );
+      const hubNote = data.repliesResult?.source === "messaging-hub"
+        ? `\n\n⚠️ Replies взяты из Messaging Hub (Beeper offline) — Anton получил предупреждение.`
+        : "";
+
+      await ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `✅ Дайджест отправлен Anton'у (TG ID ${ANTON_TG_ID}).${hubNote}`,
+        { parse_mode: "HTML" }
+      );
+    } else {
+      // Test path: send digest to the requester (Pavel) so he can preview what
+      // Anton would receive. Include the disclaimer to test that flow too.
+      const header = `🧪 <b>Тестовый дайджест</b> · ANTON_TG_ID не задан, шлю тебе`;
+      const text = composeTodayDigest(data, { header, withDisclaimer: true });
+
+      await ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id, text,
+        { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
+      );
+    }
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
     console.error("[bot /digest] error:", errMsg);
@@ -780,6 +802,10 @@ bot.catch(err => {
 });
 
 // ── Morning push cron ────────────────────────────────────────────────────────
+// Morning push is the ONLY place that injects the Hub-fallback disclaimer:
+// it's auto-fired without Pavel's review, so Anton needs the explicit warning.
+// Manual /today and /digest don't add it (Pavel can see the source himself
+// and decide whether to forward or wait until Beeper is back).
 async function sendMorningPush() {
   if (MORNING_PUSH_USERS.length === 0) {
     console.log("[cron] morning push skipped — no recipients");
@@ -789,7 +815,6 @@ async function sendMorningPush() {
   try {
     const data = await fetchTodayDigestData();
     const header = `☀️ <b>Доброе утро!</b> Дайджест на сегодня.`;
-    // Morning push always shows the disclaimer when replies came from Hub
     const text = composeTodayDigest(data, { header, withDisclaimer: true });
     for (const userId of MORNING_PUSH_USERS) {
       try {

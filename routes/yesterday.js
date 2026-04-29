@@ -14,11 +14,41 @@ const {
 
 const router = express.Router();
 
-const MESSAGES_HUB_DB = "8617a441c4254b41be671a1e65946a03";
-const ANTHROPIC_KEY   = process.env.ANTHROPIC_API_KEY;
+const MESSAGES_HUB_DB     = "8617a441c4254b41be671a1e65946a03";
+const NOTION_COMPANIES_DB = "f9b59c5b05fa4df18f9569479633fd74";
+const ANTHROPIC_KEY       = process.env.ANTHROPIC_API_KEY;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Per-network identity and groupings (unchanged from /activity)
+// CRM stage filter — only show chats with companies in late-funnel stages.
+// Per Pavel's request to cut noise from cold/early-stage chats.
+//
+// Late stages = real conversations are happening. Early stages (Backlog,
+// Not Started, To Contact, Connection sent, Communication Started) are
+// noise for the daily "what happened yesterday" digest.
+//
+// Chats whose company is NOT in CRM at all → kept (could be a hot new lead
+// not yet logged). Chats whose company IS in CRM but in early stage → dropped.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LATE_STAGES = new Set([
+  "initial discussions",
+  "Keeping in the Loop",
+  "Warm discussions",
+  "Negotiations",
+  "Call Scheduled",
+]);
+
+// Stage importance for ranking inside the digest. Higher = hotter.
+const STAGE_RANK = {
+  "Negotiations": 5,
+  "Call Scheduled": 4,
+  "Warm discussions": 3,
+  "Keeping in the Loop": 2,
+  "initial discussions": 1,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-network identity and groupings
 // ─────────────────────────────────────────────────────────────────────────────
 
 const WA_ACCOUNT_PHONE = {
@@ -54,21 +84,125 @@ function isInternalSender(s) {
   return INTERNAL_SENDER_REGEX.test(s);
 }
 
-// "Important inbound" filter — drop low-signal incoming messages.
-//
-// What counts as low-signal:
-//   - empty/whitespace
-//   - "Incoming call. Use the WhatsApp app to answer."  (Beeper system message)
-//   - very short ack-only ("ok", "thanks", "👍", emoji-only)
-//   - link-only messages without context
 function isLowSignalInbound(text) {
   if (!text || !text.trim()) return true;
   const t = text.trim();
   if (/^incoming call\./i.test(t)) return true;
   if (t.length < 10 && /^[\s\p{Emoji}\p{P}ok thanks thx]+$/iu.test(t)) return true;
-  // emoji-only or punctuation-only
   if (/^[\s\p{Emoji}\p{P}]+$/u.test(t)) return true;
   return false;
+}
+
+// Generic words that should NOT be used as Notion company-name lookup keys.
+// E.g. "World Impact Initiatives" → first token "World" matches half the DB.
+const GENERIC_SEED_WORDS = new Set([
+  "world", "global", "international", "africa", "latam", "asia", "europe",
+  "the", "a", "an",
+  "blockchain", "crypto", "fintech", "tech", "ai",
+  "venture", "ventures", "capital", "startup", "startups",
+  "community", "group", "forum", "initiatives", "network",
+  "news", "feed", "channel",
+  "intl", "i18n",
+]);
+
+// Extract the most useful lookup token from a chat name.
+//   "Patrick Chu | Agora"        → "Agora"   (prefer company part after |)
+//   "Plexo <> Bridge"            → "Bridge"
+//   "Plexo x XTransfer"          → "XTransfer"
+//   "Maximilian Bruckner"        → "Maximilian"  (single name)
+//   "Bitnob Team"                → "Bitnob"
+function extractLookupCandidate(chatName) {
+  if (!chatName) return null;
+  let s = String(chatName).trim();
+
+  // If "X | Y" or "X — Y" — prefer right side (usually company)
+  const sepMatch = s.match(/\s*[|—–-]\s*(.+)$/);
+  if (sepMatch && sepMatch[1].trim().length >= 3) {
+    s = sepMatch[1].trim();
+  }
+
+  // Strip Plexo-prefix patterns
+  s = s.replace(/^Plexo\s*[<>x×|]+\s*/i, "").trim();
+
+  const candidate = s.split(/\s+/)[0];
+  if (!candidate || candidate.length < 3) return null;
+  if (GENERIC_SEED_WORDS.has(candidate.toLowerCase())) return null;
+  return candidate;
+}
+
+// Batch lookup chat names → CRM stages. Uses parallel queries with one Notion
+// search per unique candidate. Returns Map<chatName, {stage, bdScore, name}|null>.
+async function batchLookupCRMStages(chatNames) {
+  if (!NOTION_TOKEN) return new Map();
+
+  const result = new Map();
+
+  // Group chat names by their lookup candidate so we don't re-query the same
+  // company multiple times (e.g. multiple chats named "Bitnob Team").
+  const candidateToChatNames = new Map();
+  for (const name of chatNames) {
+    const cand = extractLookupCandidate(name);
+    if (!cand) {
+      result.set(name, null);
+      continue;
+    }
+    const key = cand.toLowerCase();
+    if (!candidateToChatNames.has(key)) {
+      candidateToChatNames.set(key, { candidate: cand, names: [] });
+    }
+    candidateToChatNames.get(key).names.push(name);
+  }
+
+  // Fire all Notion queries in parallel. Each company candidate → 1 query.
+  await Promise.all([...candidateToChatNames.values()].map(async ({ candidate, names }) => {
+    try {
+      const r = await axios.post(
+        `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+        {
+          filter: { property: "Company name", title: { contains: candidate } },
+          page_size: 3,
+        },
+        { headers: notionHeaders(), timeout: 8_000 }
+      );
+      // Pick best match — exact-name preferred, otherwise first non-skipped
+      const skipStages = new Set(["Lost", "DELETE", "Not relevant"]);
+      const candidates = r.data.results.map(page => {
+        const props = page.properties || {};
+        const titleArr = props["Company name"]?.title || [];
+        const cname = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
+        const stage = props["Stage"]?.status?.name || null;
+        const bdScore = props["BD Score"]?.number ?? null;
+        return { name: cname, stage, bdScore };
+      }).filter(c => !skipStages.has(c.stage));
+
+      const best = candidates[0] || null;
+      for (const chatName of names) {
+        result.set(chatName, best);
+      }
+    } catch (err) {
+      console.warn(`[yesterday/lookup] failed for "${candidate}":`, err.message);
+      for (const chatName of names) {
+        result.set(chatName, null);
+      }
+    }
+  }));
+
+  return result;
+}
+
+// Apply CRM stage filter to enriched chats. Returns subset.
+//
+// Rule per Pavel:
+//   - In CRM + late stage   → KEEP
+//   - In CRM + other stage  → DROP
+//   - Not in CRM            → KEEP (might be hot new lead)
+function filterByImportance(chatsWithCRM) {
+  return chatsWithCRM.filter(chat => {
+    if (!chat.crm) return true; // not in CRM — keep
+    const stage = chat.crm.stage;
+    if (!stage) return true; // CRM record exists but no stage — keep
+    return LATE_STAGES.has(stage);
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -201,6 +335,10 @@ async function fetchYesterdayFromHub({ startISO, endISO }) {
     const rawSender = (props["Raw Sender Name"]?.rich_text || [])
       .map(rt => rt.plain_text || rt.text?.content || "").join("");
 
+    // Try to extract linked-company stage directly from Hub if available
+    const linkedCompaniesRel = props["Link: Companies"]?.relation || [];
+    const linkedCompanyId = linkedCompaniesRel[0]?.id || null;
+
     const accountID = null;
 
     const lastActiveDate = props["Last Active"]?.date?.start || null;
@@ -214,6 +352,7 @@ async function fetchYesterdayFromHub({ startISO, endISO }) {
       lastMsgTime: effectiveTime,
       lastEditedTime,
       outbound: rawSender ? isInternalSender(rawSender) : false,
+      linkedCompanyId,
     };
   });
 
@@ -275,25 +414,26 @@ function groupChatsForRender(chats) {
   );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Build "important activity" payload for a single network group.
-// Includes outbound + non-low-signal inbound. Prepares structured input
-// for the AI summarizer.
-// ─────────────────────────────────────────────────────────────────────────────
-
+// Build payload for AI, including CRM stage info per chat.
 function buildNetworkPayload(group) {
   const items = [];
   for (const chat of group.chats) {
     const msgs = chat.messagesYesterday || [];
     if (msgs.length === 0) continue;
 
-    // Keep outbound + non-low-signal inbound
     const filtered = msgs.filter(m => m.isSender || !isLowSignalInbound(m.text));
     if (filtered.length === 0) continue;
 
     items.push({
       chatName: chat.name,
       type: chat.type || "single",
+      crm: chat.crm
+        ? {
+            companyName: chat.crm.name,
+            stage: chat.crm.stage,
+            bdScore: chat.crm.bdScore,
+          }
+        : null,
       messages: filtered.map(m => ({
         sender: m.sender,
         text: m.text,
@@ -304,15 +444,15 @@ function buildNetworkPayload(group) {
   return items;
 }
 
-// Compute per-chat "top hits" for the under-summary list (1-2 lines per chat).
-// Picks chats by importance heuristic: prefer chats where Anton sent (outbound
-// signals BD activity), then chats with longer inbound text.
+// Pick top chats — prioritize by CRM stage rank, then by outbound presence,
+// then by message length. Returns enriched topChats with stage info.
 function pickTopChats(group, n = 3) {
   const scored = group.chats.map(chat => {
     const msgs = chat.messagesYesterday || [];
     const hasOutbound = msgs.some(m => m.isSender);
     const totalLength = msgs.reduce((sum, m) => sum + (m.text?.length || 0), 0);
-    const score = (hasOutbound ? 1000 : 0) + totalLength;
+    const stageScore = chat.crm?.stage ? (STAGE_RANK[chat.crm.stage] || 0) * 5000 : 0;
+    const score = stageScore + (hasOutbound ? 1000 : 0) + totalLength;
     return { chat, score };
   });
   scored.sort((a, b) => b.score - a.score);
@@ -326,12 +466,14 @@ function pickTopChats(group, n = 3) {
       direction,
       lastSender: lastMsg?.sender || "?",
       snippet,
+      crmStage: chat.crm?.stage || null,
+      bdScore: chat.crm?.bdScore ?? null,
     };
   });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// AI summarization via Anthropic Haiku
+// AI summarization via Anthropic Haiku — now with CRM stage context
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function summarizeNetwork(networkHeader, items) {
@@ -345,10 +487,12 @@ async function summarizeNetwork(networkHeader, items) {
     return { bullets: [], skipped: true };
   }
 
-  // Build a compact textual input for the model
   const lines = [];
   for (const item of items) {
-    lines.push(`### ${item.chatName}${item.type === "group" ? " (group)" : ""}`);
+    const stagePart = item.crm
+      ? ` [CRM: ${item.crm.stage || "?"}${item.crm.bdScore ? ` · BD ${item.crm.bdScore}` : ""}]`
+      : ` [новый контакт, не в CRM]`;
+    lines.push(`### ${item.chatName}${item.type === "group" ? " (group)" : ""}${stagePart}`);
     for (const msg of item.messages) {
       const arrow = msg.direction === "out" ? "→ Anton" : `← ${msg.sender}`;
       lines.push(`${arrow}: ${msg.text}`);
@@ -361,27 +505,31 @@ async function summarizeNetwork(networkHeader, items) {
 Anton — CEO. Pavel — Head of Partnerships.
 Твоя задача — кратко суммировать что важного произошло за вчерашний день в одном мессенджере.
 
+ВАЖНО: ты получаешь ТОЛЬКО важные сделки (поздние стадии воронки) + новые контакты не в CRM.
+Используй CRM stage как сигнал важности: Negotiations > Call Scheduled > Warm discussions > Keeping in the Loop > initial discussions.
+Новые контакты ([новый контакт, не в CRM]) — упоминай если что-то значимое.
+
 Формат вывода — 3-5 буллетов, каждый по 1 строке (до 100 символов).
 Каждый буллет должен ОТВЕЧАТЬ на вопрос "что важного?", а не пересказывать кто-кому-что-сказал.
+Когда в буллете есть конкретная компания — указывай её stage если в late-funnel.
 
 Хорошие примеры буллетов:
-• Maximilian Bruckner (Zodia Custody) запросил intro call — Standard Chartered + Northern Trust в инвесторах
-• Anton отправил pitch Nick Woodruff (Coinbase) и Ankit Mehta (OpenFX) — ждём реакции
-• Don-West Macauley забронировал встречу через Calendly
+• Maximilian Bruckner (Zodia, Negotiations) запросил intro call — SCB+Northern Trust в инвесторах
+• Don-West Macauley (Monievia, Call Scheduled) забронировал Calendly
+• Anton отправил pitch новому контакту Nick Woodruff (Coinbase)
 
-Плохие примеры (не делай так):
+Плохие примеры:
 • Pavel ответил Maximilian "thanks for getting back"  ← мелкий тех. факт
-• В чате Anupam Pahuja было сообщение  ← что важно?
 • Обсуждали интеграцию  ← размыто
 
-Если в input ничего по-настоящему важного нет — верни 1 буллет "Активности не было / только тех.переписка".
+Если в input ничего по-настоящему важного нет — верни 1 буллет "Только тех.переписка по активным сделкам".
 
 Отвечай строго JSON: { "bullets": ["bullet 1", "bullet 2", ...] }
 Не добавляй объяснений вокруг JSON.`;
 
   const userPrompt = `Network: ${networkHeader}
 
-Активность за вчера:
+Активность за вчера (только late-stage сделки и новые контакты):
 
 ${conversationText}
 
@@ -408,7 +556,6 @@ ${conversationText}
 
     const textBlock = (r.data?.content || []).find(b => b.type === "text");
     const raw = textBlock?.text || "";
-    // Strip optional markdown code fences
     const clean = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
     const parsed = JSON.parse(clean);
     const bullets = Array.isArray(parsed.bullets) ? parsed.bullets.slice(0, 5) : [];
@@ -425,28 +572,17 @@ ${conversationText}
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /yesterday/summary
 //
-// Pulls yesterday's activity (Beeper → Hub fallback), groups by network,
-// for each group calls Haiku for a 3-5 bullet summary, and returns the
-// combined response with top-3 chats per network for context.
+// Now with CRM stage filter (default ON). Set ?lateStagesOnly=0 to disable.
 //
-// Response shape:
-//   {
-//     ok: true,
-//     source: "beeper" | "hub-fresh" | "hub-stale",
-//     yesterdayLabel, dataDate, freshestEditISO,
-//     networks: [
-//       {
-//         header: "LinkedIn",
-//         summary: { bullets: ["...", "..."] },
-//         topChats: [{ name, direction, snippet, lastSender }],
-//         totalChats: 8,
-//       }, ...
-//     ],
-//   }
+// Response shape adds:
+//   - filteredBy: "late-stages" | "none"
+//   - dropped: count of chats dropped by CRM filter (for visibility)
+//   - networks[].topChats[] now have crmStage and bdScore fields
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.get("/summary", async (req, res) => {
   const window = getYesterdayWindow();
+  const lateStagesOnly = req.query.lateStagesOnly !== "0" && req.query.lateStagesOnly !== "false";
 
   let chats = null;
   let source = null;
@@ -508,6 +644,9 @@ router.get("/summary", async (req, res) => {
           yesterdayLabel: window.label,
           dataDate: null,
           freshestEditISO,
+          filteredBy: lateStagesOnly ? "late-stages" : "none",
+          totalBeforeFilter: 0,
+          dropped: 0,
           networks: [],
         });
       }
@@ -519,8 +658,22 @@ router.get("/summary", async (req, res) => {
     }
   }
 
+  const totalBeforeFilter = chats.length;
+
+  // CRM enrichment + filter
+  let filteredChats = chats;
+  let dropped = 0;
+  if (lateStagesOnly && chats.length > 0) {
+    const chatNames = chats.map(c => c.name).filter(Boolean);
+    const crmMap = await batchLookupCRMStages(chatNames);
+    const enriched = chats.map(c => ({ ...c, crm: crmMap.get(c.name) || null }));
+    filteredChats = filterByImportance(enriched);
+    dropped = totalBeforeFilter - filteredChats.length;
+    console.log(`[yesterday/summary] CRM filter: ${totalBeforeFilter} → ${filteredChats.length} (dropped ${dropped})`);
+  }
+
   // Group by network
-  const groups = groupChatsForRender(chats);
+  const groups = groupChatsForRender(filteredChats);
 
   // For each group: build payload, call Haiku, pick top chats
   const networks = await Promise.all(groups.map(async group => {
@@ -542,6 +695,9 @@ router.get("/summary", async (req, res) => {
     yesterdayLabel: window.label,
     dataDate,
     freshestEditISO,
+    filteredBy: lateStagesOnly ? "late-stages" : "none",
+    totalBeforeFilter,
+    dropped,
     networks,
   });
 });

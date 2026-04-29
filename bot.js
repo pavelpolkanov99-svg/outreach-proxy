@@ -5,7 +5,7 @@ const cron    = require("node-cron");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.16.0-stale-snippets";
+const VERSION      = "4.17.0-yesterday-late-stage-filter";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -286,16 +286,6 @@ function renderEvent(ev) {
   return lines.join("\n");
 }
 
-// Stale-deal block. New layout (v4.16):
-//
-//   🟡 <b>Belo</b> · Negotiations
-//      MH · 9 · Partnership
-//      📅 Нет активности 25д
-//      💬 "last activity snippet from Notes / People"
-//
-// `daysStale` is shown on its own line as the headline complaint.
-// `lastActivitySnippet` (from /notion/stale-deals-enriched) is shown
-// below it when available — answers the question "что было 25 дней назад?"
 function renderStaleDeal(deal) {
   const lines = [];
   const stage = deal.stage || "";
@@ -314,12 +304,10 @@ function renderStaleDeal(deal) {
   if (deal.pipeline) ctxParts.push(deal.pipeline);
   if (ctxParts.length) lines.push(`${indent}<i>${ctxParts.map(esc).join(" · ")}</i>`);
 
-  // Activity gap line — always show if we have daysStale
   if (deal.daysStale != null) {
     lines.push(`${indent}📅 <b>Нет активности ${deal.daysStale}д</b>`);
   }
 
-  // Last activity snippet from Notes (or null)
   if (deal.lastActivitySnippet) {
     lines.push(`${indent}💬 <i>"${esc(deal.lastActivitySnippet)}"</i>`);
   }
@@ -420,8 +408,6 @@ async function fetchCalendar() {
   }
 }
 
-// Switched to /stale-deals-enriched (v3.17) which adds `lastActivitySnippet`.
-// Falls back to /stale-deals if enriched endpoint fails.
 async function fetchStaleDeals({ days = 14, limit = 5 } = {}) {
   const t0 = Date.now();
   try {
@@ -520,7 +506,7 @@ async function fetchYesterdaySummary() {
     const r = await axios.get(`${PROXY}/yesterday/summary`, {
       timeout: 60_000,
     });
-    console.log(`[bot] yesterday summary fetched in ${Date.now() - t0}ms (source=${r.data?.source})`);
+    console.log(`[bot] yesterday summary fetched in ${Date.now() - t0}ms (source=${r.data?.source}, filteredBy=${r.data?.filteredBy}, dropped=${r.data?.dropped})`);
     return r.data;
   } catch (err) {
     console.error(`[bot] yesterday summary failed in ${Date.now() - t0}ms:`, err.message);
@@ -609,6 +595,16 @@ function buildStaleSection(stale) {
   );
 }
 
+// Yesterday block — v4.17 adds late-stage filter labels.
+//
+// Header layout:
+//   📆 Что было вчера (2026-04-29) · только важные сделки (скрыто 12 не-важных)
+//                                  ─── filter tag ───  ─── drop counter ───
+//                                  shown when filteredBy=late-stages
+//
+// Per-network topChats now show CRM stage inline:
+//   → Maximilian Bruckner (Negotiations): "Sorry for getting back so late..."
+//   ← Patrick Chu (Warm discussions): "Looking forward to chatting next week"
 function buildYesterdaySection(summary) {
   if (!summary) {
     return `📆 <b>Что было вчера</b>\n\n<i>⚠️ Не удалось получить summary мессенджеров.</i>`;
@@ -618,17 +614,32 @@ function buildYesterdaySection(summary) {
   }
   const networks = summary.networks || [];
 
+  // Build filter tag for header
+  const isFiltered = summary.filteredBy === "late-stages";
+  let filterTag = "";
+  if (isFiltered) {
+    const dropCount = summary.dropped || 0;
+    filterTag = dropCount > 0
+      ? `  · <i>только важные сделки (скрыто ${dropCount} не-важных)</i>`
+      : `  · <i>только важные сделки</i>`;
+  }
+
+  // Source label (Hub / stale data)
   let sourceLabel = "";
   if (summary.source === "hub-fresh") {
     sourceLabel = `  · <i>из Messaging Hub</i>`;
   } else if (summary.source === "hub-stale") {
     sourceLabel = `  · <i>данные за ${esc(summary.dataDate)} (Pavel оффлайн, Beeper-актуалка позже)</i>`;
   } else if (summary.source === "hub-empty") {
-    return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${sourceLabel}\n\n<i>Активности не было.</i>`;
+    return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n\n<i>Активности не было.</i>`;
   }
 
+  // Empty after filter — clear messaging
   if (networks.length === 0) {
-    return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${sourceLabel}\n\n<i>Активности не было.</i>`;
+    if (isFiltered && summary.totalBeforeFilter > 0) {
+      return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n\n<i>Активности по поздним статусам не было (всего ${summary.totalBeforeFilter} чатов, все early-stage или не в CRM).</i>`;
+    }
+    return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n\n<i>Активности не было.</i>`;
   }
 
   const blocks = [];
@@ -653,8 +664,9 @@ function buildYesterdaySection(summary) {
       for (const c of net.topChats) {
         const arrow = c.direction === "→" ? "→" : "←";
         const safeName = esc(c.name).slice(0, 40);
+        const stagePart = c.crmStage ? ` <i>(${esc(c.crmStage)})</i>` : "";
         const safeSnippet = esc(c.snippet || "");
-        lines.push(`   <code>${arrow}</code> <b>${safeName}</b>: <i>${safeSnippet}</i>`);
+        lines.push(`   <code>${arrow}</code> <b>${safeName}</b>${stagePart}: <i>${safeSnippet}</i>`);
       }
     }
 
@@ -662,7 +674,7 @@ function buildYesterdaySection(summary) {
   }
 
   return (
-    `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${sourceLabel}\n` +
+    `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n` +
     `\n` +
     blocks.join("\n\n")
   );
@@ -788,7 +800,7 @@ bot.command("today", ctx => guard(ctx, async () => {
 
 bot.command("yesterday", ctx => guard(ctx, async () => {
   const t0 = Date.now();
-  const loadingMsg = await ctx.reply("⏳ Собираю summary мессенджеров за вчера (Claude Haiku, ~30-60s)...");
+  const loadingMsg = await ctx.reply("⏳ Собираю summary мессенджеров за вчера (только важные сделки, ~30-60s)...");
   try {
     const summary = await fetchYesterdaySummary();
     if (!summary) {

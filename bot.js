@@ -5,7 +5,7 @@ const cron    = require("node-cron");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.13.0-pavel-only-digest";
+const VERSION      = "4.14.0-yesterday-block";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -16,9 +16,6 @@ const ALLOWED_USERS = (process.env.ALLOWED_USERS || "")
 const MORNING_PUSH_USERS = (process.env.MORNING_PUSH_USERS || "156632707")
   .split(",").map(s => parseInt(s.trim())).filter(Boolean);
 
-// Anton TG ID (optional). If set, /digest forwards the digest to him.
-// If not set, /digest sends the digest only to the requester (Pavel) for testing.
-// To enable Anton delivery: set ANTON_TG_ID env var on cooperative-freedom service.
 const ANTON_TG_ID = process.env.ANTON_TG_ID
   ? parseInt(process.env.ANTON_TG_ID.trim(), 10)
   : null;
@@ -112,6 +109,14 @@ const NET_BADGE = {
   "LI": "💼", "LinkedIn": "💼",
   "TG": "✈️", "Telegram": "✈️",
   "WA": "💚", "WhatsApp": "💚",
+};
+
+// Per-network header emoji for the yesterday block
+const NETWORK_HEADER_EMOJI = (header) => {
+  if (header === "LinkedIn") return "💼";
+  if (header === "Telegram") return "✈️";
+  if (header.startsWith("WhatsApp")) return "💚";
+  return "💬";
 };
 
 const TASK_PRIORITY_EMOJI = {
@@ -379,12 +384,8 @@ async function fetchTasksCompleted({ days = 3, limit = 20 } = {}) {
   }
 }
 
-// Try Beeper first; fall back to Messaging Hub if Beeper is offline.
-// Returns: { source: "beeper" | "messaging-hub", replies: [...] } or null on total failure.
 async function fetchRepliesWaitingResilient({ hoursIdle = 4, limit = 8, days = 7 } = {}) {
   const t0 = Date.now();
-
-  // Try Beeper first
   try {
     const r = await axios.get(`${PROXY}/beeper/replies-waiting`, {
       params: { hoursIdle, limit, days },
@@ -396,7 +397,6 @@ async function fetchRepliesWaitingResilient({ hoursIdle = 4, limit = 8, days = 7
     console.warn(`[bot] beeper failed in ${Date.now() - t0}ms (will fallback to hub):`, err.message);
   }
 
-  // Beeper failed — fall back to Messaging Hub
   const t1 = Date.now();
   try {
     const r = await axios.get(`${PROXY}/messaging-hub/replies-waiting`, {
@@ -407,6 +407,23 @@ async function fetchRepliesWaitingResilient({ hoursIdle = 4, limit = 8, days = 7
     return { source: "messaging-hub", replies: r.data?.replies || [] };
   } catch (err) {
     console.error(`[bot] hub fetch failed in ${Date.now() - t1}ms:`, err.message);
+    return null;
+  }
+}
+
+// Yesterday summary — calls /yesterday/summary which handles Beeper→Hub fallback
+// internally and adds AI-generated bullets per network. Generous timeout because
+// the endpoint makes parallel Haiku calls (one per network group).
+async function fetchYesterdaySummary() {
+  const t0 = Date.now();
+  try {
+    const r = await axios.get(`${PROXY}/yesterday/summary`, {
+      timeout: 60_000,
+    });
+    console.log(`[bot] yesterday summary fetched in ${Date.now() - t0}ms (source=${r.data?.source})`);
+    return r.data;
+  } catch (err) {
+    console.error(`[bot] yesterday summary failed in ${Date.now() - t0}ms:`, err.message);
     return null;
   }
 }
@@ -431,18 +448,11 @@ function buildCalendarSection(calendarRes) {
   );
 }
 
-// New unified tasks section with completed-fallback.
-//
-// Logic:
-//   - If tasksData has overdue/today items → render normally.
-//   - If tasksData is empty AND completedTasks list is non-empty → show completed.
-//   - If both empty → return null (skip section entirely).
 function buildTasksSectionResilient(tasksData, completedTasks) {
   if (!tasksData || tasksData.__timeout) {
     return `📋 <b>Задачи</b>\n\n<i>⚠️ Notion не ответил по задачам.</i>`;
   }
 
-  // Has open/overdue tasks — render normally
   if (tasksData.items?.length) {
     const { items, totalRaw, overdueRaw } = tasksData;
     const counter = overdueRaw > 0
@@ -455,7 +465,6 @@ function buildTasksSectionResilient(tasksData, completedTasks) {
     );
   }
 
-  // No open tasks — show completed fallback if available
   if (Array.isArray(completedTasks) && completedTasks.length > 0) {
     const top = completedTasks.slice(0, 8);
     const overflow = completedTasks.length > top.length
@@ -469,7 +478,6 @@ function buildTasksSectionResilient(tasksData, completedTasks) {
     );
   }
 
-  // Nothing to show
   return null;
 }
 
@@ -501,15 +509,93 @@ function buildStaleSection(stale) {
   );
 }
 
+// Yesterday block — per-network AI summary + top-3 chats with one-line snippet.
+//
+// Layout per network:
+//   💼 <b>LinkedIn</b>  · 8 чатов
+//      • Maximilian Bruckner запросил intro call
+//      • Anton отправил pitch Nick Woodruff и Patrick Chu
+//      • Don-West Macauley забронировал Calendly
+//
+//      → Anton: "Feel free to grab a free slot..."  (Don-West)
+//      ← Maximilian: "Hi Anton, sorry for getting back..."
+//      → Anton: "Hi Patrick, will book within today"
+//
+// Header is annotated with source badge:
+//   · из Messaging Hub  (when source = hub-fresh)
+//   · данные за 2026-04-26 (Pavel оффлайн)  (when source = hub-stale)
+function buildYesterdaySection(summary) {
+  if (!summary) {
+    return `📆 <b>Что было вчера</b>\n\n<i>⚠️ Не удалось получить summary мессенджеров.</i>`;
+  }
+  if (!summary.ok) {
+    return null;
+  }
+  const networks = summary.networks || [];
+
+  // Source badge
+  let sourceLabel = "";
+  if (summary.source === "hub-fresh") {
+    sourceLabel = `  · <i>из Messaging Hub</i>`;
+  } else if (summary.source === "hub-stale") {
+    sourceLabel = `  · <i>данные за ${esc(summary.dataDate)} (Pavel оффлайн, Beeper-актуалка позже)</i>`;
+  } else if (summary.source === "hub-empty") {
+    return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${sourceLabel}\n\n<i>Активности не было.</i>`;
+  }
+
+  if (networks.length === 0) {
+    return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${sourceLabel}\n\n<i>Активности не было.</i>`;
+  }
+
+  const blocks = [];
+  for (const net of networks) {
+    const lines = [];
+    const emoji = NETWORK_HEADER_EMOJI(net.header);
+    const totalLabel = net.totalChats > 0
+      ? `  · <i>${net.totalChats} чатов</i>`
+      : "";
+    lines.push(`${emoji} <b>${esc(net.header)}</b>${totalLabel}`);
+
+    // AI summary bullets
+    const bullets = (net.summary?.bullets || []).filter(Boolean);
+    if (bullets.length > 0) {
+      lines.push("");
+      for (const b of bullets) {
+        lines.push(`   • ${esc(b)}`);
+      }
+    }
+
+    // Top chats with snippets — only if we got real data, skip if hub-stale
+    // because the snippets there would be misleading
+    if (Array.isArray(net.topChats) && net.topChats.length > 0 && summary.source !== "hub-stale") {
+      lines.push("");
+      for (const c of net.topChats) {
+        const arrow = c.direction === "→" ? "→" : "←";
+        const senderHint = arrow === "→" ? "Anton" : (c.lastSender || "?");
+        const safeName = esc(c.name).slice(0, 40);
+        const safeSnippet = esc(c.snippet || "");
+        lines.push(`   <code>${arrow}</code> <b>${safeName}</b>: <i>${safeSnippet}</i>`);
+      }
+    }
+
+    blocks.push(lines.join("\n"));
+  }
+
+  return (
+    `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${sourceLabel}\n` +
+    `\n` +
+    blocks.join("\n\n")
+  );
+}
+
 // Stale-data warning — shown at TOP of digest when replies came from Hub.
-// Currently only injected by the morning push cron (per Pavel's directive).
 const HUB_FALLBACK_DISCLAIMER =
   `⚠️ <b>Внимание Anton</b>: данные мессенджеров могут быть частично неактуальными — ` +
   `Pavel сейчас не подключен к Beeper. Когда подключение восстановится, Pavel пришлёт ` +
   `актуальную сводку вручную.`;
 
 function composeTodayDigest(
-  { calendarRes, tasksData, stale, repliesResult, completedTasks },
+  { calendarRes, tasksData, stale, repliesResult, completedTasks, yesterdaySummary },
   { header, withDisclaimer = false } = {}
 ) {
   const sections = [];
@@ -526,6 +612,9 @@ function composeTodayDigest(
   const repliesBlock = buildRepliesSection(repliesResult);
   if (repliesBlock) sections.push(repliesBlock);
 
+  const yesterdayBlock = buildYesterdaySection(yesterdaySummary);
+  if (yesterdayBlock) sections.push(yesterdayBlock);
+
   const staleBlock = buildStaleSection(stale);
   if (staleBlock) sections.push(staleBlock);
 
@@ -534,14 +623,14 @@ function composeTodayDigest(
 
 async function fetchTodayDigestData() {
   const t0 = Date.now();
-  const [calendarRes, tasksData, stale, repliesResult] = await Promise.all([
+  const [calendarRes, tasksData, stale, repliesResult, yesterdaySummary] = await Promise.all([
     withTimeout(fetchCalendar(),                                                    20_000, "calendar"),
     withTimeout(fetchTasksToday({ limit: 20 }),                                     15_000, "tasks"),
     withTimeout(fetchStaleDeals({ days: 14, limit: 5 }),                            15_000, "stale"),
     withTimeout(fetchRepliesWaitingResilient({ hoursIdle: 4, limit: 8, days: 7 }), 30_000, "replies"),
+    withTimeout(fetchYesterdaySummary(),                                            65_000, "yesterday"),
   ]);
 
-  // Only fetch completed-tasks fallback if open-tasks list is empty
   let completedTasks = null;
   if (tasksData && !tasksData.__timeout && (!tasksData.items || tasksData.items.length === 0)) {
     completedTasks = await withTimeout(
@@ -552,8 +641,10 @@ async function fetchTodayDigestData() {
     if (completedTasks?.__timeout) completedTasks = null;
   }
 
+  const ySummary = (yesterdaySummary && !yesterdaySummary.__timeout) ? yesterdaySummary : null;
+
   console.log(`[bot] digest data fetched in ${Date.now() - t0}ms`);
-  return { calendarRes, tasksData, stale, repliesResult, completedTasks };
+  return { calendarRes, tasksData, stale, repliesResult, completedTasks, yesterdaySummary: ySummary };
 }
 
 // ── Commands ─────────────────────────────────────────────────────────────────
@@ -564,7 +655,8 @@ bot.command("start", ctx => guard(ctx, () => {
     `Версия: ${VERSION}\n\n` +
     `Команды:\n` +
     `/ping — health check\n` +
-    `/today — встречи + задачи + сделки + replies\n` +
+    `/today — встречи + задачи + сделки + replies + вчера\n` +
+    `/yesterday — что было вчера в мессенджерах\n` +
     `/digest — собрать дайджест (для Anton'а или для теста)\n` +
     `/tasks — открытые задачи\n` +
     `/stale — заглохшие сделки (>14d)\n` +
@@ -596,11 +688,8 @@ bot.command("ping", ctx => guard(ctx, () => {
 
 bot.command("today", ctx => guard(ctx, async () => {
   const t0 = Date.now();
-  const loadingMsg = await ctx.reply("⏳ Тяну дайджест...");
+  const loadingMsg = await ctx.reply("⏳ Тяну дайджест (yesterday-summary через Claude Haiku, ~30-60s)...");
   try {
-    // Manual /today: NO disclaimer regardless of fallback (Pavel sees the
-    // "из Messaging Hub" tag on the section header instead — that's enough
-    // signal for him).
     const data = await fetchTodayDigestData();
     const text = composeTodayDigest(data, { withDisclaimer: false });
 
@@ -621,15 +710,44 @@ bot.command("today", ctx => guard(ctx, async () => {
   }
 }));
 
-// /digest — manually compose digest. Behaviour:
-//   - If ANTON_TG_ID is set: send digest to Anton (with hub-fallback disclaimer
-//     prepended if replies came from Hub) AND send Pavel a confirmation note.
-//   - If ANTON_TG_ID is NOT set: send digest to the requester (Pavel) for
-//     testing — same content as Anton would receive, including the disclaimer
-//     when Beeper is offline. No confirmation note (the digest itself is the
-//     test artifact).
+// /yesterday — standalone command for the messenger summary block
+bot.command("yesterday", ctx => guard(ctx, async () => {
+  const t0 = Date.now();
+  const loadingMsg = await ctx.reply("⏳ Собираю summary мессенджеров за вчера (Claude Haiku, ~30-60s)...");
+  try {
+    const summary = await fetchYesterdaySummary();
+    if (!summary) {
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Не удалось получить summary за вчера.`
+      );
+    }
+    const block = buildYesterdaySection(summary);
+    if (!block) {
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `📆 <b>Что было вчера</b>\n\n<i>Активности не было.</i>`,
+        { parse_mode: "HTML" }
+      );
+    }
+    await ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id, block,
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
+    );
+    console.log(`[bot] /yesterday completed in ${Date.now() - t0}ms`);
+  } catch (err) {
+    const errMsg = err.response?.data?.error || err.message;
+    console.error("[bot /yesterday] error:", errMsg);
+    try {
+      await ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Ошибка: ${esc(errMsg)}`
+      );
+    } catch (_) {}
+  }
+}));
+
 bot.command("digest", ctx => guard(ctx, async () => {
-  const requesterId = ctx.from?.id;
   const loadingMsg = await ctx.reply(
     ANTON_TG_ID
       ? "⏳ Собираю дайджест для Anton'а..."
@@ -640,7 +758,6 @@ bot.command("digest", ctx => guard(ctx, async () => {
     const data = await fetchTodayDigestData();
 
     if (ANTON_TG_ID) {
-      // Production path: send to Anton, confirm to Pavel
       const header = `☀️ <b>Дайджест от Loop OS</b> (отправлен Pavel вручную)`;
       const text = composeTodayDigest(data, { header, withDisclaimer: true });
 
@@ -659,8 +776,6 @@ bot.command("digest", ctx => guard(ctx, async () => {
         { parse_mode: "HTML" }
       );
     } else {
-      // Test path: send digest to the requester (Pavel) so he can preview what
-      // Anton would receive. Include the disclaimer to test that flow too.
       const header = `🧪 <b>Тестовый дайджест</b> · ANTON_TG_ID не задан, шлю тебе`;
       const text = composeTodayDigest(data, { header, withDisclaimer: true });
 
@@ -690,7 +805,6 @@ bot.command("tasks", ctx => guard(ctx, async () => {
       );
     }
     if (!tasksData.items.length) {
-      // Fall back to completed tasks
       const completed = await fetchTasksCompleted({ days: 3, limit: 20 });
       if (Array.isArray(completed) && completed.length > 0) {
         const top = completed.slice(0, 10);
@@ -793,7 +907,7 @@ bot.command("replies", ctx => guard(ctx, async () => {
 
 bot.on("message:text", ctx => guard(ctx, () => {
   return ctx.reply(
-    `Команды:\n/start  /ping  /today  /digest  /tasks  /stale  /replies`
+    `Команды:\n/start  /ping  /today  /yesterday  /digest  /tasks  /stale  /replies`
   );
 }));
 
@@ -802,10 +916,6 @@ bot.catch(err => {
 });
 
 // ── Morning push cron ────────────────────────────────────────────────────────
-// Morning push is the ONLY place that injects the Hub-fallback disclaimer:
-// it's auto-fired without Pavel's review, so Anton needs the explicit warning.
-// Manual /today and /digest don't add it (Pavel can see the source himself
-// and decide whether to forward or wait until Beeper is back).
 async function sendMorningPush() {
   if (MORNING_PUSH_USERS.length === 0) {
     console.log("[cron] morning push skipped — no recipients");

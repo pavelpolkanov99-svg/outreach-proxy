@@ -18,18 +18,6 @@ const MESSAGES_HUB_DB     = "8617a441c4254b41be671a1e65946a03";
 const NOTION_COMPANIES_DB = "f9b59c5b05fa4df18f9569479633fd74";
 const ANTHROPIC_KEY       = process.env.ANTHROPIC_API_KEY;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CRM stage filter — only show chats with companies in late-funnel stages.
-// Per Pavel's request to cut noise from cold/early-stage chats.
-//
-// Late stages = real conversations are happening. Early stages (Backlog,
-// Not Started, To Contact, Connection sent, Communication Started) are
-// noise for the daily "what happened yesterday" digest.
-//
-// Chats whose company is NOT in CRM at all → kept (could be a hot new lead
-// not yet logged). Chats whose company IS in CRM but in early stage → dropped.
-// ─────────────────────────────────────────────────────────────────────────────
-
 const LATE_STAGES = new Set([
   "initial discussions",
   "Keeping in the Loop",
@@ -38,7 +26,6 @@ const LATE_STAGES = new Set([
   "Call Scheduled",
 ]);
 
-// Stage importance for ranking inside the digest. Higher = hotter.
 const STAGE_RANK = {
   "Negotiations": 5,
   "Call Scheduled": 4,
@@ -46,10 +33,6 @@ const STAGE_RANK = {
   "Keeping in the Loop": 2,
   "initial discussions": 1,
 };
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Per-network identity and groupings
-// ─────────────────────────────────────────────────────────────────────────────
 
 const WA_ACCOUNT_PHONE = {
   "Htp4o51CAhE8_SXbpXCKofjvn1Y": "+420777225067",
@@ -93,8 +76,6 @@ function isLowSignalInbound(text) {
   return false;
 }
 
-// Generic words that should NOT be used as Notion company-name lookup keys.
-// E.g. "World Impact Initiatives" → first token "World" matches half the DB.
 const GENERIC_SEED_WORDS = new Set([
   "world", "global", "international", "africa", "latam", "asia", "europe",
   "the", "a", "an",
@@ -105,23 +86,15 @@ const GENERIC_SEED_WORDS = new Set([
   "intl", "i18n",
 ]);
 
-// Extract the most useful lookup token from a chat name.
-//   "Patrick Chu | Agora"        → "Agora"   (prefer company part after |)
-//   "Plexo <> Bridge"            → "Bridge"
-//   "Plexo x XTransfer"          → "XTransfer"
-//   "Maximilian Bruckner"        → "Maximilian"  (single name)
-//   "Bitnob Team"                → "Bitnob"
 function extractLookupCandidate(chatName) {
   if (!chatName) return null;
   let s = String(chatName).trim();
 
-  // If "X | Y" or "X — Y" — prefer right side (usually company)
   const sepMatch = s.match(/\s*[|—–-]\s*(.+)$/);
   if (sepMatch && sepMatch[1].trim().length >= 3) {
     s = sepMatch[1].trim();
   }
 
-  // Strip Plexo-prefix patterns
   s = s.replace(/^Plexo\s*[<>x×|]+\s*/i, "").trim();
 
   const candidate = s.split(/\s+/)[0];
@@ -130,16 +103,12 @@ function extractLookupCandidate(chatName) {
   return candidate;
 }
 
-// Batch lookup chat names → CRM stages. Uses parallel queries with one Notion
-// search per unique candidate. Returns Map<chatName, {stage, bdScore, name}|null>.
 async function batchLookupCRMStages(chatNames) {
   if (!NOTION_TOKEN) return new Map();
 
   const result = new Map();
-
-  // Group chat names by their lookup candidate so we don't re-query the same
-  // company multiple times (e.g. multiple chats named "Bitnob Team").
   const candidateToChatNames = new Map();
+
   for (const name of chatNames) {
     const cand = extractLookupCandidate(name);
     if (!cand) {
@@ -153,7 +122,8 @@ async function batchLookupCRMStages(chatNames) {
     candidateToChatNames.get(key).names.push(name);
   }
 
-  // Fire all Notion queries in parallel. Each company candidate → 1 query.
+  console.log(`[yesterday/lookup] ${chatNames.length} chats → ${candidateToChatNames.size} unique candidates`);
+
   await Promise.all([...candidateToChatNames.values()].map(async ({ candidate, names }) => {
     try {
       const r = await axios.post(
@@ -164,7 +134,6 @@ async function batchLookupCRMStages(chatNames) {
         },
         { headers: notionHeaders(), timeout: 8_000 }
       );
-      // Pick best match — exact-name preferred, otherwise first non-skipped
       const skipStages = new Set(["Lost", "DELETE", "Not relevant"]);
       const candidates = r.data.results.map(page => {
         const props = page.properties || {};
@@ -176,6 +145,7 @@ async function batchLookupCRMStages(chatNames) {
       }).filter(c => !skipStages.has(c.stage));
 
       const best = candidates[0] || null;
+      console.log(`[yesterday/lookup] "${candidate}" → ${best ? `"${best.name}" (${best.stage})` : "NO MATCH"}`);
       for (const chatName of names) {
         result.set(chatName, best);
       }
@@ -190,24 +160,14 @@ async function batchLookupCRMStages(chatNames) {
   return result;
 }
 
-// Apply CRM stage filter to enriched chats. Returns subset.
-//
-// Rule per Pavel:
-//   - In CRM + late stage   → KEEP
-//   - In CRM + other stage  → DROP
-//   - Not in CRM            → KEEP (might be hot new lead)
 function filterByImportance(chatsWithCRM) {
   return chatsWithCRM.filter(chat => {
-    if (!chat.crm) return true; // not in CRM — keep
+    if (!chat.crm) return true;
     const stage = chat.crm.stage;
-    if (!stage) return true; // CRM record exists but no stage — keep
+    if (!stage) return true;
     return LATE_STAGES.has(stage);
   });
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Yesterday window (Europe/Prague)
-// ─────────────────────────────────────────────────────────────────────────────
 
 function getYesterdayWindow() {
   const TZ = "Europe/Prague";
@@ -238,10 +198,6 @@ function getYesterdayWindow() {
   };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Fetch from Beeper
-// ─────────────────────────────────────────────────────────────────────────────
-
 async function fetchYesterdayFromBeeper({ startISO, endISO }) {
   if (!BEEPER_TOKEN) throw new Error("BEEPER_TOKEN not set");
 
@@ -250,6 +206,8 @@ async function fetchYesterdayFromBeeper({ startISO, endISO }) {
     timeout: 12_000,
   });
   const items = r.data?.items || [];
+
+  console.log(`[yesterday/beeper] /v1/chats returned ${items.length} chats`);
 
   const startMs = Date.parse(startISO);
   const endMs = Date.parse(endISO);
@@ -260,20 +218,41 @@ async function fetchYesterdayFromBeeper({ startISO, endISO }) {
     return !isNaN(tsMs) && tsMs >= startMs && tsMs < endMs;
   });
 
+  console.log(`[yesterday/beeper] ${recentChats.length} chats in yesterday window (${startISO} → ${endISO})`);
+  if (recentChats.length > 0) {
+    console.log(`[yesterday/beeper] in-window chats: ${recentChats.slice(0, 10).map(c => `"${c.title || c.name}" @ ${c.lastMessageAt || c.lastActivityAt}`).join(", ")}`);
+  }
+
   const enriched = await Promise.all(recentChats.map(async c => {
     let messagesYesterday = [];
+    let msgsTotal = 0;
+    let msgsFirstTs = null;
+    let msgsLastTs = null;
+    let parseFailures = 0;
     try {
       const msgs = await beeperGetMessages(c.id, 8);
+      msgsTotal = msgs.length;
+      if (msgs[0]) msgsFirstTs = msgs[0].timestamp;
+      if (msgs[msgs.length - 1]) msgsLastTs = msgs[msgs.length - 1].timestamp;
+
       messagesYesterday = msgs.filter(m => {
         const tsMs = Date.parse(m.timestamp || 0);
-        return !isNaN(tsMs) && tsMs >= startMs && tsMs < endMs;
+        if (isNaN(tsMs)) {
+          parseFailures++;
+          return false;
+        }
+        return tsMs >= startMs && tsMs < endMs;
       }).map(m => ({
         sender: m.sender?.fullName || m.sender?.displayName || m.senderName || "?",
         text: (m.content?.text || m.content?.body || m.text || m.body || "").slice(0, 400),
         timestamp: m.timestamp,
         isSender: !!m.isSender,
       })).filter(m => m.text);
-    } catch (_) { /* swallow */ }
+    } catch (e) {
+      console.warn(`[yesterday/beeper] msg fetch failed for "${c.title || c.name}":`, e.message);
+    }
+
+    console.log(`[yesterday/beeper] "${c.title || c.name}": fetched ${msgsTotal} msgs (firstTs=${msgsFirstTs}, lastTs=${msgsLastTs}, parseFailures=${parseFailures}) → ${messagesYesterday.length} in window`);
 
     return {
       id: c.id,
@@ -285,15 +264,15 @@ async function fetchYesterdayFromBeeper({ startISO, endISO }) {
     };
   }));
 
-  return enriched.filter(c =>
+  const survived = enriched.filter(c =>
     c.messagesYesterday.length > 0 &&
     !SKIP_CHAT_NAME_REGEX.test(c.name)
   );
-}
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Fetch from Messaging Hub
-// ─────────────────────────────────────────────────────────────────────────────
+  console.log(`[yesterday/beeper] after msg-filter + skip-regex: ${survived.length}/${enriched.length} chats`);
+
+  return survived;
+}
 
 async function fetchYesterdayFromHub({ startISO, endISO }) {
   if (!NOTION_TOKEN) throw new Error("NOTION_TOKEN not set");
@@ -335,10 +314,6 @@ async function fetchYesterdayFromHub({ startISO, endISO }) {
     const rawSender = (props["Raw Sender Name"]?.rich_text || [])
       .map(rt => rt.plain_text || rt.text?.content || "").join("");
 
-    // Try to extract linked-company stage directly from Hub if available
-    const linkedCompaniesRel = props["Link: Companies"]?.relation || [];
-    const linkedCompanyId = linkedCompaniesRel[0]?.id || null;
-
     const accountID = null;
 
     const lastActiveDate = props["Last Active"]?.date?.start || null;
@@ -352,7 +327,6 @@ async function fetchYesterdayFromHub({ startISO, endISO }) {
       lastMsgTime: effectiveTime,
       lastEditedTime,
       outbound: rawSender ? isInternalSender(rawSender) : false,
-      linkedCompanyId,
     };
   });
 
@@ -378,16 +352,14 @@ async function fetchYesterdayFromHub({ startISO, endISO }) {
       .slice(0, 30);
   }
 
+  console.log(`[yesterday/hub] ${allRows.length} active rows, ${yesterdayRows.length} in window, ${stalestFallbackRows.length} fallback`);
+
   return {
     yesterdayRows,
     stalestFallbackRows,
     freshestEditISO: freshestEdit > 0 ? new Date(freshestEdit).toISOString() : null,
   };
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Group chats by network
-// ─────────────────────────────────────────────────────────────────────────────
 
 function groupChatsForRender(chats) {
   const groups = new Map();
@@ -414,7 +386,6 @@ function groupChatsForRender(chats) {
   );
 }
 
-// Build payload for AI, including CRM stage info per chat.
 function buildNetworkPayload(group) {
   const items = [];
   for (const chat of group.chats) {
@@ -444,8 +415,6 @@ function buildNetworkPayload(group) {
   return items;
 }
 
-// Pick top chats — prioritize by CRM stage rank, then by outbound presence,
-// then by message length. Returns enriched topChats with stage info.
 function pickTopChats(group, n = 3) {
   const scored = group.chats.map(chat => {
     const msgs = chat.messagesYesterday || [];
@@ -471,10 +440,6 @@ function pickTopChats(group, n = 3) {
     };
   });
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// AI summarization via Anthropic Haiku — now with CRM stage context
-// ─────────────────────────────────────────────────────────────────────────────
 
 async function summarizeNetwork(networkHeader, items) {
   if (!ANTHROPIC_KEY) {
@@ -507,20 +472,9 @@ Anton — CEO. Pavel — Head of Partnerships.
 
 ВАЖНО: ты получаешь ТОЛЬКО важные сделки (поздние стадии воронки) + новые контакты не в CRM.
 Используй CRM stage как сигнал важности: Negotiations > Call Scheduled > Warm discussions > Keeping in the Loop > initial discussions.
-Новые контакты ([новый контакт, не в CRM]) — упоминай если что-то значимое.
 
 Формат вывода — 3-5 буллетов, каждый по 1 строке (до 100 символов).
 Каждый буллет должен ОТВЕЧАТЬ на вопрос "что важного?", а не пересказывать кто-кому-что-сказал.
-Когда в буллете есть конкретная компания — указывай её stage если в late-funnel.
-
-Хорошие примеры буллетов:
-• Maximilian Bruckner (Zodia, Negotiations) запросил intro call — SCB+Northern Trust в инвесторах
-• Don-West Macauley (Monievia, Call Scheduled) забронировал Calendly
-• Anton отправил pitch новому контакту Nick Woodruff (Coinbase)
-
-Плохие примеры:
-• Pavel ответил Maximilian "thanks for getting back"  ← мелкий тех. факт
-• Обсуждали интеграцию  ← размыто
 
 Если в input ничего по-настоящему важного нет — верни 1 буллет "Только тех.переписка по активным сделкам".
 
@@ -569,35 +523,26 @@ ${conversationText}
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /yesterday/summary
-//
-// Now with CRM stage filter (default ON). Set ?lateStagesOnly=0 to disable.
-//
-// Response shape adds:
-//   - filteredBy: "late-stages" | "none"
-//   - dropped: count of chats dropped by CRM filter (for visibility)
-//   - networks[].topChats[] now have crmStage and bdScore fields
-// ─────────────────────────────────────────────────────────────────────────────
-
 router.get("/summary", async (req, res) => {
+  const t0 = Date.now();
   const window = getYesterdayWindow();
   const lateStagesOnly = req.query.lateStagesOnly !== "0" && req.query.lateStagesOnly !== "false";
+
+  console.log(`[yesterday] === START === window: ${window.startISO} → ${window.endISO} (label: ${window.label}) lateStagesOnly=${lateStagesOnly}`);
 
   let chats = null;
   let source = null;
   let dataDate = window.label;
   let freshestEditISO = null;
 
-  // Try Beeper first
   try {
     chats = await fetchYesterdayFromBeeper(window);
     source = "beeper";
+    console.log(`[yesterday] beeper SUCCESS: ${chats.length} chats`);
   } catch (beeperErr) {
-    console.warn(`[yesterday/summary] beeper failed: ${beeperErr.message} — falling back to hub`);
+    console.warn(`[yesterday] beeper FAILED: ${beeperErr.message} — falling back to hub`);
   }
 
-  // Hub fallback
   if (!chats) {
     try {
       const hub = await fetchYesterdayFromHub(window);
@@ -616,6 +561,7 @@ router.get("/summary", async (req, res) => {
             isSender: row.outbound,
           }],
         }));
+        console.log(`[yesterday] hub-fresh: ${chats.length} chats`);
       } else if (hub.stalestFallbackRows.length > 0) {
         source = "hub-stale";
         if (freshestEditISO) {
@@ -637,7 +583,9 @@ router.get("/summary", async (req, res) => {
             isSender: row.outbound,
           }],
         }));
+        console.log(`[yesterday] hub-stale: ${chats.length} chats from ${dataDate}`);
       } else {
+        console.log(`[yesterday] hub EMPTY — both yesterdayRows and fallbackRows are 0`);
         return res.json({
           ok: true,
           source: "hub-empty",
@@ -651,6 +599,7 @@ router.get("/summary", async (req, res) => {
         });
       }
     } catch (hubErr) {
+      console.error(`[yesterday] hub FAILED: ${hubErr.message}`);
       return res.status(500).json({
         error: "both beeper and hub failed",
         hubError: hubErr.message,
@@ -660,7 +609,6 @@ router.get("/summary", async (req, res) => {
 
   const totalBeforeFilter = chats.length;
 
-  // CRM enrichment + filter
   let filteredChats = chats;
   let dropped = 0;
   if (lateStagesOnly && chats.length > 0) {
@@ -669,13 +617,19 @@ router.get("/summary", async (req, res) => {
     const enriched = chats.map(c => ({ ...c, crm: crmMap.get(c.name) || null }));
     filteredChats = filterByImportance(enriched);
     dropped = totalBeforeFilter - filteredChats.length;
-    console.log(`[yesterday/summary] CRM filter: ${totalBeforeFilter} → ${filteredChats.length} (dropped ${dropped})`);
+    console.log(`[yesterday] CRM filter: ${totalBeforeFilter} → ${filteredChats.length} (dropped ${dropped})`);
+    if (dropped > 0) {
+      const droppedSamples = enriched
+        .filter(c => c.crm && c.crm.stage && !LATE_STAGES.has(c.crm.stage))
+        .slice(0, 10)
+        .map(c => `"${c.name}" (${c.crm.stage})`);
+      console.log(`[yesterday] dropped samples: ${droppedSamples.join(", ")}`);
+    }
   }
 
-  // Group by network
   const groups = groupChatsForRender(filteredChats);
+  console.log(`[yesterday] grouped into ${groups.length} networks: ${groups.map(g => `${g.header}=${g.chats.length}`).join(", ")}`);
 
-  // For each group: build payload, call Haiku, pick top chats
   const networks = await Promise.all(groups.map(async group => {
     const payload = buildNetworkPayload(group);
     const topChats = pickTopChats(group, 3);
@@ -689,6 +643,8 @@ router.get("/summary", async (req, res) => {
     };
   }));
 
+  console.log(`[yesterday] === END === ${Date.now() - t0}ms · source=${source} · totalBefore=${totalBeforeFilter} · dropped=${dropped} · networks=${networks.length}`);
+
   return res.json({
     ok: true,
     source,
@@ -701,10 +657,6 @@ router.get("/summary", async (req, res) => {
     networks,
   });
 });
-
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /yesterday/activity (raw — kept for direct inspection)
-// ─────────────────────────────────────────────────────────────────────────────
 
 router.get("/activity", async (req, res) => {
   const window = getYesterdayWindow();

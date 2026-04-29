@@ -861,4 +861,110 @@ router.get("/tasks-today", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tasks-completed — recently-completed tasks (fallback for /today when no overdue)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// GET /notion/tasks-completed?days=3&limit=20
+//
+// Returns Status=Done tasks edited in the past N days. Sorted by last_edited_time
+// descending (most recent first). Used as the celebratory fallback in /today
+// when there are no overdue/today tasks left.
+
+router.get("/tasks-completed", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+
+  const days  = Math.max(1, Math.min(30, parseInt(req.query.days,  10) || 3));
+  const limit = Math.max(1, Math.min(50, parseInt(req.query.limit, 10) || 20));
+
+  const cutoffISO = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+  try {
+    const filter = {
+      and: [
+        { property: "Status", status: { equals: "Done" } },
+        {
+          timestamp: "last_edited_time",
+          last_edited_time: { on_or_after: cutoffISO },
+        },
+      ],
+    };
+
+    const r = await axios.post(
+      `https://api.notion.com/v1/databases/${NOTION_TASKS_DB}/query`,
+      {
+        filter,
+        sorts: [
+          { timestamp: "last_edited_time", direction: "descending" },
+        ],
+        page_size: Math.min(limit * 2, 100),
+      },
+      { headers: notionHeaders() }
+    );
+
+    const rawTasks = r.data.results.map(page => {
+      const props = page.properties || {};
+      const titleArr = props["Task name"]?.title || [];
+      const name = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
+
+      const priority = props["Priority"]?.select?.name || null;
+      const dueDate  = props["Due date"]?.date?.start || null;
+      const completedAt = page.last_edited_time || null;
+
+      const companyRel = props["🏢  CRM Companies"]?.relation || [];
+      const linkedCompanyId = companyRel[0]?.id || null;
+
+      return {
+        id: page.id,
+        url: page.url,
+        name,
+        priority,
+        dueDate,
+        completedAt,
+        linkedCompanyId,
+      };
+    });
+
+    // Resolve linked company names in one batch (same pattern as tasks-today)
+    const uniqueCompanyIds = [...new Set(rawTasks.map(t => t.linkedCompanyId).filter(Boolean))];
+    const companyNameById = new Map();
+    if (uniqueCompanyIds.length > 0) {
+      await Promise.all(uniqueCompanyIds.map(async (id) => {
+        try {
+          const cr = await axios.get(
+            `https://api.notion.com/v1/pages/${id}`,
+            { headers: notionHeaders(), timeout: 6000 }
+          );
+          const props = cr.data.properties || {};
+          const titleArr = props["Company name"]?.title || [];
+          const cname = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
+          if (cname) companyNameById.set(id, cname);
+        } catch (_) { /* swallow */ }
+      }));
+    }
+
+    const tasks = rawTasks.map(t => ({
+      id: t.id,
+      url: t.url,
+      name: t.name,
+      priority: t.priority,
+      dueDate: t.dueDate,
+      completedAt: t.completedAt,
+      companyName: t.linkedCompanyId ? (companyNameById.get(t.linkedCompanyId) || null) : null,
+    })).slice(0, limit);
+
+    res.json({
+      ok: true,
+      cutoffDays: days,
+      cutoffISO,
+      total: tasks.length,
+      tasks,
+    });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({
+      error: err.response?.data?.message || err.message,
+    });
+  }
+});
+
 module.exports = router;

@@ -5,7 +5,7 @@ const cron    = require("node-cron");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.14.0-yesterday-block";
+const VERSION      = "4.15.0-message-splitting";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -61,6 +61,100 @@ function withTimeout(promise, ms, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Message splitting — Telegram has a 4096-char hard limit on message bodies,
+// and digests with the yesterday-summary block routinely exceed that.
+//
+// Strategy: split on the section separator "━━━━━━━━━━━━━━━" (3 newlines on
+// each side). If a single section is somehow still too long after splitting,
+// fall back to a hard slice with a continuation marker.
+//
+// MAX_MESSAGE_LEN — 4000 leaves headroom for HTML entity expansion at parse
+// time and the occasional emoji that occupies more bytes than expected.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MAX_MESSAGE_LEN = 4000;
+const SECTION_SEP = "\n\n━━━━━━━━━━━━━━━\n\n";
+
+function splitForTelegram(text) {
+  if (!text || text.length <= MAX_MESSAGE_LEN) return [text];
+
+  const sections = text.split(SECTION_SEP);
+  const chunks = [];
+  let current = "";
+
+  for (const section of sections) {
+    // If adding this section would overflow, flush current chunk first.
+    const wouldBe = current
+      ? current + SECTION_SEP + section
+      : section;
+    if (wouldBe.length <= MAX_MESSAGE_LEN) {
+      current = wouldBe;
+      continue;
+    }
+
+    // Flush current
+    if (current) {
+      chunks.push(current);
+      current = "";
+    }
+
+    // Section alone fits
+    if (section.length <= MAX_MESSAGE_LEN) {
+      current = section;
+      continue;
+    }
+
+    // Section is itself too big — hard-slice it with continuation markers.
+    let remaining = section;
+    while (remaining.length > MAX_MESSAGE_LEN) {
+      // Try to find a newline before the cutoff to slice cleanly
+      let cutAt = remaining.lastIndexOf("\n", MAX_MESSAGE_LEN);
+      if (cutAt < MAX_MESSAGE_LEN / 2) cutAt = MAX_MESSAGE_LEN; // no good newline; hard cut
+      chunks.push(remaining.slice(0, cutAt));
+      remaining = remaining.slice(cutAt).trimStart();
+    }
+    current = remaining;
+  }
+
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+// Edit the loading message with the first chunk, then send rest as new messages.
+// Returns the array of message_ids that were created/edited.
+async function editAndSplit(ctx, loadingMsg, fullText, opts = {}) {
+  const chunks = splitForTelegram(fullText);
+  const sendOpts = {
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: true },
+    ...opts,
+  };
+
+  // First chunk replaces the loading message
+  await ctx.api.editMessageText(
+    ctx.chat.id, loadingMsg.message_id, chunks[0], sendOpts
+  );
+
+  // Subsequent chunks as new messages
+  for (let i = 1; i < chunks.length; i++) {
+    await ctx.api.sendMessage(ctx.chat.id, chunks[i], sendOpts);
+  }
+}
+
+// Send digest as a series of split messages to a user (used by morning push and /digest→Anton path).
+async function sendSplit(userId, fullText, opts = {}) {
+  const chunks = splitForTelegram(fullText);
+  const sendOpts = {
+    parse_mode: "HTML",
+    link_preview_options: { is_disabled: true },
+    ...opts,
+  };
+  for (const chunk of chunks) {
+    await bot.api.sendMessage(userId, chunk, sendOpts);
+  }
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function daysAgo(isoDate) {
@@ -111,7 +205,6 @@ const NET_BADGE = {
   "WA": "💚", "WhatsApp": "💚",
 };
 
-// Per-network header emoji for the yesterday block
 const NETWORK_HEADER_EMOJI = (header) => {
   if (header === "LinkedIn") return "💼";
   if (header === "Telegram") return "✈️";
@@ -411,9 +504,6 @@ async function fetchRepliesWaitingResilient({ hoursIdle = 4, limit = 8, days = 7
   }
 }
 
-// Yesterday summary — calls /yesterday/summary which handles Beeper→Hub fallback
-// internally and adds AI-generated bullets per network. Generous timeout because
-// the endpoint makes parallel Haiku calls (one per network group).
 async function fetchYesterdaySummary() {
   const t0 = Date.now();
   try {
@@ -509,21 +599,6 @@ function buildStaleSection(stale) {
   );
 }
 
-// Yesterday block — per-network AI summary + top-3 chats with one-line snippet.
-//
-// Layout per network:
-//   💼 <b>LinkedIn</b>  · 8 чатов
-//      • Maximilian Bruckner запросил intro call
-//      • Anton отправил pitch Nick Woodruff и Patrick Chu
-//      • Don-West Macauley забронировал Calendly
-//
-//      → Anton: "Feel free to grab a free slot..."  (Don-West)
-//      ← Maximilian: "Hi Anton, sorry for getting back..."
-//      → Anton: "Hi Patrick, will book within today"
-//
-// Header is annotated with source badge:
-//   · из Messaging Hub  (when source = hub-fresh)
-//   · данные за 2026-04-26 (Pavel оффлайн)  (when source = hub-stale)
 function buildYesterdaySection(summary) {
   if (!summary) {
     return `📆 <b>Что было вчера</b>\n\n<i>⚠️ Не удалось получить summary мессенджеров.</i>`;
@@ -533,7 +608,6 @@ function buildYesterdaySection(summary) {
   }
   const networks = summary.networks || [];
 
-  // Source badge
   let sourceLabel = "";
   if (summary.source === "hub-fresh") {
     sourceLabel = `  · <i>из Messaging Hub</i>`;
@@ -556,7 +630,6 @@ function buildYesterdaySection(summary) {
       : "";
     lines.push(`${emoji} <b>${esc(net.header)}</b>${totalLabel}`);
 
-    // AI summary bullets
     const bullets = (net.summary?.bullets || []).filter(Boolean);
     if (bullets.length > 0) {
       lines.push("");
@@ -565,13 +638,10 @@ function buildYesterdaySection(summary) {
       }
     }
 
-    // Top chats with snippets — only if we got real data, skip if hub-stale
-    // because the snippets there would be misleading
     if (Array.isArray(net.topChats) && net.topChats.length > 0 && summary.source !== "hub-stale") {
       lines.push("");
       for (const c of net.topChats) {
         const arrow = c.direction === "→" ? "→" : "←";
-        const senderHint = arrow === "→" ? "Anton" : (c.lastSender || "?");
         const safeName = esc(c.name).slice(0, 40);
         const safeSnippet = esc(c.snippet || "");
         lines.push(`   <code>${arrow}</code> <b>${safeName}</b>: <i>${safeSnippet}</i>`);
@@ -588,7 +658,6 @@ function buildYesterdaySection(summary) {
   );
 }
 
-// Stale-data warning — shown at TOP of digest when replies came from Hub.
 const HUB_FALLBACK_DISCLAIMER =
   `⚠️ <b>Внимание Anton</b>: данные мессенджеров могут быть частично неактуальными — ` +
   `Pavel сейчас не подключен к Beeper. Когда подключение восстановится, Pavel пришлёт ` +
@@ -618,7 +687,7 @@ function composeTodayDigest(
   const staleBlock = buildStaleSection(stale);
   if (staleBlock) sections.push(staleBlock);
 
-  return sections.join("\n\n━━━━━━━━━━━━━━━\n\n");
+  return sections.join(SECTION_SEP);
 }
 
 async function fetchTodayDigestData() {
@@ -693,11 +762,8 @@ bot.command("today", ctx => guard(ctx, async () => {
     const data = await fetchTodayDigestData();
     const text = composeTodayDigest(data, { withDisclaimer: false });
 
-    await ctx.api.editMessageText(
-      ctx.chat.id, loadingMsg.message_id, text,
-      { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
-    );
-    console.log(`[bot] /today completed in ${Date.now() - t0}ms`);
+    await editAndSplit(ctx, loadingMsg, text);
+    console.log(`[bot] /today completed in ${Date.now() - t0}ms (${text.length} chars)`);
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
     console.error("[bot /today] error:", errMsg);
@@ -710,7 +776,6 @@ bot.command("today", ctx => guard(ctx, async () => {
   }
 }));
 
-// /yesterday — standalone command for the messenger summary block
 bot.command("yesterday", ctx => guard(ctx, async () => {
   const t0 = Date.now();
   const loadingMsg = await ctx.reply("⏳ Собираю summary мессенджеров за вчера (Claude Haiku, ~30-60s)...");
@@ -730,11 +795,8 @@ bot.command("yesterday", ctx => guard(ctx, async () => {
         { parse_mode: "HTML" }
       );
     }
-    await ctx.api.editMessageText(
-      ctx.chat.id, loadingMsg.message_id, block,
-      { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
-    );
-    console.log(`[bot] /yesterday completed in ${Date.now() - t0}ms`);
+    await editAndSplit(ctx, loadingMsg, block);
+    console.log(`[bot] /yesterday completed in ${Date.now() - t0}ms (${block.length} chars)`);
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
     console.error("[bot /yesterday] error:", errMsg);
@@ -761,10 +823,7 @@ bot.command("digest", ctx => guard(ctx, async () => {
       const header = `☀️ <b>Дайджест от Loop OS</b> (отправлен Pavel вручную)`;
       const text = composeTodayDigest(data, { header, withDisclaimer: true });
 
-      await bot.api.sendMessage(ANTON_TG_ID, text, {
-        parse_mode: "HTML",
-        link_preview_options: { is_disabled: true },
-      });
+      await sendSplit(ANTON_TG_ID, text);
 
       const hubNote = data.repliesResult?.source === "messaging-hub"
         ? `\n\n⚠️ Replies взяты из Messaging Hub (Beeper offline) — Anton получил предупреждение.`
@@ -779,10 +838,7 @@ bot.command("digest", ctx => guard(ctx, async () => {
       const header = `🧪 <b>Тестовый дайджест</b> · ANTON_TG_ID не задан, шлю тебе`;
       const text = composeTodayDigest(data, { header, withDisclaimer: true });
 
-      await ctx.api.editMessageText(
-        ctx.chat.id, loadingMsg.message_id, text,
-        { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
-      );
+      await editAndSplit(ctx, loadingMsg, text);
     }
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
@@ -815,10 +871,7 @@ bot.command("tasks", ctx => guard(ctx, async () => {
           `✅ <b>Все задачи под контролем</b>  · <i>${completed.length} закрыто за 3 дня</i>\n\n` +
           top.map(renderCompletedTask).join("\n") +
           overflow;
-        return ctx.api.editMessageText(
-          ctx.chat.id, loadingMsg.message_id, text,
-          { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
-        );
+        return editAndSplit(ctx, loadingMsg, text);
       }
       return ctx.api.editMessageText(
         ctx.chat.id, loadingMsg.message_id,
@@ -827,10 +880,7 @@ bot.command("tasks", ctx => guard(ctx, async () => {
       );
     }
     const text = buildTasksSectionResilient(tasksData, null);
-    return ctx.api.editMessageText(
-      ctx.chat.id, loadingMsg.message_id, text,
-      { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
-    );
+    return editAndSplit(ctx, loadingMsg, text);
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
     return ctx.api.editMessageText(
@@ -861,10 +911,7 @@ bot.command("stale", ctx => guard(ctx, async () => {
     const text =
       `🟡 <b>Заглохли</b>  · <i>${stale.length} сделок &gt;14d</i>\n\n` +
       dealBlocks.join("\n\n");
-    return ctx.api.editMessageText(
-      ctx.chat.id, loadingMsg.message_id, text,
-      { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
-    );
+    return editAndSplit(ctx, loadingMsg, text);
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
     return ctx.api.editMessageText(
@@ -892,10 +939,7 @@ bot.command("replies", ctx => guard(ctx, async () => {
       );
     }
     const block = buildRepliesSection(result);
-    return ctx.api.editMessageText(
-      ctx.chat.id, loadingMsg.message_id, block,
-      { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
-    );
+    return editAndSplit(ctx, loadingMsg, block);
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
     return ctx.api.editMessageText(
@@ -928,11 +972,8 @@ async function sendMorningPush() {
     const text = composeTodayDigest(data, { header, withDisclaimer: true });
     for (const userId of MORNING_PUSH_USERS) {
       try {
-        await bot.api.sendMessage(userId, text, {
-          parse_mode: "HTML",
-          link_preview_options: { is_disabled: true },
-        });
-        console.log(`[cron] morning push sent to ${userId}`);
+        await sendSplit(userId, text);
+        console.log(`[cron] morning push sent to ${userId} (${text.length} chars)`);
       } catch (err) {
         console.error(`[cron] morning push to ${userId} failed:`, err.message);
       }

@@ -20,14 +20,15 @@ const GITHUB_PAT    = process.env.GITHUB_PAT;
 const GOOGLE_OAUTH  = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REFRESH_TOKEN_PAVEL);
 
 // ── Routes ────────────────────────────────────────────────────────────────────
-app.use("/apollo",   require("./routes/apollo"));
-app.use("/heyreach", require("./routes/heyreach"));
-app.use("/notion",   require("./routes/notion"));
-app.use("/parallel", require("./routes/parallel"));
-app.use("/beeper",   require("./routes/beeper"));
-app.use("/calendar", require("./routes/calendar"));
-app.use("/webhook",  require("./routes/webhooks"));
-app.use("/mcp",      require("./routes/mcp")); // ← Custom Connector endpoint for claude.ai
+app.use("/apollo",         require("./routes/apollo"));
+app.use("/heyreach",       require("./routes/heyreach"));
+app.use("/notion",         require("./routes/notion"));
+app.use("/parallel",       require("./routes/parallel"));
+app.use("/beeper",         require("./routes/beeper"));
+app.use("/calendar",       require("./routes/calendar"));
+app.use("/webhook",        require("./routes/webhooks"));
+app.use("/mcp",            require("./routes/mcp")); // ← Custom Connector endpoint for claude.ai
+app.use("/messaging-hub",  require("./routes/messaging-hub")); // ← Beeper fallback (Notion source)
 
 // ── Beeper sync job (mounted under /beeper/*) ─────────────────────────────────
 const beeperSync = require("./jobs/beeper-sync");
@@ -49,9 +50,9 @@ app.get("/health", (_, res) => res.json({
   calendar: GOOGLE_OAUTH,
   apollo:   !!process.env.APOLLO_KEY,
   mcp:      true,
-  version:  "3.14.0",
+  version:  "3.15.0",
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.14.0", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.15.0", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

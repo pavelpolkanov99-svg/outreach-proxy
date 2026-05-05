@@ -5,7 +5,7 @@ const cron    = require("node-cron");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.17.0-yesterday-late-stage-filter";
+const VERSION      = "4.18.0-deeplinks";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -50,6 +50,18 @@ function esc(text) {
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+// Build a clickable name with optional deeplink. If deeplink is null, returns
+// just <b>esc(name)</b>. If present, wraps name in <a href> and appends 🔗
+// icon for visual affordance (so Anton sees "this is tappable").
+//
+// Per Anton's UX answer "оба" — name itself is clickable AND there's a small
+// icon. Icon goes after to keep the name's visual weight first.
+function renderClickableName(name, deeplinkUrl) {
+  const safeName = esc(name);
+  if (!deeplinkUrl) return `<b>${safeName}</b>`;
+  return `<a href="${esc(deeplinkUrl)}"><b>${safeName}</b></a> 🔗`;
+}
+
 function withTimeout(promise, ms, label) {
   let timer;
   const timeout = new Promise(resolve => {
@@ -62,7 +74,7 @@ function withTimeout(promise, ms, label) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Message splitting — Telegram has a 4096-char hard limit on message bodies.
+// Message splitting
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MAX_MESSAGE_LEN = 4000;
@@ -368,13 +380,16 @@ function renderCompletedTask(task) {
   return lines.join("\n");
 }
 
+// v4.18: chat name is now clickable (deeplink to native chat) when proxy
+// resolved a contact for it. Falls back to plain bold name when no deeplink.
 function renderReply(reply) {
   const lines = [];
   const networkBadge = NET_BADGE[reply.networkFull] || NET_BADGE[reply.network] || "💬";
   const idle = reply.hoursIdle != null ? `${Math.round(reply.hoursIdle)}h` : "?";
   const networkLabel = reply.networkFull || reply.network || "Chat";
 
-  lines.push(`${networkBadge} <b>${esc(reply.name)}</b> · ${esc(networkLabel)} · <b>${idle}</b>`);
+  const clickableName = renderClickableName(reply.name, reply.deeplink);
+  lines.push(`${networkBadge} ${clickableName} · ${esc(networkLabel)} · <b>${idle}</b>`);
 
   const indent = "   ";
   const snippet = (reply.lastMsgText || "").slice(0, 200);
@@ -595,16 +610,7 @@ function buildStaleSection(stale) {
   );
 }
 
-// Yesterday block — v4.17 adds late-stage filter labels.
-//
-// Header layout:
-//   📆 Что было вчера (2026-04-29) · только важные сделки (скрыто 12 не-важных)
-//                                  ─── filter tag ───  ─── drop counter ───
-//                                  shown when filteredBy=late-stages
-//
-// Per-network topChats now show CRM stage inline:
-//   → Maximilian Bruckner (Negotiations): "Sorry for getting back so late..."
-//   ← Patrick Chu (Warm discussions): "Looking forward to chatting next week"
+// v4.18: topChats names now clickable when deeplink available
 function buildYesterdaySection(summary) {
   if (!summary) {
     return `📆 <b>Что было вчера</b>\n\n<i>⚠️ Не удалось получить summary мессенджеров.</i>`;
@@ -614,7 +620,6 @@ function buildYesterdaySection(summary) {
   }
   const networks = summary.networks || [];
 
-  // Build filter tag for header
   const isFiltered = summary.filteredBy === "late-stages";
   let filterTag = "";
   if (isFiltered) {
@@ -624,7 +629,6 @@ function buildYesterdaySection(summary) {
       : `  · <i>только важные сделки</i>`;
   }
 
-  // Source label (Hub / stale data)
   let sourceLabel = "";
   if (summary.source === "hub-fresh") {
     sourceLabel = `  · <i>из Messaging Hub</i>`;
@@ -634,7 +638,6 @@ function buildYesterdaySection(summary) {
     return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n\n<i>Активности не было.</i>`;
   }
 
-  // Empty after filter — clear messaging
   if (networks.length === 0) {
     if (isFiltered && summary.totalBeforeFilter > 0) {
       return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n\n<i>Активности по поздним статусам не было (всего ${summary.totalBeforeFilter} чатов, все early-stage или не в CRM).</i>`;
@@ -663,10 +666,14 @@ function buildYesterdaySection(summary) {
       lines.push("");
       for (const c of net.topChats) {
         const arrow = c.direction === "→" ? "→" : "←";
-        const safeName = esc(c.name).slice(0, 40);
+        // Truncate name for display, but use full name in clickable link
+        const displayName = (c.name || "").length > 40
+          ? (c.name || "").slice(0, 40) + "..."
+          : c.name;
+        const clickableName = renderClickableName(displayName, c.deeplink);
         const stagePart = c.crmStage ? ` <i>(${esc(c.crmStage)})</i>` : "";
         const safeSnippet = esc(c.snippet || "");
-        lines.push(`   <code>${arrow}</code> <b>${safeName}</b>${stagePart}: <i>${safeSnippet}</i>`);
+        lines.push(`   <code>${arrow}</code> ${clickableName}${stagePart}: <i>${safeSnippet}</i>`);
       }
     }
 

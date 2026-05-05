@@ -9,6 +9,7 @@ const router = express.Router();
 
 const MESSAGES_HUB_DB     = "8617a441c4254b41be671a1e65946a03";
 const NOTION_COMPANIES_DB = "f9b59c5b05fa4df18f9569479633fd74";
+const NOTION_PEOPLE_DB    = "f36b2a0f0ab241cebbdbd1d0874a55be";
 
 // Internal sender heuristics — same regex used in beeper/replies-waiting
 const INTERNAL_SENDER_REGEX = /(anton ceo|antón|^антон$|^pavel|polkanov|@pavel-remide:beeper\.com|titov|anton t)/i;
@@ -18,10 +19,6 @@ function isInternalSenderText(s) {
   return INTERNAL_SENDER_REGEX.test(s);
 }
 
-// Try to figure out if the last message in a Hub row was sent by Anton/Pavel.
-// The Hub stores `Raw Sender Name` for many rows but not all. Fall back to
-// `Participants` parsing or returning false (= treat as inbound) which is safer
-// for the digest (we'd rather show a slightly off chat than miss one).
 function hubRowIsOutbound(props) {
   const rawSender = (props["Raw Sender Name"]?.rich_text || [])
     .map(rt => rt.plain_text || rt.text?.content || "").join("");
@@ -29,8 +26,56 @@ function hubRowIsOutbound(props) {
   return false;
 }
 
-// Resolve linked company name from Link: Companies relation. Returns the first
-// linked Company's title, or null. Bounded fetch (timeout 4s) per row.
+// ─────────────────────────────────────────────────────────────────────────────
+// Deeplink helpers (v3.18.5) — same logic as routes/yesterday.js & beeper.js.
+// Resolves Notion People row → contacts → native chat URL.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function extractPersonContacts(personPage) {
+  if (!personPage) return null;
+  const props = personPage.properties || {};
+
+  let telegram = null;
+  const tgArr = props["Telegram"]?.rich_text || [];
+  const tgRaw = tgArr.map(t => t.plain_text || t.text?.content || "").join("").trim();
+  if (tgRaw) {
+    const cleaned = tgRaw.replace(/^@/, "").trim();
+    if (/^[a-zA-Z0-9_]{4,32}$/.test(cleaned)) telegram = cleaned;
+  }
+
+  let phone = null;
+  const phoneRaw = props["Phone"]?.phone_number;
+  if (phoneRaw) {
+    const digits = String(phoneRaw).replace(/[^\d]/g, "");
+    if (digits.length >= 7 && digits.length <= 15) phone = digits;
+  }
+
+  let linkedin = props["LinkedIn"]?.url || null;
+  if (linkedin && !/^https?:\/\//i.test(linkedin)) {
+    linkedin = `https://${linkedin}`;
+  }
+
+  if (!telegram && !phone && !linkedin) return null;
+  return { telegram, phone, linkedin };
+}
+
+function buildChatDeeplink(networkFull, contacts) {
+  if (!contacts) return null;
+
+  if (networkFull === "WhatsApp" && contacts.phone) {
+    return { url: `https://wa.me/${contacts.phone}`, label: "wa.me" };
+  }
+  if (networkFull === "Telegram" && contacts.telegram) {
+    return { url: `https://t.me/${contacts.telegram}`, label: "t.me" };
+  }
+  if (networkFull === "LinkedIn" && contacts.linkedin) {
+    return { url: contacts.linkedin, label: "linkedin" };
+  }
+  return null;
+}
+
+// Resolve linked company. Now ALSO pulls first attached person's contacts
+// so bot can render clickable deeplink. Best-effort — silent on errors.
 async function resolveLinkedCompany(relationArr) {
   if (!Array.isArray(relationArr) || relationArr.length === 0) return null;
   const id = relationArr[0]?.id;
@@ -46,25 +91,46 @@ async function resolveLinkedCompany(relationArr) {
     const stage = props["Stage"]?.status?.name || null;
     const bdScore = props["BD Score"]?.number ?? null;
     const priority = props["Priority"]?.select?.name || null;
-    return { name: name || null, stage, bdScore, priority };
+
+    // NEW v3.18.5: pull first attached person's contacts
+    let personContacts = null;
+    const peopleRel = props["People"]?.relation || [];
+    if (peopleRel.length > 0) {
+      try {
+        const personRes = await axios.get(
+          `https://api.notion.com/v1/pages/${peopleRel[0].id}`,
+          { headers: notionHeaders(), timeout: 4000 }
+        );
+        personContacts = extractPersonContacts(personRes.data);
+      } catch (_) { /* swallow */ }
+    }
+
+    return { name: name || null, stage, bdScore, priority, personContacts };
+  } catch (_) {
+    return null;
+  }
+}
+
+// NEW v3.18.5: also try Hub's "Link: People" relation directly. The Hub schema
+// has both "Link: Companies" AND "Link: People" — for LinkedIn DM rows the
+// person is linked directly. Use this BEFORE falling back to company.People[0].
+async function resolveLinkedPerson(relationArr) {
+  if (!Array.isArray(relationArr) || relationArr.length === 0) return null;
+  const id = relationArr[0]?.id;
+  if (!id) return null;
+  try {
+    const r = await axios.get(`https://api.notion.com/v1/pages/${id}`, {
+      headers: notionHeaders(),
+      timeout: 4000,
+    });
+    return extractPersonContacts(r.data);
   } catch (_) {
     return null;
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /messaging-hub/replies-waiting
-//
-// Reads from Notion Messaging Hub DB instead of Beeper. Used as the fallback
-// when Beeper desktop is offline (e.g. Pavel's laptop closed).
-//
-// Filter: Status=Active, Last edited time within `days` (default 7).
-// Strips internal-sender-only rows (where Anton sent last). Sorts by
-// last_edited_time descending so freshest replies show first.
-//
-// Note: Hub data is only as fresh as the last successful Beeper sync. The
-// caller (bot) should add a "data may be stale" disclaimer when serving
-// from this fallback.
+// GET /messaging-hub/replies-waiting (v3.18.5 — adds deeplinks)
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.get("/replies-waiting", async (req, res) => {
@@ -95,12 +161,11 @@ router.get("/replies-waiting", async (req, res) => {
         sorts: [
           { timestamp: "last_edited_time", direction: "descending" },
         ],
-        page_size: Math.min(limit * 3, 60), // overfetch for filtering
+        page_size: Math.min(limit * 3, 60),
       },
       { headers: notionHeaders(), timeout: 10_000 }
     );
 
-    // First pass — extract & cheap-filter
     const candidates = r.data.results.map(page => {
       const props = page.properties || {};
       const titleArr = props["Chat Name"]?.title || [];
@@ -116,11 +181,10 @@ router.get("/replies-waiting", async (req, res) => {
       const participants = participantsArr.map(rt => rt.plain_text || rt.text?.content || "").join("");
 
       const linkedCompaniesRel = props["Link: Companies"]?.relation || [];
+      const linkedPeopleRel    = props["Link: People"]?.relation    || [];
 
       const lastEditedTime = page.last_edited_time;
       const lastActiveDate = props["Last Active"]?.date?.start || null;
-
-      // Use Last Active if present (more accurate), else last_edited_time
       const effectiveTime = lastActiveDate || lastEditedTime;
 
       return {
@@ -128,40 +192,44 @@ router.get("/replies-waiting", async (req, res) => {
         name,
         networkFull,
         lastMsgText,
-        lastMsgSender: participants, // best approximation in Hub
+        lastMsgSender: participants,
         participants,
         lastMsgTime: effectiveTime,
         outbound: hubRowIsOutbound(props),
         linkedCompaniesRel,
+        linkedPeopleRel,
       };
     });
 
-    // Filter: drop outbound, drop empty, drop too-recent (less than hoursIdle ago)
     const filtered = candidates.filter(c => {
       if (c.outbound) return false;
       if (!c.lastMsgText || !c.lastMsgText.trim()) return false;
       if (!c.lastMsgTime) return false;
       const ts = Date.parse(c.lastMsgTime);
       if (isNaN(ts)) return false;
-      if (ts > idleCutoffMs) return false; // too recent — Anton doesn't owe a reply yet
-      // Drop internal chat rooms by name pattern
+      if (ts > idleCutoffMs) return false;
       if (/(remide\s*\|.*advisor|plexo\s*\|.*advisor|beeper developer|remide team|plexo team)/i.test(c.name)) return false;
       return true;
     });
 
-    // Sort: oldest unanswered first (longest wait at top)
     filtered.sort((a, b) => Date.parse(a.lastMsgTime) - Date.parse(b.lastMsgTime));
 
     const top = filtered.slice(0, limit);
 
-    // Resolve linked companies in parallel (bounded)
     const enriched = await Promise.all(top.map(async c => {
-      const company = await resolveLinkedCompany(c.linkedCompaniesRel);
+      // Resolve company AND person in parallel
+      const [company, personContacts] = await Promise.all([
+        resolveLinkedCompany(c.linkedCompaniesRel),
+        resolveLinkedPerson(c.linkedPeopleRel),
+      ]);
+
       const idleMs = Date.now() - Date.parse(c.lastMsgTime);
       const hoursIdleVal = Math.round(idleMs / (60 * 60 * 1000) * 10) / 10;
-
-      // Visual tier: primary if linked to CRM company, else secondary
       const visualTier = company ? "primary" : "secondary";
+
+      // Deeplink priority: linked-person contacts → company's first-person contacts
+      const contacts = personContacts || company?.personContacts || null;
+      const deeplinkObj = buildChatDeeplink(c.networkFull, contacts);
 
       return {
         pageId: c.pageId,
@@ -173,9 +241,14 @@ router.get("/replies-waiting", async (req, res) => {
         hoursIdle: hoursIdleVal,
         notion: company,
         visualTier,
-        type: "single", // Hub doesn't reliably track group/single — default single
+        type: "single",
+        deeplink: deeplinkObj?.url || null,
+        deeplinkLabel: deeplinkObj?.label || null,
       };
     }));
+
+    const deeplinkCount = enriched.filter(e => e.deeplink).length;
+    console.log(`[messaging-hub/replies-waiting] returned ${enriched.length} replies, ${deeplinkCount} with deeplinks`);
 
     res.json({
       ok: true,

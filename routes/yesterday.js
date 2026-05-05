@@ -104,42 +104,132 @@ function extractLookupCandidate(chatName) {
   return candidate;
 }
 
-// Extract a person-name candidate from a chat name. Different from
-// extractLookupCandidate which prefers the company-side after "|".
-// For people lookup we want the FULL person name (typically before "|"
-// or the whole name for direct DMs).
-//
-//   "Patrick Chu | Agora"  → "Patrick Chu"  (person side, before |)
-//   "Maximilian Bruckner"  → "Maximilian Bruckner"
-//   "Renna Ba | Morph"     → "Renna Ba"
-//   "Plexo <> Bridge"      → null (no person hint)
-//   "Hector Ramirez | Bitso Business" → "Hector Ramirez"
 function extractPersonCandidate(chatName) {
   if (!chatName) return null;
   let s = String(chatName).trim();
 
-  // Skip group-chat patterns
   if (/^Plexo\s*[<>x×|]/i.test(s)) return null;
 
-  // Take left side of "|" / "—" / "–" if present
   const sepMatch = s.match(/^(.+?)\s*[|—–]\s*/);
   if (sepMatch && sepMatch[1].trim().length >= 3) {
     s = sepMatch[1].trim();
   }
 
-  // Person should be 2+ words (first + last name)
   const tokens = s.split(/\s+/).filter(Boolean);
   if (tokens.length < 1) return null;
-  // Single-token names are still usable (e.g. "Modupe", "Polina")
-  // but skip if it's a generic word
   if (tokens.length === 1 && GENERIC_SEED_WORDS.has(tokens[0].toLowerCase())) return null;
 
-  return tokens.slice(0, 3).join(" "); // First 3 tokens max — drops emoji/badges
+  return tokens.slice(0, 3).join(" ");
 }
 
-// Resolve a Notion company page by ID — returns {name, stage, bdScore} or null.
-// Used by People-fallback path.
-async function resolveCompanyPage(pageId) {
+// ─────────────────────────────────────────────────────────────────────────────
+// Deeplink construction (v3.18.4)
+//
+// For each chat, we want Anton to be able to TAP the name and land directly
+// in that chat in the native client (WhatsApp / Telegram / LinkedIn profile).
+//
+// Beeper's chat.id is a matrix-internal ID — useless for this. The actual
+// contact identity (phone, @username, linkedin URL) lives in Notion People DB.
+//
+// Coverage flow:
+//   1. extractPersonContacts(personPage) — pull Telegram/Phone/LinkedIn fields
+//      from a Notion People row.
+//   2. resolveCompanyContacts(companyPageId) — for company-matched chats
+//      (e.g. "Plexo <> XTransfer"), follow Company.People relation and
+//      grab first attached person's contacts.
+//   3. buildChatDeeplink(networkFull, contacts) — turn contacts into native URL.
+//
+// LinkedIn limitation: there's no public deeplink to a specific DM thread.
+// Best we can do is the profile URL — Anton taps once → profile → Message
+// button is right there.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Parse contact fields from a Notion People DB page. All fields optional.
+function extractPersonContacts(personPage) {
+  if (!personPage) return null;
+  const props = personPage.properties || {};
+
+  // Telegram is rich_text in People DB (e.g. "@m4rtr3d")
+  let telegram = null;
+  const tgArr = props["Telegram"]?.rich_text || [];
+  const tgRaw = tgArr.map(t => t.plain_text || t.text?.content || "").join("").trim();
+  if (tgRaw) {
+    // Normalize: strip leading "@", trim, validate it looks like a username
+    const cleaned = tgRaw.replace(/^@/, "").trim();
+    if (/^[a-zA-Z0-9_]{4,32}$/.test(cleaned)) telegram = cleaned;
+  }
+
+  // Phone is phone_number type
+  let phone = null;
+  const phoneRaw = props["Phone"]?.phone_number;
+  if (phoneRaw) {
+    // Strip everything except digits
+    const digits = String(phoneRaw).replace(/[^\d]/g, "");
+    if (digits.length >= 7 && digits.length <= 15) phone = digits;
+  }
+
+  // LinkedIn is url type
+  let linkedin = props["LinkedIn"]?.url || null;
+  if (linkedin && !/^https?:\/\//i.test(linkedin)) {
+    linkedin = `https://${linkedin}`;
+  }
+
+  if (!telegram && !phone && !linkedin) return null;
+  return { telegram, phone, linkedin };
+}
+
+// Resolve a company page → first attached person's contacts.
+// Used for group chats matched by company name.
+async function resolveCompanyContacts(companyPageId) {
+  if (!companyPageId) return null;
+  try {
+    const r = await axios.get(
+      `https://api.notion.com/v1/pages/${companyPageId}`,
+      { headers: notionHeaders(), timeout: 6_000 }
+    );
+    const peopleRel = r.data.properties?.People?.relation || [];
+    if (!peopleRel.length) return null;
+
+    // Take first linked person and resolve their page
+    const personPageRes = await axios.get(
+      `https://api.notion.com/v1/pages/${peopleRel[0].id}`,
+      { headers: notionHeaders(), timeout: 6_000 }
+    );
+    return extractPersonContacts(personPageRes.data);
+  } catch (err) {
+    console.warn(`[yesterday/lookup] resolveCompanyContacts(${companyPageId}) failed:`, err.message);
+    return null;
+  }
+}
+
+// Pure function: contacts → deeplink URL for the chat's network.
+// Returns { url, label } where label is "wa.me" / "t.me" / "linkedin" so
+// the bot can pick a small icon. Returns null if no usable contact.
+function buildChatDeeplink(networkFull, contacts) {
+  if (!contacts) return null;
+
+  if (networkFull === "WhatsApp" && contacts.phone) {
+    return { url: `https://wa.me/${contacts.phone}`, label: "wa.me" };
+  }
+
+  if (networkFull === "Telegram" && contacts.telegram) {
+    return { url: `https://t.me/${contacts.telegram}`, label: "t.me" };
+  }
+
+  if (networkFull === "LinkedIn" && contacts.linkedin) {
+    return { url: contacts.linkedin, label: "linkedin" };
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Notion lookups
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Resolve a Notion company page by ID — returns full info incl. attached
+// person's contacts (for group-chat deeplinks).
+async function resolveCompanyPage(pageId, withContacts = false) {
   try {
     const r = await axios.get(
       `https://api.notion.com/v1/pages/${pageId}`,
@@ -152,20 +242,35 @@ async function resolveCompanyPage(pageId) {
     const bdScore = props["BD Score"]?.number ?? null;
     const skipStages = new Set(["Lost", "DELETE", "Not relevant"]);
     if (stage && skipStages.has(stage)) return null;
-    return { name: cname, stage, bdScore };
+
+    const result = { name: cname, stage, bdScore, _pageId: pageId };
+
+    if (withContacts) {
+      const peopleRel = props["People"]?.relation || [];
+      if (peopleRel.length > 0) {
+        try {
+          const personRes = await axios.get(
+            `https://api.notion.com/v1/pages/${peopleRel[0].id}`,
+            { headers: notionHeaders(), timeout: 6_000 }
+          );
+          const contacts = extractPersonContacts(personRes.data);
+          if (contacts) result.personContacts = contacts;
+        } catch (e) { /* swallow */ }
+      }
+    }
+
+    return result;
   } catch (err) {
     console.warn(`[yesterday/lookup] resolveCompanyPage(${pageId}) failed:`, err.message);
     return null;
   }
 }
 
-// Look up a person in People DB by name — returns linked Company stage info.
-// Falls back to null if not found, person has no Company relation, or company
-// is in a skip-stage.
+// Person lookup — returns stage info from linked company AND person's own
+// contact fields (Telegram/Phone/LinkedIn from People DB row).
 async function lookupPersonStage(personCandidate) {
   if (!NOTION_TOKEN || !personCandidate) return null;
   try {
-    // Search by first token (more permissive for fuzzy matches)
     const firstToken = personCandidate.split(/\s+/)[0];
     if (!firstToken || firstToken.length < 3) return null;
 
@@ -180,7 +285,6 @@ async function lookupPersonStage(personCandidate) {
 
     if (!r.data.results.length) return null;
 
-    // Prefer the one whose name CONTAINS the full personCandidate (case-insensitive)
     const lowerCandidate = personCandidate.toLowerCase();
     const exactMatch = r.data.results.find(page => {
       const titleArr = page.properties?.Name?.title || [];
@@ -189,12 +293,21 @@ async function lookupPersonStage(personCandidate) {
     });
     const person = exactMatch || r.data.results[0];
 
-    const companyRel = person.properties?.Company?.relation || [];
-    if (!companyRel.length) return null;
+    // Pull person's own contact fields — these are PRIMARY source for deeplink
+    const personContacts = extractPersonContacts(person);
 
-    // First linked company — resolve it
-    const companyInfo = await resolveCompanyPage(companyRel[0].id);
-    return companyInfo;
+    const companyRel = person.properties?.Company?.relation || [];
+    let companyInfo = null;
+    if (companyRel.length) {
+      companyInfo = await resolveCompanyPage(companyRel[0].id, false);
+    }
+
+    if (!companyInfo && !personContacts) return null;
+
+    return {
+      ...(companyInfo || {}),
+      personContacts,
+    };
   } catch (err) {
     console.warn(`[yesterday/lookup] person lookup failed for "${personCandidate}":`, err.message);
     return null;
@@ -217,7 +330,6 @@ async function batchLookupCRMStages(chatNames) {
       }
       candidateToChatNames.get(key).names.push(name);
     }
-    // Always also try person-lookup as a fallback later
     const personCand = extractPersonCandidate(name);
     if (personCand) {
       const pKey = personCand.toLowerCase();
@@ -230,7 +342,7 @@ async function batchLookupCRMStages(chatNames) {
 
   console.log(`[yesterday/lookup] ${chatNames.length} chats → ${candidateToChatNames.size} company candidates, ${personCandidateToChatNames.size} person candidates`);
 
-  // ── PASS 1: Company-name lookup ──
+  // ── PASS 1: Company-name lookup with contacts ──
   await Promise.all([...candidateToChatNames.values()].map(async ({ candidate, names }) => {
     try {
       const r = await axios.post(
@@ -242,20 +354,36 @@ async function batchLookupCRMStages(chatNames) {
         { headers: notionHeaders(), timeout: 8_000 }
       );
       const skipStages = new Set(["Lost", "DELETE", "Not relevant"]);
-      const candidates = r.data.results.map(page => {
-        const props = page.properties || {};
-        const titleArr = props["Company name"]?.title || [];
-        const cname = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
-        const stage = props["Stage"]?.status?.name || null;
-        const bdScore = props["BD Score"]?.number ?? null;
-        return { name: cname, stage, bdScore };
-      }).filter(c => !skipStages.has(c.stage));
+      const candidates = r.data.results
+        .map(page => {
+          const props = page.properties || {};
+          const titleArr = props["Company name"]?.title || [];
+          const cname = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
+          const stage = props["Stage"]?.status?.name || null;
+          const bdScore = props["BD Score"]?.number ?? null;
+          const peopleRel = props["People"]?.relation || [];
+          return { name: cname, stage, bdScore, _pageId: page.id, _firstPersonId: peopleRel[0]?.id || null };
+        })
+        .filter(c => !skipStages.has(c.stage));
 
       const best = candidates[0] || null;
       if (best) {
-        console.log(`[yesterday/lookup] company "${candidate}" → "${best.name}" (${best.stage})`);
+        // For company-matched chats — try resolve first attached person's contacts
+        let personContacts = null;
+        if (best._firstPersonId) {
+          try {
+            const personRes = await axios.get(
+              `https://api.notion.com/v1/pages/${best._firstPersonId}`,
+              { headers: notionHeaders(), timeout: 6_000 }
+            );
+            personContacts = extractPersonContacts(personRes.data);
+          } catch (e) { /* swallow */ }
+        }
+        const enriched = { ...best, personContacts };
+        delete enriched._firstPersonId;
+        console.log(`[yesterday/lookup] company "${candidate}" → "${best.name}" (${best.stage})${personContacts ? " +contacts" : ""}`);
         for (const chatName of names) {
-          result.set(chatName, best);
+          result.set(chatName, enriched);
         }
       }
     } catch (err) {
@@ -264,7 +392,6 @@ async function batchLookupCRMStages(chatNames) {
   }));
 
   // ── PASS 2: People-fallback for chats not yet matched ──
-  // For each chat that didn't get a Company match, try People DB lookup.
   const unmatchedPersonLookups = [];
   for (const [pKey, { candidate, names }] of personCandidateToChatNames) {
     const allNamesAlreadyMatched = names.every(n => result.has(n));
@@ -277,7 +404,7 @@ async function batchLookupCRMStages(chatNames) {
     await Promise.all(unmatchedPersonLookups.map(async ({ candidate, names }) => {
       const stageInfo = await lookupPersonStage(candidate);
       if (stageInfo) {
-        console.log(`[yesterday/lookup] person "${candidate}" → "${stageInfo.name}" (${stageInfo.stage})`);
+        console.log(`[yesterday/lookup] person "${candidate}" → "${stageInfo.name || "?"}" (${stageInfo.stage || "no-stage"})${stageInfo.personContacts ? " +contacts" : ""}`);
         for (const chatName of names) {
           if (!result.has(chatName)) result.set(chatName, stageInfo);
         }
@@ -287,7 +414,6 @@ async function batchLookupCRMStages(chatNames) {
     }));
   }
 
-  // Fill nulls for chats that didn't match anything
   for (const name of chatNames) {
     if (!result.has(name)) result.set(name, null);
   }
@@ -562,6 +688,8 @@ function buildNetworkPayload(group) {
   return items;
 }
 
+// Top chats per network — now also includes deeplink derived from
+// chat.crm.personContacts via buildChatDeeplink.
 function pickTopChats(group, n = 3) {
   const scored = group.chats.map(chat => {
     const msgs = chat.messagesYesterday || [];
@@ -577,6 +705,11 @@ function pickTopChats(group, n = 3) {
     const lastMsg = chat.messagesYesterday[chat.messagesYesterday.length - 1];
     const direction = lastMsg?.isSender ? "→" : "←";
     const snippet = (lastMsg?.text || "").slice(0, 120);
+
+    // Build deeplink from CRM person contacts
+    const contacts = chat.crm?.personContacts;
+    const deeplinkObj = buildChatDeeplink(chat.networkFull, contacts);
+
     return {
       name: chat.name,
       direction,
@@ -584,20 +717,15 @@ function pickTopChats(group, n = 3) {
       snippet,
       crmStage: chat.crm?.stage || null,
       bdScore: chat.crm?.bdScore ?? null,
+      deeplink: deeplinkObj?.url || null,
+      deeplinkLabel: deeplinkObj?.label || null,
     };
   });
 }
 
-// Non-AI fallback summary — generates simple bullets from items metadata
-// without calling Anthropic. Used when AI is unavailable / errored.
-//
-// Strategy: highlight outbound (Anton initiated something) and high-stage
-// inbound (counterparty in Negotiations/Call Scheduled responded). Keep it
-// short and factual — no inferences.
 function generateFallbackSummary(items) {
   if (!items.length) return { bullets: [], skipped: true, fallback: true };
 
-  // Sort items by importance: stage rank first, then outbound count, then chat name
   const ranked = items.slice().sort((a, b) => {
     const stageA = a.crm?.stage ? (STAGE_RANK[a.crm.stage] || 0) : 0;
     const stageB = b.crm?.stage ? (STAGE_RANK[b.crm.stage] || 0) : 0;
@@ -701,7 +829,6 @@ ${conversationText}
     return { bullets };
   } catch (err) {
     console.error(`[yesterday/summary] AI failed for ${networkHeader}:`, err.message);
-    // Fallback to non-AI summary instead of error message
     const fallback = generateFallbackSummary(items);
     fallback.aiError = err.message;
     return fallback;
@@ -798,7 +925,6 @@ router.get("/summary", async (req, res) => {
   let dropped = 0;
   let crmMap = new Map();
   if (chats.length > 0) {
-    // Always run CRM lookup — even when filter is off — so topChats can show stage
     const chatNames = chats.map(c => c.name).filter(Boolean);
     crmMap = await batchLookupCRMStages(chatNames);
     const enriched = chats.map(c => ({ ...c, crm: crmMap.get(c.name) || null }));
@@ -835,7 +961,10 @@ router.get("/summary", async (req, res) => {
     };
   }));
 
-  console.log(`[yesterday] === END === ${Date.now() - t0}ms · source=${source} · totalBefore=${totalBeforeFilter} · dropped=${dropped} · networks=${networks.length}`);
+  // Count deeplinks for visibility / debugging
+  const deeplinkCount = networks.reduce((sum, n) =>
+    sum + (n.topChats || []).filter(c => c.deeplink).length, 0);
+  console.log(`[yesterday] === END === ${Date.now() - t0}ms · source=${source} · totalBefore=${totalBeforeFilter} · dropped=${dropped} · networks=${networks.length} · deeplinks=${deeplinkCount}`);
 
   return res.json({
     ok: true,

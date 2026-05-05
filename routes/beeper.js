@@ -24,6 +24,57 @@ const {
 
 const router = express.Router();
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Deeplink helpers (v3.18.4) — same logic as routes/yesterday.js, duplicated
+// here to avoid cross-module coupling. If we extract this, do it via lib/.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function extractPersonContacts(personPage) {
+  if (!personPage) return null;
+  const props = personPage.properties || {};
+
+  let telegram = null;
+  const tgArr = props["Telegram"]?.rich_text || [];
+  const tgRaw = tgArr.map(t => t.plain_text || t.text?.content || "").join("").trim();
+  if (tgRaw) {
+    const cleaned = tgRaw.replace(/^@/, "").trim();
+    if (/^[a-zA-Z0-9_]{4,32}$/.test(cleaned)) telegram = cleaned;
+  }
+
+  let phone = null;
+  const phoneRaw = props["Phone"]?.phone_number;
+  if (phoneRaw) {
+    const digits = String(phoneRaw).replace(/[^\d]/g, "");
+    if (digits.length >= 7 && digits.length <= 15) phone = digits;
+  }
+
+  let linkedin = props["LinkedIn"]?.url || null;
+  if (linkedin && !/^https?:\/\//i.test(linkedin)) {
+    linkedin = `https://${linkedin}`;
+  }
+
+  if (!telegram && !phone && !linkedin) return null;
+  return { telegram, phone, linkedin };
+}
+
+function buildChatDeeplink(networkFull, contacts) {
+  if (!contacts) return null;
+
+  if (networkFull === "WhatsApp" && contacts.phone) {
+    return { url: `https://wa.me/${contacts.phone}`, label: "wa.me" };
+  }
+
+  if (networkFull === "Telegram" && contacts.telegram) {
+    return { url: `https://t.me/${contacts.telegram}`, label: "t.me" };
+  }
+
+  if (networkFull === "LinkedIn" && contacts.linkedin) {
+    return { url: contacts.linkedin, label: "linkedin" };
+  }
+
+  return null;
+}
+
 // ── GET /beeper/health ────────────────────────────────────────────────────────
 router.get("/health", async (req, res) => {
   if (!BEEPER_TOKEN) return res.status(500).json({ error: "BEEPER_TOKEN not set" });
@@ -253,6 +304,8 @@ const GENERIC_SEED_WORDS = new Set([
   "beeper", "telegram",
 ]);
 
+// v3.18.4: now also resolves first attached person and pulls their contacts
+// for deeplink construction.
 async function lookupCompanyByName(name) {
   if (!NOTION_TOKEN || !name) return null;
   try {
@@ -274,7 +327,8 @@ async function lookupCompanyByName(name) {
     );
     const page = r.data.results?.[0];
     if (!page) return null;
-    return {
+
+    const result = {
       pageId: page.id,
       url:    page.url,
       name:   page.properties["Company name"]?.title?.[0]?.text?.content || candidate,
@@ -282,11 +336,27 @@ async function lookupCompanyByName(name) {
       priority: page.properties["Priority"]?.select?.name || null,
       bdScore: page.properties["BD Score"]?.number ?? null,
     };
+
+    // NEW: resolve first attached person → personContacts for deeplink
+    const peopleRel = page.properties["People"]?.relation || [];
+    if (peopleRel.length > 0) {
+      try {
+        const personRes = await axios.get(
+          `https://api.notion.com/v1/pages/${peopleRel[0].id}`,
+          { headers: notionHeaders(), timeout: 6000 }
+        );
+        const contacts = extractPersonContacts(personRes.data);
+        if (contacts) result.personContacts = contacts;
+      } catch (_) { /* swallow */ }
+    }
+
+    return result;
   } catch (err) {
     return null;
   }
 }
 
+// v3.18.4: returns personContacts for the matched person (Telegram/Phone/LinkedIn)
 async function lookupPersonByName(name) {
   if (!NOTION_TOKEN || !name) return null;
   if (/anton|pavel|paul|polkanov|titov|@pavel-remide:beeper\.com/i.test(name)) return null;
@@ -302,6 +372,9 @@ async function lookupPersonByName(name) {
     const page = r.data.results?.[0];
     if (!page) return null;
     const props = page.properties || {};
+
+    const personContacts = extractPersonContacts(page);
+
     return {
       pageId:   page.id,
       url:      page.url,
@@ -309,30 +382,12 @@ async function lookupPersonByName(name) {
       title:    (props["Role"]?.rich_text || []).map(t => t.plain_text || t.text?.content || "").join("") || null,
       email:    props["Email"]?.email || null,
       linkedin: props["LinkedIn"]?.url || null,
+      personContacts,
     };
   } catch (err) {
     return null;
   }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Internal-sender detection.
-//
-// EXPANDED in v3.17: previously this only matched obvious sender names like
-// "Anton" or "Pavel". But Beeper's LinkedIn bridge sometimes labels Anton's
-// outbound messages with sender like "beeper.com" or "@anton-titov:beeper.com",
-// which slipped through. Patrick Chu in /replies showed Anton's reply
-// "Hi Patrick, Thanks! Will book within today" labelled as inbound — that's
-// exactly this bug.
-//
-// Fix is two-pronged:
-//   1) Match more sender patterns (anything starting "@anton" / "anton" /
-//      "anton-titov" / "beeper.com" / matrix-style mxid for Anton)
-//   2) Heuristic-fallback by message TEXT — if the message starts with a
-//      common outbound greeting addressed to someone whose name is in the
-//      chat name, it's almost certainly Anton sending. This catches the
-//      Beeper-bridge metadata bug without needing to fix Beeper itself.
-// ─────────────────────────────────────────────────────────────────────────────
 
 const INTERNAL_SENDER_REGEX = /(anton ceo|antón|^антон$|^pavel|polkanov|@pavel-remide:beeper\.com|titov|^anton$|@anton|anton[-\s]*titov|^beeper\.com$|beeper\.com:|^paul$)/i;
 
@@ -341,14 +396,9 @@ function isInternalSender(senderName) {
   return INTERNAL_SENDER_REGEX.test(senderName);
 }
 
-// Given a chat name like "Patrick Chu" or "Patrick Chu | Agora", extract
-// the first-name token to use for outbound-text heuristic. Bails out for
-// generic / system chat names.
 function chatFirstName(chatName) {
   if (!chatName) return null;
-  // Take part before "|" or "—" if present
   const beforeSep = chatName.split(/\s*[|—–-]\s*/)[0].trim();
-  // First token, alphabetic only
   const first = beforeSep.split(/\s+/)[0];
   if (!first || first.length < 2) return null;
   if (GENERIC_SEED_WORDS.has(first.toLowerCase())) return null;
@@ -356,27 +406,15 @@ function chatFirstName(chatName) {
   return first;
 }
 
-// Heuristic: does the message text look like Anton sending an outbound message,
-// even if sender metadata didn't flag it as such?
-//
-// Returns true when:
-//   - text starts with "Hi <First>", "Hey <First>", "Hello <First>", followed
-//     by content typical of Anton's voice (Thanks/will/feel free/let me/etc),
-//     where <First> is the first name of the chat counterpart.
-//   - text contains a phrase strongly associated with Anton's outreach
-//     (Calendly link, "feel free to grab a free slot", etc.)
 function looksOutboundByText(text, chatName) {
   if (!text) return false;
   const t = text.trim();
   if (!t) return false;
 
-  // Phrase-based: links to Anton's Calendly, recognizable outbound CTAs
   if (/calendly\.com\/plex0/i.test(t)) return true;
   if (/feel free to (grab|pick) a (free )?slot/i.test(t)) return true;
   if (/will book within today/i.test(t)) return true;
 
-  // Greeting-based: "Hi <First>" or "Hey <First>" or "Hello <First>" addressed
-  // to the chat counterpart's first name.
   const counterpart = chatFirstName(chatName);
   if (counterpart) {
     const greetingRe = new RegExp(
@@ -389,15 +427,11 @@ function looksOutboundByText(text, chatName) {
   return false;
 }
 
-// Internal/team chat rooms — drop these from "ждут ответа" entirely.
-// Expanded in v3.17 to cover community/spam channel NAMES too (not just senders).
 function isInternalChatName(chatName) {
   if (!chatName) return false;
-  // Internal Plexo/RemiDe rooms
   if (/(remide\s*\|.*advisor|plexo\s*\|.*advisor|beeper developer|remide team|plexo team)/i.test(chatName)) {
     return true;
   }
-  // Community & spam channels (chat NAME pattern, not sender)
   if (/(rocket tech school|frontforumfocus|world impact|africa stablecoin community|deals global investment|blockchain.*tech news|latam venture talks|дедушка)/i.test(chatName)) {
     return true;
   }
@@ -432,8 +466,6 @@ router.get("/replies-waiting", async (req, res) => {
       const sentByInternal = isInternalSender(c.lastMsgSender);
       const internalChat   = isInternalChatName(c.name);
       const broadcast      = isBroadcastSpam(c.name, c.lastMsgSender);
-      // NEW: text-based outbound detection — catches Beeper-bridge metadata
-      // bugs where sender label doesn't reflect that Anton actually sent.
       const outboundByText = looksOutboundByText(c.lastMsgText, c.name);
 
       if (c.fetchError)                            reasons.push("msg-fetch-failed");
@@ -493,12 +525,19 @@ router.get("/replies-waiting", async (req, res) => {
 
       const visualTier = (company || c.type === "single") ? "primary" : "secondary";
 
+      // v3.18.4: deeplink — prefer person-level contacts (more direct), fallback
+      // to company's first attached person's contacts (for group chats).
+      const contacts = person?.personContacts || company?.personContacts || null;
+      const deeplinkObj = buildChatDeeplink(c.networkFull, contacts);
+
       return {
         ...c,
         hoursIdle: hoursIdleVal,
         notion: company,
         person,
         visualTier,
+        deeplink: deeplinkObj?.url || null,
+        deeplinkLabel: deeplinkObj?.label || null,
       };
     }));
 

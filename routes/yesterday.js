@@ -122,53 +122,25 @@ function extractPersonCandidate(chatName) {
   return tokens.slice(0, 3).join(" ");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Deeplink construction (v3.18.4)
-//
-// For each chat, we want Anton to be able to TAP the name and land directly
-// in that chat in the native client (WhatsApp / Telegram / LinkedIn profile).
-//
-// Beeper's chat.id is a matrix-internal ID — useless for this. The actual
-// contact identity (phone, @username, linkedin URL) lives in Notion People DB.
-//
-// Coverage flow:
-//   1. extractPersonContacts(personPage) — pull Telegram/Phone/LinkedIn fields
-//      from a Notion People row.
-//   2. resolveCompanyContacts(companyPageId) — for company-matched chats
-//      (e.g. "Plexo <> XTransfer"), follow Company.People relation and
-//      grab first attached person's contacts.
-//   3. buildChatDeeplink(networkFull, contacts) — turn contacts into native URL.
-//
-// LinkedIn limitation: there's no public deeplink to a specific DM thread.
-// Best we can do is the profile URL — Anton taps once → profile → Message
-// button is right there.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Parse contact fields from a Notion People DB page. All fields optional.
 function extractPersonContacts(personPage) {
   if (!personPage) return null;
   const props = personPage.properties || {};
 
-  // Telegram is rich_text in People DB (e.g. "@m4rtr3d")
   let telegram = null;
   const tgArr = props["Telegram"]?.rich_text || [];
   const tgRaw = tgArr.map(t => t.plain_text || t.text?.content || "").join("").trim();
   if (tgRaw) {
-    // Normalize: strip leading "@", trim, validate it looks like a username
     const cleaned = tgRaw.replace(/^@/, "").trim();
     if (/^[a-zA-Z0-9_]{4,32}$/.test(cleaned)) telegram = cleaned;
   }
 
-  // Phone is phone_number type
   let phone = null;
   const phoneRaw = props["Phone"]?.phone_number;
   if (phoneRaw) {
-    // Strip everything except digits
     const digits = String(phoneRaw).replace(/[^\d]/g, "");
     if (digits.length >= 7 && digits.length <= 15) phone = digits;
   }
 
-  // LinkedIn is url type
   let linkedin = props["LinkedIn"]?.url || null;
   if (linkedin && !/^https?:\/\//i.test(linkedin)) {
     linkedin = `https://${linkedin}`;
@@ -178,8 +150,6 @@ function extractPersonContacts(personPage) {
   return { telegram, phone, linkedin };
 }
 
-// Resolve a company page → first attached person's contacts.
-// Used for group chats matched by company name.
 async function resolveCompanyContacts(companyPageId) {
   if (!companyPageId) return null;
   try {
@@ -190,7 +160,6 @@ async function resolveCompanyContacts(companyPageId) {
     const peopleRel = r.data.properties?.People?.relation || [];
     if (!peopleRel.length) return null;
 
-    // Take first linked person and resolve their page
     const personPageRes = await axios.get(
       `https://api.notion.com/v1/pages/${peopleRel[0].id}`,
       { headers: notionHeaders(), timeout: 6_000 }
@@ -202,9 +171,6 @@ async function resolveCompanyContacts(companyPageId) {
   }
 }
 
-// Pure function: contacts → deeplink URL for the chat's network.
-// Returns { url, label } where label is "wa.me" / "t.me" / "linkedin" so
-// the bot can pick a small icon. Returns null if no usable contact.
 function buildChatDeeplink(networkFull, contacts) {
   if (!contacts) return null;
 
@@ -223,12 +189,6 @@ function buildChatDeeplink(networkFull, contacts) {
   return null;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Notion lookups
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Resolve a Notion company page by ID — returns full info incl. attached
-// person's contacts (for group-chat deeplinks).
 async function resolveCompanyPage(pageId, withContacts = false) {
   try {
     const r = await axios.get(
@@ -266,8 +226,6 @@ async function resolveCompanyPage(pageId, withContacts = false) {
   }
 }
 
-// Person lookup — returns stage info from linked company AND person's own
-// contact fields (Telegram/Phone/LinkedIn from People DB row).
 async function lookupPersonStage(personCandidate) {
   if (!NOTION_TOKEN || !personCandidate) return null;
   try {
@@ -293,7 +251,6 @@ async function lookupPersonStage(personCandidate) {
     });
     const person = exactMatch || r.data.results[0];
 
-    // Pull person's own contact fields — these are PRIMARY source for deeplink
     const personContacts = extractPersonContacts(person);
 
     const companyRel = person.properties?.Company?.relation || [];
@@ -342,7 +299,6 @@ async function batchLookupCRMStages(chatNames) {
 
   console.log(`[yesterday/lookup] ${chatNames.length} chats → ${candidateToChatNames.size} company candidates, ${personCandidateToChatNames.size} person candidates`);
 
-  // ── PASS 1: Company-name lookup with contacts ──
   await Promise.all([...candidateToChatNames.values()].map(async ({ candidate, names }) => {
     try {
       const r = await axios.post(
@@ -368,7 +324,6 @@ async function batchLookupCRMStages(chatNames) {
 
       const best = candidates[0] || null;
       if (best) {
-        // For company-matched chats — try resolve first attached person's contacts
         let personContacts = null;
         if (best._firstPersonId) {
           try {
@@ -391,7 +346,6 @@ async function batchLookupCRMStages(chatNames) {
     }
   }));
 
-  // ── PASS 2: People-fallback for chats not yet matched ──
   const unmatchedPersonLookups = [];
   for (const [pKey, { candidate, names }] of personCandidateToChatNames) {
     const allNamesAlreadyMatched = names.every(n => result.has(n));
@@ -688,8 +642,6 @@ function buildNetworkPayload(group) {
   return items;
 }
 
-// Top chats per network — now also includes deeplink derived from
-// chat.crm.personContacts via buildChatDeeplink.
 function pickTopChats(group, n = 3) {
   const scored = group.chats.map(chat => {
     const msgs = chat.messagesYesterday || [];
@@ -706,7 +658,6 @@ function pickTopChats(group, n = 3) {
     const direction = lastMsg?.isSender ? "→" : "←";
     const snippet = (lastMsg?.text || "").slice(0, 120);
 
-    // Build deeplink from CRM person contacts
     const contacts = chat.crm?.personContacts;
     const deeplinkObj = buildChatDeeplink(chat.networkFull, contacts);
 
@@ -802,6 +753,10 @@ ${conversationText}
 
 Дай 3-5 буллетов про что важного.`;
 
+  // v3.18.7: log full Anthropic error body so we can diagnose 400s.
+  // Previously err.message gave only "Request failed with status code 400"
+  // — we need the actual error type from Anthropic (model_not_found,
+  // invalid_request_error, authentication_error, etc).
   try {
     const r = await axios.post(
       "https://api.anthropic.com/v1/messages",
@@ -828,9 +783,25 @@ ${conversationText}
     const bullets = Array.isArray(parsed.bullets) ? parsed.bullets.slice(0, 5) : [];
     return { bullets };
   } catch (err) {
-    console.error(`[yesterday/summary] AI failed for ${networkHeader}:`, err.message);
+    // VERBOSE error logging — print full Anthropic error body, status, type.
+    const status = err.response?.status;
+    const responseBody = err.response?.data;
+    const bodyStr = responseBody
+      ? (typeof responseBody === "string" ? responseBody : JSON.stringify(responseBody))
+      : "(no response body)";
+
+    console.error(
+      `[yesterday/summary] AI failed for ${networkHeader}: ${err.message} | status=${status} | body=${bodyStr.slice(0, 500)}`
+    );
+
+    // Also dump key prefix for debugging (safe — only first 12 chars)
+    const keyPrefix = ANTHROPIC_KEY ? ANTHROPIC_KEY.slice(0, 12) + "..." : "(empty)";
+    console.error(`[yesterday/summary] (using key ${keyPrefix})`);
+
     const fallback = generateFallbackSummary(items);
     fallback.aiError = err.message;
+    fallback.aiErrorStatus = status;
+    fallback.aiErrorBody = typeof responseBody === "object" ? responseBody : null;
     return fallback;
   }
 }
@@ -961,7 +932,6 @@ router.get("/summary", async (req, res) => {
     };
   }));
 
-  // Count deeplinks for visibility / debugging
   const deeplinkCount = networks.reduce((sum, n) =>
     sum + (n.topChats || []).filter(c => c.deeplink).length, 0);
   console.log(`[yesterday] === END === ${Date.now() - t0}ms · source=${source} · totalBefore=${totalBeforeFilter} · dropped=${dropped} · networks=${networks.length} · deeplinks=${deeplinkCount}`);

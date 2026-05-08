@@ -12,7 +12,7 @@ const router = express.Router();
 // ─────────────────────────────────────────────────────────────────────────────
 // BD Scoring Framework v2.2 — formulas, Floor Rules, tier mapping
 //
-// Changelog vs v2.1 (May 8 2026, Anton's patches):
+// v2.2 (May 8 2026, Anton's patches):
 // - Removed bug: was dividing rawScore by 10, should be /17 (Client) or /14 (Partner)
 // - Removed MH tier (was inflated). P1 ≥7.5 is the new top.
 // - Apply UNKNOWN cap (axes_meta from response): UNKNOWN axes capped at 3
@@ -20,6 +20,11 @@ const router = express.Router();
 // - Floor Rules as post-processor caps (G-1, G-2, G-3)
 // - SE modifier band-locked (+0.5 max, cannot move P2→P1)
 // - Apply correct Client vs Partner formula based on category
+//
+// v2.2.1 fixes (May 8 2026, after unit testing):
+// - SE band-lock final guard: score 7.0 + SE no longer rounds up to 7.5 (crosses P1)
+// - G-2 only applies to Client (Partner formula doesn't use axes 1,2)
+// - Score < 3.0 → Skip (not P3 from phantom Floor Rule trigger)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildCompactV22(c) {
@@ -39,10 +44,7 @@ function buildCompactV22(c) {
       score: 0,
       tier: "Hard Kill",
       axes: { 1: a(1), 2: a(2), 3: a(3), 4: a(4), 5: a(5), 6: a(6), 7: a(7), 8: a(8), 10: a(10) },
-      axes_meta: {
-        1: m(1), 2: m(2), 3: m(3), 4: m(4), 5: m(5),
-        6: m(6), 7: m(7), 8: m(8), 10: m(10),
-      },
+      axes_meta: { 1: m(1), 2: m(2), 3: m(3), 4: m(4), 5: m(5), 6: m(6), 7: m(7), 8: m(8), 10: m(10) },
       sources: c.top_sources ?? [],
       strat: null,
       ready: c.readiness ?? null,
@@ -60,16 +62,12 @@ function buildCompactV22(c) {
   let formula_used;
   if (isPartner) {
     // Partner: (axis3*3 + axis6*3 + axis10*3 + axis5*2 + axis8*2 + axis4) / 14
-    rawScore = (ac(3) + ac(6) + ac(10)) * 3
-             + (ac(5) + ac(8)) * 2
-             + ac(4);
+    rawScore = (ac(3) + ac(6) + ac(10)) * 3 + (ac(5) + ac(8)) * 2 + ac(4);
     rawScore = rawScore / 14;
     formula_used = "Partner /14";
   } else {
-    // Client (default): (axis1*3 + axis3*3 + axis6*3 + axis2*2 + axis5*2 + axis8*2 + axis4 + axis7) / 17
-    rawScore = (ac(1) + ac(3) + ac(6)) * 3
-             + (ac(2) + ac(5) + ac(8)) * 2
-             + ac(4) + ac(7);
+    // Client: (axis1*3 + axis3*3 + axis6*3 + axis2*2 + axis5*2 + axis8*2 + axis4 + axis7) / 17
+    rawScore = (ac(1) + ac(3) + ac(6)) * 3 + (ac(2) + ac(5) + ac(8)) * 2 + ac(4) + ac(7);
     rawScore = rawScore / 17;
     formula_used = "Client /17";
   }
@@ -81,40 +79,45 @@ function buildCompactV22(c) {
   const unknownCount = allMeta.filter(v => v === "UNKNOWN").length;
 
   // Floor Rules (post-processor caps, applied as max-tier limit)
+  // v2.2.1 fix: G-2 only applies to Client (Partner formula doesn't use axes 1,2)
   let floorRule = null;
   if (ac(6) < 3) floorRule = "G-1 (License < 3)";
-  if (ac(1) < 3 && ac(2) < 3) floorRule = "G-2 (XBorder<3 AND Ramp<3)";
+  if (!isPartner && ac(1) < 3 && ac(2) < 3) floorRule = "G-2 (XBorder<3 AND Ramp<3)";
   if (isPartner && ac(10) < 5) floorRule = "G-3 (PartnerFit < 5)";
 
   // Strategic Entrant — band-locked +0.5
+  // v2.2.1 fix: use 7.5 threshold + final guard against rounding 7.49 up to 7.5
   const seSignal = c.strategic_entrant_signal && c.strategic_entrant_signal !== "NOT APPLICABLE"
     ? c.strategic_entrant_signal
     : null;
   let seApplied = false;
   let scorePreSE = score;
   if (seSignal && a(7) >= 7) {
-    // SE applies +0.5 within band (cannot move P2 → P1)
-    const seScore = Math.min(score + 0.5, score < 7.0 ? 7.49 : 10);
+    // If raw score < 7.5 (P2 territory), SE caps at 7.49 to stay P2
+    const seScore = Math.min(score + 0.5, score < 7.5 ? 7.49 : 10);
     if (seScore !== score) {
       score = Math.round(seScore * 10) / 10;
+      // Final guard: if rounding bumped 7.49 to 7.5 (crossing P1), force back
+      if (scorePreSE < 7.5 && score >= 7.5) score = 7.49;
       seApplied = true;
     }
   }
 
   // Tier mapping (v2.2 — no MH, P1 ≥7.5)
+  // v2.2.1 fix: score < 3.0 → Skip (not P3 from phantom Floor Rule)
   let tier;
   if (unknownCount > 3) {
     tier = "Manual Review";
+  } else if (score < 3.0) {
+    tier = "Skip";
   } else if (floorRule) {
-    tier = "P3"; // Floor Rules cap at P3
+    tier = "P3";
   } else if (score >= 7.5) {
     tier = "P1";
   } else if (score >= 5.0) {
     tier = "P2";
-  } else if (score >= 3.0) {
-    tier = "P3";
   } else {
-    tier = "Skip";
+    tier = "P3";
   }
 
   return {
@@ -125,10 +128,7 @@ function buildCompactV22(c) {
     score_pre_se: seApplied ? scorePreSE : null,
     tier,
     axes: { 1: a(1), 2: a(2), 3: a(3), 4: a(4), 5: a(5), 6: a(6), 7: a(7), 8: a(8), 10: a(10) },
-    axes_meta: {
-      1: m(1), 2: m(2), 3: m(3), 4: m(4), 5: m(5),
-      6: m(6), 7: m(7), 8: m(8), 10: m(10),
-    },
+    axes_meta: { 1: m(1), 2: m(2), 3: m(3), 4: m(4), 5: m(5), 6: m(6), 7: m(7), 8: m(8), 10: m(10) },
     sources: c.top_sources ?? [],
     strat: seSignal,
     ready: c.readiness ?? null,
@@ -201,7 +201,7 @@ router.get("/result/:taskId/compact", async (req, res) => {
     const c = raw?.output?.content || raw?.content;
     if (!c) return res.json({ ok: true, taskId, status, done, failed, compact: null, error: "No content in output" });
 
-    // v2.2 scoring (Anton's patches)
+    // v2.2.1 scoring (Anton's patches + bug fixes from unit testing)
     const compact = buildCompactV22(c);
 
     res.json({ ok: true, taskId, status, done, failed, compact });
@@ -390,15 +390,12 @@ function extractBulletsAndCitations(parallelResult) {
 }
 
 // ── POST /parallel/insights-bullets ──────────────────────────────────────────
-// Body: { company: string, domain?: string, timeoutMs?: number }
-// timeoutMs — how long to poll Parallel for completion. Default 90000.
 router.post("/insights-bullets", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ ok: false, error: "PARALLEL_KEY not set" });
 
   const { company, domain, timeoutMs } = req.body || {};
   if (!company) return res.status(400).json({ ok: false, error: "company required" });
 
-  // Clamp caller-supplied timeout into a sane range (10s-300s)
   const pollTimeoutMs = Math.max(
     10_000,
     Math.min(300_000, Number(timeoutMs) || 90_000)

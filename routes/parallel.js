@@ -9,6 +9,121 @@ const {
 
 const router = express.Router();
 
+// ── Scoring helpers (BD Scoring Framework v2.2) ──────────────────────────────
+//
+// v2.2 changes vs v2.1 (May 8 2026 — Anton's discipline patch):
+// - UNKNOWN axes capped at 3 in formula
+// - Client formula: (a1*3 + a3*3 + a6*3 + a2*2 + a5*2 + a8*2 + a4 + a7) / 17
+// - Partner formula: (a3*3 + a6*3 + a10*3 + a5*2 + a8*2 + a4) / 14
+// - Floor Rules applied as post-processor caps (G-1, G-2, G-3)
+// - Tier bands strict: P1 ≥ 7.5, P2 5.0-7.49, P3 3.0-4.99, Skip <3.0
+// - MH tier removed — P1 is new top, rare by design
+// - >3 UNKNOWN axes → "Manual Review" (no tier assigned)
+// - Hard Kill remains mandatory STOP — no overrides
+
+function getCappedAxis(c, n) {
+  const score = Number(c[`axis${n}_score`]) || 0;
+  const meta = c[`axis${n}_meta`];
+  if (meta === "UNKNOWN") {
+    return Math.min(score, 3);
+  }
+  return score;
+}
+
+function countUnknownAxes(c, isPartner) {
+  // For Client: check axes 1-8. For Partner: check axes 3-8 + 10.
+  const axesToCheck = isPartner ? [3, 4, 5, 6, 8, 10] : [1, 2, 3, 4, 5, 6, 7, 8];
+  return axesToCheck.filter(n => c[`axis${n}_meta`] === "UNKNOWN").length;
+}
+
+function calculateScore(c) {
+  if (c.hk_triggered) return { score: 0, isPartner: false, raw: 0, formula: "HK" };
+
+  const isPartner = c.category === "Partner";
+
+  if (isPartner) {
+    // Partner: (axis3*3 + axis6*3 + axis10*3 + axis5*2 + axis8*2 + axis4) / 14
+    const a3  = getCappedAxis(c, 3);
+    const a4  = getCappedAxis(c, 4);
+    const a5  = getCappedAxis(c, 5);
+    const a6  = getCappedAxis(c, 6);
+    const a8  = getCappedAxis(c, 8);
+    const a10 = getCappedAxis(c, 10);
+    const raw = (a3 + a6 + a10) * 3 + (a5 + a8) * 2 + a4;
+    const score = Math.round((raw / 14) * 10) / 10;
+    return { score, isPartner: true, raw, formula: "Partner" };
+  }
+
+  // Client: (axis1*3 + axis3*3 + axis6*3 + axis2*2 + axis5*2 + axis8*2 + axis4 + axis7) / 17
+  const a1 = getCappedAxis(c, 1);
+  const a2 = getCappedAxis(c, 2);
+  const a3 = getCappedAxis(c, 3);
+  const a4 = getCappedAxis(c, 4);
+  const a5 = getCappedAxis(c, 5);
+  const a6 = getCappedAxis(c, 6);
+  const a7 = getCappedAxis(c, 7);
+  const a8 = getCappedAxis(c, 8);
+  const raw = (a1 + a3 + a6) * 3 + (a2 + a5 + a8) * 2 + a4 + a7;
+  const score = Math.round((raw / 17) * 10) / 10;
+  return { score, isPartner: false, raw, formula: "Client" };
+}
+
+function applyFloorRules(c, isPartner) {
+  const a1  = getCappedAxis(c, 1);
+  const a2  = getCappedAxis(c, 2);
+  const a6  = getCappedAxis(c, 6);
+  const a10 = getCappedAxis(c, 10);
+
+  // G-1: License < 3 → max P3
+  if (a6 < 3) return { capped: true, reason: "G-1: License axis < 3" };
+
+  // G-2: XBorder < 3 AND Ramp < 3 → max P3 (Client only)
+  if (!isPartner && a1 < 3 && a2 < 3) {
+    return { capped: true, reason: "G-2: Both XBorder and Ramp < 3" };
+  }
+
+  // G-3: Partner with InfraFit < 5 → max P3
+  if (isPartner && a10 < 5) return { capped: true, reason: "G-3: Partner InfraFit < 5" };
+
+  return { capped: false, reason: null };
+}
+
+function determineTier(c, score, isPartner) {
+  if (c.hk_triggered) return { tier: "Hard Kill", reason: c.hk_criterion };
+
+  // Check UNKNOWN count first — >3 means insufficient data
+  const unknownCount = countUnknownAxes(c, isPartner);
+  if (unknownCount > 3) {
+    return { tier: "Manual Review", reason: `${unknownCount} UNKNOWN axes — insufficient verifiable data` };
+  }
+
+  // Apply Floor Rules
+  const floor = applyFloorRules(c, isPartner);
+  if (floor.capped) {
+    return { tier: "P3", reason: floor.reason };
+  }
+
+  // Strict tier banding (no MH in v2.2, no rounding)
+  if (score >= 7.5) return { tier: "P1",   reason: null };
+  if (score >= 5.0) return { tier: "P2",   reason: null };
+  if (score >= 3.0) return { tier: "P3",   reason: null };
+  return { tier: "Skip", reason: "Score below P3 threshold" };
+}
+
+function buildAxesMeta(c) {
+  return {
+    1:  c.axis1_meta  || "INFERENCE",
+    2:  c.axis2_meta  || "INFERENCE",
+    3:  c.axis3_meta  || "INFERENCE",
+    4:  c.axis4_meta  || "INFERENCE",
+    5:  c.axis5_meta  || "INFERENCE",
+    6:  c.axis6_meta  || "INFERENCE",
+    7:  c.axis7_meta  || "INFERENCE",
+    8:  c.axis8_meta  || "INFERENCE",
+    10: c.axis10_meta || "UNKNOWN",
+  };
+}
+
 // ── POST /parallel/research/start ─────────────────────────────────────────────
 router.post("/research/start", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
@@ -70,26 +185,31 @@ router.get("/result/:taskId/compact", async (req, res) => {
     const c = raw?.output?.content || raw?.content;
     if (!c) return res.json({ ok: true, taskId, status, done, failed, compact: null, error: "No content in output" });
 
+    // v2.2 scoring pipeline
+    const { score, isPartner, formula } = calculateScore(c);
+    const { tier, reason: tierReason } = determineTier(c, score, isPartner);
+    const axesMeta = buildAxesMeta(c);
+    const unknownCount = countUnknownAxes(c, isPartner);
+
     const a = (n) => Number(c[`axis${n}_score`]) || 0;
-    const rawScore = (a(1)+a(3)+a(6))*3 + (a(2)+a(5)+a(8))*2 + a(4) + a(7);
-    const clientScore = c.hk_triggered ? 0 : Math.round(rawScore * 0.1 * 10) / 10;
-    const tier = c.hk_triggered ? "Hard Kill"
-               : clientScore >= 9.0 ? "MH"
-               : clientScore >= 7.5 ? "P1"
-               : clientScore >= 5.0 ? "P2"
-               : "P3";
 
     const compact = {
       cat: c.category ?? null,
       role: c.network_role ?? null,
       hk: c.hk_triggered ? c.hk_criterion : false,
-      score: clientScore,
+      score,
       tier,
+      tier_reason: tierReason,
       axes: { 1: a(1), 2: a(2), 3: a(3), 4: a(4), 5: a(5), 6: a(6), 7: a(7), 8: a(8), 10: a(10) },
+      axes_meta: axesMeta,
+      axes_evidence: c.axes_evidence ?? null,
+      unknown_count: unknownCount,
+      formula,
       sources: c.top_sources ?? [],
       strat: c.strategic_entrant_signal === "NOT APPLICABLE" ? null : c.strategic_entrant_signal,
       ready: c.readiness ?? null,
       conf: c.confidence_level ?? null,
+      scoring_version: "v2.2",
     };
 
     res.json({ ok: true, taskId, status, done, failed, compact });
@@ -121,6 +241,7 @@ router.post("/insight/start", async (req, res) => {
 });
 
 // ── POST /parallel/score ──────────────────────────────────────────────────────
+// v2.2: processor escalation threshold is now P1 (≥7.5), not legacy MH (≥9.0)
 router.post("/score", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
   const { company, domain, clientScore } = req.body;

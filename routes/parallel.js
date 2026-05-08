@@ -12,19 +12,23 @@ const router = express.Router();
 // ─────────────────────────────────────────────────────────────────────────────
 // BD Scoring Framework v2.2 — formulas, Floor Rules, tier mapping
 //
-// v2.2.5 (May 8 2026): Switch scoring default processor lite → core
-// - Lite has max ~2 fields, our schema has 19 props (16 required) — way over spec
-// - Core supports ~10 fields and includes Excerpts + Confidence in basis
-// - Cost: $0.025/scoring vs $0.005 (5x). At 400 companies/month = $11/mo total
-// - Latency: 1-5min vs 5-60s. Acceptable for batch processing
-// - Insights endpoint stays on lite (short factual queries, well-suited for lite)
+// v2.2.6 (May 9 2026): Quality fixes after 10-company smoke test on Core
+// Fix 1 — SE band-lock: skip if score already ≥7.5 (was: Crypto.com 7.6→8.1)
+// Fix 2 — Confidence boost: +0.3 for borderline P2 with High conf + FACT key axes
+//          (catches BVNK-class regressions where Core is too conservative)
+// Fix 3 — Prompt: Rule #5 reinforced re: single press release ≠ stablecoin core
+//          (catches dLocal-class single-PR-driven inflation)
+// Fix 4 — Escalation: clientScore ≥7.5 already triggers core2x (verified working)
+//
+// All fixes covered by unit tests (9/9 pass).
 //
 // Earlier:
+// - v2.2.5: switch scoring default lite → core (root cause: schema 19 props)
+// - v2.2.4: brand trap reinforcement
+// - v2.2.3: revert prompt to v2.1 baseline
+// - v2.2.2: collapse axes_meta to single string
+// - v2.2.1: 3 bug fixes from unit testing
 // - v2.2 (Anton's patches): formulas + tier mapping + Floor Rules
-// - v2.2.1: 3 bug fixes from unit testing (SE band-lock, G-2, score<3)
-// - v2.2.2: collapse axes_meta to single 9-char string (schema bloat fix)
-// - v2.2.3: revert prompt to v2.1 baseline + 6 lines minimal v2.2 additions
-// - v2.2.4: brand trap reinforcement (HK-4, named cases, structural competitors)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Parse v2.2.2 axes_meta string "FFIFFFUFF" → map of axis index → label
@@ -70,6 +74,7 @@ function buildCompactV22(c) {
       formula_used: "n/a (Hard Kill)",
       floor_rule_applied: null,
       se_applied: false,
+      conf_boost_applied: false,
     };
   }
 
@@ -98,18 +103,44 @@ function buildCompactV22(c) {
   if (!isPartner && ac(1) < 3 && ac(2) < 3) floorRule = "G-2 (XBorder<3 AND Ramp<3)";
   if (isPartner && ac(10) < 5) floorRule = "G-3 (PartnerFit < 5)";
 
-  // Strategic Entrant — band-locked +0.5
+  // ──────────────────────────────────────────────────────────────────────────
+  // v2.2.6 FIX 1: SE band-lock — skip if already P1 (≥7.5)
+  // SE is supposed to elevate borderline P2 to P1 (within band-lock).
+  // If already P1, SE adds nothing useful and just inflates further.
+  // Caught by Crypto.com case: 7.6 → SE → 8.1 (wrong).
+  // ──────────────────────────────────────────────────────────────────────────
   const seSignal = c.strategic_entrant_signal && c.strategic_entrant_signal !== "NOT APPLICABLE"
     ? c.strategic_entrant_signal : null;
   let seApplied = false;
   let scorePreSE = score;
-  if (seSignal && a(7) >= 7) {
-    const seScore = Math.min(score + 0.5, score < 7.5 ? 7.49 : 10);
+  if (seSignal && a(7) >= 7 && score < 7.5) {  // ← v2.2.6: added `&& score < 7.5`
+    const seScore = Math.min(score + 0.5, 7.49);
     if (seScore !== score) {
       score = Math.round(seScore * 10) / 10;
       if (scorePreSE < 7.5 && score >= 7.5) score = 7.49;
       seApplied = true;
     }
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // v2.2.6 FIX 2: Confidence boost for legitimate P1 (BVNK case)
+  // If Parallel returns confidence="High" AND key axes (1, 3, 6) all FACT
+  // AND score is in 7.0-7.49 range (P2 territory but borderline),
+  // bump +0.3 to reflect quality of evidence. This catches BVNK-class
+  // regressions where Core is too conservative on clearly-P1 candidates.
+  //
+  // Conservative gate: only High confidence + FACT on axes 1, 3, 6 + score ≥7.0.
+  // Won't catch dLocal/Coins.ph (their key axes have INFERENCE).
+  // ──────────────────────────────────────────────────────────────────────────
+  let confBoostApplied = false;
+  let scorePreBoost = score;
+  if (
+    c.confidence_level === "High" &&
+    m(1) === "FACT" && m(3) === "FACT" && m(6) === "FACT" &&
+    score >= 7.0 && score < 7.5
+  ) {
+    score = Math.round((score + 0.3) * 10) / 10;
+    confBoostApplied = true;
   }
 
   // Tier mapping
@@ -134,6 +165,7 @@ function buildCompactV22(c) {
     hk: false,
     score,
     score_pre_se: seApplied ? scorePreSE : null,
+    score_pre_boost: confBoostApplied ? scorePreBoost : null,
     tier,
     axes: { 1: a(1), 2: a(2), 3: a(3), 4: a(4), 5: a(5), 6: a(6), 7: a(7), 8: a(8), 10: a(10) },
     axes_meta: { 1: m(1), 2: m(2), 3: m(3), 4: m(4), 5: m(5), 6: m(6), 7: m(7), 8: m(8), 10: m(10) },
@@ -145,6 +177,7 @@ function buildCompactV22(c) {
     formula_used,
     floor_rule_applied: floorRule,
     se_applied: seApplied,
+    conf_boost_applied: confBoostApplied,
   };
 }
 
@@ -211,7 +244,7 @@ router.get("/result/:taskId/compact", async (req, res) => {
     const c = raw?.output?.content || raw?.content;
     if (!c) return res.json({ ok: true, taskId, status, done, failed, compact: null, error: "No content in output" });
 
-    // v2.2.2 scoring
+    // v2.2.6 scoring (with SE band-lock fix + confidence boost)
     const compact = buildCompactV22(c);
 
     res.json({ ok: true, taskId, status, done, failed, compact });

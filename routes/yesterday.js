@@ -19,6 +19,11 @@ const NOTION_COMPANIES_DB = "f9b59c5b05fa4df18f9569479633fd74";
 const NOTION_PEOPLE_DB    = "f36b2a0f0ab241cebbdbd1d0874a55be";
 const ANTHROPIC_KEY       = process.env.ANTHROPIC_API_KEY;
 
+// v3.18.8: pinned model snapshot. Anthropic API as of late 2025 requires
+// pinned snapshots in production — bare alias "claude-haiku-4-5" returns 400
+// when used via /v1/messages.
+const ANTHROPIC_MODEL = "claude-haiku-4-5-20251001";
+
 const LATE_STAGES = new Set([
   "initial discussions",
   "Keeping in the Loop",
@@ -753,15 +758,11 @@ ${conversationText}
 
 Дай 3-5 буллетов про что важного.`;
 
-  // v3.18.7: log full Anthropic error body so we can diagnose 400s.
-  // Previously err.message gave only "Request failed with status code 400"
-  // — we need the actual error type from Anthropic (model_not_found,
-  // invalid_request_error, authentication_error, etc).
   try {
     const r = await axios.post(
       "https://api.anthropic.com/v1/messages",
       {
-        model: "claude-haiku-4-5",
+        model: ANTHROPIC_MODEL,
         max_tokens: 600,
         system: systemPrompt,
         messages: [{ role: "user", content: userPrompt }],
@@ -783,7 +784,6 @@ ${conversationText}
     const bullets = Array.isArray(parsed.bullets) ? parsed.bullets.slice(0, 5) : [];
     return { bullets };
   } catch (err) {
-    // VERBOSE error logging — print full Anthropic error body, status, type.
     const status = err.response?.status;
     const responseBody = err.response?.data;
     const bodyStr = responseBody
@@ -791,10 +791,9 @@ ${conversationText}
       : "(no response body)";
 
     console.error(
-      `[yesterday/summary] AI failed for ${networkHeader}: ${err.message} | status=${status} | body=${bodyStr.slice(0, 500)}`
+      `[yesterday/summary] AI failed for ${networkHeader} (model=${ANTHROPIC_MODEL}): ${err.message} | status=${status} | body=${bodyStr.slice(0, 500)}`
     );
 
-    // Also dump key prefix for debugging (safe — only first 12 chars)
     const keyPrefix = ANTHROPIC_KEY ? ANTHROPIC_KEY.slice(0, 12) + "..." : "(empty)";
     console.error(`[yesterday/summary] (using key ${keyPrefix})`);
 

@@ -15,23 +15,45 @@ const router = express.Router();
 // v2.2 (May 8 2026, Anton's patches):
 // - Removed bug: was dividing rawScore by 10, should be /17 (Client) or /14 (Partner)
 // - Removed MH tier (was inflated). P1 ≥7.5 is the new top.
-// - Apply UNKNOWN cap (axes_meta from response): UNKNOWN axes capped at 3
+// - Apply UNKNOWN cap: UNKNOWN axes capped at 3
 // - >3 UNKNOWN → "Manual Review" (no tier assigned)
 // - Floor Rules as post-processor caps (G-1, G-2, G-3)
 // - SE modifier band-locked (+0.5 max, cannot move P2→P1)
 // - Apply correct Client vs Partner formula based on category
 //
 // v2.2.1 fixes (May 8 2026, after unit testing):
-// - SE band-lock final guard: score 7.0 + SE no longer rounds up to 7.5 (crosses P1)
+// - SE band-lock final guard: score 7.0 + SE no longer rounds up to 7.5
 // - G-2 only applies to Client (Partner formula doesn't use axes 1,2)
 // - Score < 3.0 → Skip (not P3 from phantom Floor Rule trigger)
+//
+// v2.2.2 schema fix (May 8 2026):
+// - axes_meta is now a single 9-char string (was 9 separate fields)
+//   to fit within Parallel's stability threshold (~18-19 props)
+// - Position N in string = axis K where K = axes 1,2,3,4,5,6,7,8,10
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Parse v2.2.2 axes_meta string "FFIFFFUFF" → map of axis index → label
+function parseAxesMeta(metaStr) {
+  const result = {};
+  const axisOrder = [1, 2, 3, 4, 5, 6, 7, 8, 10]; // position 0..8 maps to these axes
+  const labelMap = { F: "FACT", I: "INFERENCE", U: "UNKNOWN" };
+  if (typeof metaStr !== "string") {
+    // Fallback: treat all as INFERENCE (conservative)
+    axisOrder.forEach(n => { result[n] = "INFERENCE"; });
+    return result;
+  }
+  axisOrder.forEach((axisN, pos) => {
+    const ch = metaStr[pos] || "I";
+    result[axisN] = labelMap[ch.toUpperCase()] || "INFERENCE";
+  });
+  return result;
+}
+
 function buildCompactV22(c) {
-  // axis values (raw)
   const a = (n) => Number(c[`axis${n}_score`]) || 0;
-  // axis meta (FACT | INFERENCE | UNKNOWN)
-  const m = (n) => c[`axis${n}_meta`] || "INFERENCE";
+  // Parse compact axes_meta string into per-axis labels
+  const metaMap = parseAxesMeta(c.axes_meta);
+  const m = (n) => metaMap[n] || "INFERENCE";
   // capped axis: UNKNOWN → max 3
   const ac = (n) => m(n) === "UNKNOWN" ? Math.min(a(n), 3) : a(n);
 
@@ -56,17 +78,14 @@ function buildCompactV22(c) {
     };
   }
 
-  // Apply correct formula based on category
   const isPartner = c.category === "Partner";
   let rawScore;
   let formula_used;
   if (isPartner) {
-    // Partner: (axis3*3 + axis6*3 + axis10*3 + axis5*2 + axis8*2 + axis4) / 14
     rawScore = (ac(3) + ac(6) + ac(10)) * 3 + (ac(5) + ac(8)) * 2 + ac(4);
     rawScore = rawScore / 14;
     formula_used = "Partner /14";
   } else {
-    // Client: (axis1*3 + axis3*3 + axis6*3 + axis2*2 + axis5*2 + axis8*2 + axis4 + axis7) / 17
     rawScore = (ac(1) + ac(3) + ac(6)) * 3 + (ac(2) + ac(5) + ac(8)) * 2 + ac(4) + ac(7);
     rawScore = rawScore / 17;
     formula_used = "Client /17";
@@ -78,33 +97,27 @@ function buildCompactV22(c) {
   if (isPartner) allMeta.push(m(10));
   const unknownCount = allMeta.filter(v => v === "UNKNOWN").length;
 
-  // Floor Rules (post-processor caps, applied as max-tier limit)
-  // v2.2.1 fix: G-2 only applies to Client (Partner formula doesn't use axes 1,2)
+  // Floor Rules (post-processor caps)
   let floorRule = null;
   if (ac(6) < 3) floorRule = "G-1 (License < 3)";
   if (!isPartner && ac(1) < 3 && ac(2) < 3) floorRule = "G-2 (XBorder<3 AND Ramp<3)";
   if (isPartner && ac(10) < 5) floorRule = "G-3 (PartnerFit < 5)";
 
   // Strategic Entrant — band-locked +0.5
-  // v2.2.1 fix: use 7.5 threshold + final guard against rounding 7.49 up to 7.5
   const seSignal = c.strategic_entrant_signal && c.strategic_entrant_signal !== "NOT APPLICABLE"
-    ? c.strategic_entrant_signal
-    : null;
+    ? c.strategic_entrant_signal : null;
   let seApplied = false;
   let scorePreSE = score;
   if (seSignal && a(7) >= 7) {
-    // If raw score < 7.5 (P2 territory), SE caps at 7.49 to stay P2
     const seScore = Math.min(score + 0.5, score < 7.5 ? 7.49 : 10);
     if (seScore !== score) {
       score = Math.round(seScore * 10) / 10;
-      // Final guard: if rounding bumped 7.49 to 7.5 (crossing P1), force back
       if (scorePreSE < 7.5 && score >= 7.5) score = 7.49;
       seApplied = true;
     }
   }
 
-  // Tier mapping (v2.2 — no MH, P1 ≥7.5)
-  // v2.2.1 fix: score < 3.0 → Skip (not P3 from phantom Floor Rule)
+  // Tier mapping
   let tier;
   if (unknownCount > 3) {
     tier = "Manual Review";
@@ -201,7 +214,7 @@ router.get("/result/:taskId/compact", async (req, res) => {
     const c = raw?.output?.content || raw?.content;
     if (!c) return res.json({ ok: true, taskId, status, done, failed, compact: null, error: "No content in output" });
 
-    // v2.2.1 scoring (Anton's patches + bug fixes from unit testing)
+    // v2.2.2 scoring
     const compact = buildCompactV22(c);
 
     res.json({ ok: true, taskId, status, done, failed, compact });
@@ -284,7 +297,7 @@ router.post("/upgrade", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// /insights-bullets — single Parallel call with structured output (no LLM split)
+// /insights-bullets — single Parallel call with structured output
 // ─────────────────────────────────────────────────────────────────────────────
 
 const insightsBulletsSpec = {
@@ -389,7 +402,6 @@ function extractBulletsAndCitations(parallelResult) {
   return { bullets, citations: cites };
 }
 
-// ── POST /parallel/insights-bullets ──────────────────────────────────────────
 router.post("/insights-bullets", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ ok: false, error: "PARALLEL_KEY not set" });
 

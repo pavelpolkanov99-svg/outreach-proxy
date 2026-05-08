@@ -31,6 +31,7 @@ app.use("/webhook",        require("./routes/webhooks"));
 app.use("/mcp",            require("./routes/mcp"));
 app.use("/messaging-hub",  require("./routes/messaging-hub"));
 app.use("/yesterday",      require("./routes/yesterday"));
+app.use("/today",          require("./routes/today-lean")); // ← v4.20 /today/lean
 
 // ── Beeper sync job (mounted under /beeper/*) ─────────────────────────────────
 const beeperSync = require("./jobs/beeper-sync");
@@ -52,9 +53,9 @@ app.get("/health", (_, res) => res.json({
   calendar: GOOGLE_OAUTH,
   apollo:   !!process.env.APOLLO_KEY,
   mcp:      true,
-  version:  "3.17.0",
+  version:  "3.20.0",
 }));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.17.0", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.20.0", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

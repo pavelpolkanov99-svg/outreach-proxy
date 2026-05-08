@@ -5,7 +5,7 @@ const cron    = require("node-cron");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.20.0-anton-template";
+const VERSION      = "4.21.0-no-stale-in-today";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -659,7 +659,7 @@ function buildStaleSectionLean(stale) {
 }
 
 function buildFooter() {
-  return `<i>/details для деталей · /full для полного дайджеста</i>`;
+  return `<i>/details для деталей · /full для полного дайджеста · /stale для заглохших сделок</i>`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -793,16 +793,16 @@ function buildYesterdaySectionFull(summary) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // /today — Anton's lean format. Uses Haiku-merged blocks from /today/lean.
-function composeLeanDigest({ calendarRes, leanData, stale }, { customHeader } = {}) {
+// v4.21: stale block REMOVED from /today (still in /details, /full, /stale).
+function composeLeanDigest({ calendarRes, leanData }, { customHeader } = {}) {
   const sections = [];
   sections.push(customHeader || buildLeanHeader());
 
-  // Order per Anton's reference template:
+  // Order per Anton's reference template (v4.21 — без stale):
   //   📅 ВСТРЕЧИ СЕГОДНЯ
   //   🔥 СДЕЛАТЬ СЕГОДНЯ
   //   📊 ВЧЕРА В PIPELINE
-  //   🟡 ЗАГЛОХЛИ
-  //   /details · /full
+  //   /details · /full · /stale
 
   sections.push(buildCalendarSectionLean(calendarRes));
 
@@ -811,9 +811,6 @@ function composeLeanDigest({ calendarRes, leanData, stale }, { customHeader } = 
 
   const yesterdayPipeline = buildYesterdayPipelineSection(leanData);
   if (yesterdayPipeline) sections.push(yesterdayPipeline);
-
-  const staleBlock = buildStaleSectionLean(stale);
-  if (staleBlock) sections.push(staleBlock);
 
   sections.push(buildFooter());
 
@@ -873,16 +870,15 @@ function composeFullDigest(allData, { customHeader } = {}) {
 // Data fetchers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// /today minimal — only what lean digest needs
+// /today minimal — only what lean digest needs (v4.21: no stale)
 async function fetchLeanDigestData() {
   const t0 = Date.now();
-  const [calendarRes, leanData, stale] = await Promise.all([
+  const [calendarRes, leanData] = await Promise.all([
     withTimeout(fetchCalendar(),                                          20_000, "calendar"),
     withTimeout(fetchTodayLean(),                                         65_000, "today-lean"),
-    withTimeout(fetchStaleDeals({ days: 14, limit: 5 }),                  20_000, "stale"),
   ]);
   console.log(`[bot] lean digest data fetched in ${Date.now() - t0}ms`);
-  return { calendarRes, leanData, stale };
+  return { calendarRes, leanData };
 }
 
 // /details — Tasks + Replies + Stale + Calendar

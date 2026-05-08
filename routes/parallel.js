@@ -12,24 +12,19 @@ const router = express.Router();
 // ─────────────────────────────────────────────────────────────────────────────
 // BD Scoring Framework v2.2 — formulas, Floor Rules, tier mapping
 //
-// v2.2 (May 8 2026, Anton's patches):
-// - Removed bug: was dividing rawScore by 10, should be /17 (Client) or /14 (Partner)
-// - Removed MH tier (was inflated). P1 ≥7.5 is the new top.
-// - Apply UNKNOWN cap: UNKNOWN axes capped at 3
-// - >3 UNKNOWN → "Manual Review" (no tier assigned)
-// - Floor Rules as post-processor caps (G-1, G-2, G-3)
-// - SE modifier band-locked (+0.5 max, cannot move P2→P1)
-// - Apply correct Client vs Partner formula based on category
+// v2.2.5 (May 8 2026): Switch scoring default processor lite → core
+// - Lite has max ~2 fields, our schema has 19 props (16 required) — way over spec
+// - Core supports ~10 fields and includes Excerpts + Confidence in basis
+// - Cost: $0.025/scoring vs $0.005 (5x). At 400 companies/month = $11/mo total
+// - Latency: 1-5min vs 5-60s. Acceptable for batch processing
+// - Insights endpoint stays on lite (short factual queries, well-suited for lite)
 //
-// v2.2.1 fixes (May 8 2026, after unit testing):
-// - SE band-lock final guard: score 7.0 + SE no longer rounds up to 7.5
-// - G-2 only applies to Client (Partner formula doesn't use axes 1,2)
-// - Score < 3.0 → Skip (not P3 from phantom Floor Rule trigger)
-//
-// v2.2.2 schema fix (May 8 2026):
-// - axes_meta is now a single 9-char string (was 9 separate fields)
-//   to fit within Parallel's stability threshold (~18-19 props)
-// - Position N in string = axis K where K = axes 1,2,3,4,5,6,7,8,10
+// Earlier:
+// - v2.2 (Anton's patches): formulas + tier mapping + Floor Rules
+// - v2.2.1: 3 bug fixes from unit testing (SE band-lock, G-2, score<3)
+// - v2.2.2: collapse axes_meta to single 9-char string (schema bloat fix)
+// - v2.2.3: revert prompt to v2.1 baseline + 6 lines minimal v2.2 additions
+// - v2.2.4: brand trap reinforcement (HK-4, named cases, structural competitors)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Parse v2.2.2 axes_meta string "FFIFFFUFF" → map of axis index → label
@@ -154,9 +149,11 @@ function buildCompactV22(c) {
 }
 
 // ── POST /parallel/research/start ─────────────────────────────────────────────
+// Default processor: "core" (v2.2.5 — was "lite", but lite max 2 fields,
+// our schema has 19 props. Core supports ~10 fields + Excerpts/Confidence basis).
 router.post("/research/start", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
-  const { company, domain, processor = "lite" } = req.body;
+  const { company, domain, processor = "core" } = req.body;
   if (!company) return res.status(400).json({ error: "company required" });
   try {
     const r = await axios.post(
@@ -224,6 +221,7 @@ router.get("/result/:taskId/compact", async (req, res) => {
 });
 
 // ── POST /parallel/insight/start ──────────────────────────────────────────────
+// Stays on lite — short factual outreach hooks, simple 1-2 field task suits lite
 router.post("/insight/start", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
   const { company, person, topic } = req.body;
@@ -246,11 +244,13 @@ router.post("/insight/start", async (req, res) => {
 });
 
 // ── POST /parallel/score ──────────────────────────────────────────────────────
+// v2.2.5: core (default) for all; core2x for high-clientScore (verification escalation)
 router.post("/score", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
   const { company, domain, clientScore } = req.body;
   if (!company) return res.status(400).json({ error: "company required" });
-  const processor = (clientScore !== undefined && clientScore >= 7.5) ? "base" : "lite";
+  // Default Core; escalate to Core2x if clientScore signals high stakes (≥7.5)
+  const processor = (clientScore !== undefined && clientScore >= 7.5) ? "core2x" : "core";
   try {
     const r = await axios.post(
       "https://api.parallel.ai/v1/tasks/runs",
@@ -266,6 +266,7 @@ router.post("/score", async (req, res) => {
 });
 
 // ── POST /parallel/upgrade ────────────────────────────────────────────────────
+// Upgrade endpoint: re-research on Core2x (verification of high-stakes results)
 router.post("/upgrade", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
   const { company, domain } = req.body;
@@ -285,12 +286,12 @@ router.post("/upgrade", async (req, res) => {
   try {
     const r = await axios.post(
       "https://api.parallel.ai/v1/tasks/runs",
-      { input: buildResearchQuery(company, domain), processor: "base", task_spec: upgradeSpec },
+      { input: buildResearchQuery(company, domain), processor: "core2x", task_spec: upgradeSpec },
       { headers: parallelHeaders(), timeout: 15000 }
     );
     const taskId = r.data?.run_id || r.data?.id;
     if (!taskId) return res.status(500).json({ error: "No task ID" });
-    res.json({ ok: true, taskId, company, processor: "base", status: r.data?.status });
+    res.json({ ok: true, taskId, company, processor: "core2x", status: r.data?.status });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
   }
@@ -298,6 +299,7 @@ router.post("/upgrade", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // /insights-bullets — single Parallel call with structured output
+// Stays on lite — 1-3 short factual bullets, well within lite spec
 // ─────────────────────────────────────────────────────────────────────────────
 
 const insightsBulletsSpec = {
@@ -408,6 +410,7 @@ router.post("/insights-bullets", async (req, res) => {
   const { company, domain, timeoutMs } = req.body || {};
   if (!company) return res.status(400).json({ ok: false, error: "company required" });
 
+  // Core latency 1-5min; insights uses lite, but still increase default to handle Parallel queue variability
   const pollTimeoutMs = Math.max(
     10_000,
     Math.min(300_000, Number(timeoutMs) || 90_000)

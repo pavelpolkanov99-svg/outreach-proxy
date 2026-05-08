@@ -5,7 +5,7 @@ const cron    = require("node-cron");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.18.0-deeplinks";
+const VERSION      = "4.19.0-lean-template";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -50,12 +50,6 @@ function esc(text) {
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-// Build a clickable name with optional deeplink. If deeplink is null, returns
-// just <b>esc(name)</b>. If present, wraps name in <a href> and appends 🔗
-// icon for visual affordance (so Anton sees "this is tappable").
-//
-// Per Anton's UX answer "оба" — name itself is clickable AND there's a small
-// icon. Icon goes after to keep the name's visual weight first.
 function renderClickableName(name, deeplinkUrl) {
   const safeName = esc(name);
   if (!deeplinkUrl) return `<b>${safeName}</b>`;
@@ -71,6 +65,49 @@ function withTimeout(promise, ms, label) {
     }, ms);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v4.19: Russian-localized header per Anton's approved lean-template:
+//   ☀️ Доброе утро. Сегодня 8 мая, четверг.
+//
+// Uses Europe/Prague timezone to match where Anton actually is.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const RU_MONTHS = [
+  "января", "февраля", "марта", "апреля", "мая", "июня",
+  "июля", "августа", "сентября", "октября", "ноября", "декабря",
+];
+const RU_WEEKDAYS_FULL = [
+  "воскресенье", "понедельник", "вторник", "среда",
+  "четверг", "пятница", "суббота",
+];
+
+function buildRussianHeaderDate() {
+  const fmt = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Europe/Prague",
+    year:    "numeric",
+    month:   "numeric",
+    day:     "numeric",
+    weekday: "short",
+  });
+  const parts = fmt.formatToParts(new Date());
+  const day   = parseInt(parts.find(p => p.type === "day").value,   10);
+  const month = parseInt(parts.find(p => p.type === "month").value, 10);
+  const wkShort = parts.find(p => p.type === "weekday").value;
+
+  const wkMap = {
+    Sun: "воскресенье", Mon: "понедельник", Tue: "вторник",
+    Wed: "среда",       Thu: "четверг",     Fri: "пятница",
+    Sat: "суббота",
+  };
+  const weekday = wkMap[wkShort] || "";
+
+  return `Сегодня ${day} ${RU_MONTHS[month - 1]}, ${weekday}.`;
+}
+
+function buildLeanHeader() {
+  return `☀️ <b>Доброе утро.</b> ${buildRussianHeaderDate()}`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -219,112 +256,123 @@ function dueLabel(daysOverdue) {
   return ` · in ${Math.abs(daysOverdue)}d`;
 }
 
-// ── Render helpers ───────────────────────────────────────────────────────────
+// ── Render helpers (v4.19 lean) ──────────────────────────────────────────────
 
-function renderEvent(ev) {
+// Extract a short start-time prefix from "11:30–12:00" → "11:30".
+function shortStartTime(timeRange) {
+  if (!timeRange) return "";
+  const m = String(timeRange).match(/^(\d{1,2}:\d{2})/);
+  return m ? m[1] : timeRange;
+}
+
+// v4.19: lean event format per Anton's approved template:
+//   11:30  Person · Company · 🟢 MH 11.5 · stage
+//          └ 1 top bullet (либо ничего)
+//          Join → meet.google.com/...
+//
+// Differences vs old format:
+//   - One single line for time + person + company + tier + stage
+//   - Description (📝) DROPPED — too noisy
+//   - Tags (🏷) DROPPED — irrelevant for Anton
+//   - Insight bullets reduced to TOP 1 (not all 3)
+//   - LinkedIn URL stays inline on person
+//   - Hard Kill stays as warning (those Anton MUST see)
+function renderEventLean(ev) {
   const lines = [];
-  const title = esc(ev.summary);
-  lines.push(`<code>${ev.timeRange}</code>  <b>${title}</b>`);
+  const startTime = shortStartTime(ev.timeRange);
 
   if (ev.isInternal) {
-    lines.push(`             <i>internal/focus</i>`);
+    lines.push(`<code>${startTime}</code>  <b>${esc(ev.summary)}</b> · <i>internal/focus</i>`);
     return lines.join("\n");
   }
 
-  const indent = "             ";
-
-  if (ev.primaryDomain) {
-    lines.push(`${indent}🌐 ${esc(ev.primaryDomain)}`);
-  }
-
-  const p = ev.attendeePerson;
-  if (p) {
-    const personName = p.name || p.email?.split("@")[0] || "?";
-    const titlePart  = p.title ? ` — ${esc(p.title)}` : "";
-    const linkPart   = p.linkedin ? ` · <a href="${esc(p.linkedin)}">LinkedIn</a>` : "";
-    lines.push(`${indent}👤 ${esc(personName)}${titlePart}${linkPart}`);
-  }
-
+  const indent = "       ";
   const crm = ev.notion;
+  const p   = ev.attendeePerson;
+
+  // Compose the headline: person · company · tier · stage
+  // Fall back gracefully when fields missing.
+  const headlineParts = [];
+
+  if (p) {
+    const personName = p.name || p.email?.split("@")[0] || null;
+    if (personName) {
+      const linkPart = p.linkedin ? ` <a href="${esc(p.linkedin)}">↗</a>` : "";
+      headlineParts.push(`${esc(personName)}${linkPart}`);
+    }
+  }
+
+  if (crm?.name) {
+    headlineParts.push(`<b>${esc(crm.name)}</b>`);
+  } else if (ev.primaryDomain) {
+    headlineParts.push(`<b>${esc(ev.primaryDomain)}</b>`);
+  }
+
+  // Tier + stage (or just stage if no tier yet)
   if (crm) {
     const t = tierFromCompany(crm);
     if (t?.hardKill) {
       const hkDesc = HK_DESCRIPTIONS[t.code] || "Hard Kill";
-      lines.push(`${indent}🔴 <b>Hard Kill — ${esc(t.code)}</b> · ${esc(hkDesc)}`);
-      lines.push(`${indent}   <i>Anton, замни диалог</i>`);
-    } else if (t) {
-      const stagePart = crm.stage ? ` · ${esc(crm.stage)}` : "";
-      const lastTouch = daysAgo(crm.lastContact);
-      const touchPart = lastTouch ? ` · last touch ${lastTouch}` : "";
-      lines.push(
-        `${indent}${t.emoji} <b>${t.tier}</b> · ${t.score}${stagePart}${touchPart}`
-      );
-    } else if (crm.stage) {
-      lines.push(`${indent}⚪ ${esc(crm.stage)}`);
-    }
-
-    if (crm.description) {
-      const shortDesc = crm.description.split(/\n\s*\n/)[0].trim();
-      const truncated = shortDesc.length > 180
-        ? shortDesc.slice(0, 177) + "..."
-        : shortDesc;
-      lines.push(`${indent}📝 ${esc(truncated)}`);
-    }
-
-    if (crm.insight?.bullets?.length) {
-      const refreshDate = crm.insight.refreshedAt
-        ? ` <i>(${esc(crm.insight.refreshedAt.slice(0, 10))})</i>`
-        : "";
-      lines.push(`${indent}🔍 <b>Refreshed</b>${refreshDate}:`);
-      for (const b of crm.insight.bullets) {
-        lines.push(`${indent}   • ${esc(b)}`);
+      headlineParts.push(`🔴 <b>Hard Kill — ${esc(t.code)}</b>`);
+      lines.push(`<code>${startTime}</code>  ${headlineParts.join(" · ")}`);
+      lines.push(`${indent}└ <i>${esc(hkDesc)} · Anton, замни диалог</i>`);
+      if (ev.meetUrl) {
+        lines.push(`${indent}<a href="${esc(ev.meetUrl)}">Join</a> → ${esc(ev.meetUrl.replace(/^https?:\/\//, ""))}`);
       }
+      return lines.join("\n");
     }
-
-    const visibleTags = (crm.tags || []).filter(t =>
-      !/^(MH|P1|P2|P3|Hard Kill)/i.test(t)
-    );
-    if (visibleTags.length) {
-      lines.push(`${indent}🏷 ${visibleTags.slice(0, 6).map(esc).join(" · ")}`);
+    if (t) {
+      const stagePart = crm.stage ? ` · ${esc(crm.stage)}` : "";
+      headlineParts.push(`${t.emoji} <b>${t.tier}</b> ${t.score}${stagePart}`);
+    } else if (crm.stage) {
+      headlineParts.push(`⚪ ${esc(crm.stage)}`);
     }
   } else {
-    lines.push(`${indent}🆕 <i>not in CRM</i> — cron подхватит ночью`);
+    headlineParts.push(`🆕 <i>not in CRM</i>`);
+  }
+
+  // If we only have the title (no person/CRM), use the event summary
+  if (headlineParts.length === 0) {
+    headlineParts.push(`<b>${esc(ev.summary)}</b>`);
+  }
+
+  lines.push(`<code>${startTime}</code>  ${headlineParts.join(" · ")}`);
+
+  // Top insight bullet — 1 only, the most actionable
+  if (crm?.insight?.bullets?.length) {
+    const top = crm.insight.bullets[0];
+    if (top) lines.push(`${indent}└ ${esc(top)}`);
   }
 
   if (ev.meetUrl) {
-    lines.push(`${indent}📞 <a href="${esc(ev.meetUrl)}">Join</a>`);
+    const shortUrl = ev.meetUrl.replace(/^https?:\/\//, "");
+    lines.push(`${indent}<a href="${esc(ev.meetUrl)}">Join</a> → ${esc(shortUrl)}`);
   }
 
   return lines.join("\n");
 }
 
-function renderStaleDeal(deal) {
-  const lines = [];
+// v4.19: lean stale-deal — no tier-row, all info on one line + snippet.
+//   🔴 LeoPay (Negotiations · 20д) — Discovery Card hard deadline проигнорирован
+//   🟡 Belo (Warm · 25д), Merge (Warm · 25д), BPCE (Warm · 20д)
+//
+// "Hot" stale (Negotiations / Call Scheduled) → red + own line + snippet.
+// "Warm" stale → yellow, packed into compact lines.
+function renderStaleDealLean(deal) {
   const stage = deal.stage || "";
   const isHotStage = stage === "Negotiations" || stage === "Call Scheduled";
   const emoji = isHotStage ? "🔴" : "🟡";
 
-  const stagePart = stage ? ` · ${esc(stage)}` : "";
-  lines.push(`${emoji} <b>${esc(deal.name)}</b>${stagePart}`);
+  const stageShort = stage.replace(/discussions/i, "").trim();
+  const days = deal.daysStale != null ? `${deal.daysStale}д` : "?";
+  const headline = `${emoji} <b>${esc(deal.name)}</b> (${esc(stageShort)} · ${days})`;
 
-  const indent = "   ";
-  const t = tierFromCompany(deal);
-  const ctxParts = [];
-  if (t && !t.hardKill) ctxParts.push(`${t.tier} · ${t.score}`);
-  else if (deal.bdScore != null) ctxParts.push(`BD ${deal.bdScore}`);
-  if (deal.priority) ctxParts.push(deal.priority);
-  if (deal.pipeline) ctxParts.push(deal.pipeline);
-  if (ctxParts.length) lines.push(`${indent}<i>${ctxParts.map(esc).join(" · ")}</i>`);
-
-  if (deal.daysStale != null) {
-    lines.push(`${indent}📅 <b>Нет активности ${deal.daysStale}д</b>`);
+  // Hot deals get a snippet line; warm get just the headline (snippets shown
+  // in /stale, but for /today digest they make the block too long).
+  if (isHotStage && deal.lastActivitySnippet) {
+    return `${headline} — <i>${esc(deal.lastActivitySnippet)}</i>`;
   }
-
-  if (deal.lastActivitySnippet) {
-    lines.push(`${indent}💬 <i>"${esc(deal.lastActivitySnippet)}"</i>`);
-  }
-
-  return lines.join("\n");
+  return headline;
 }
 
 function renderTask(task) {
@@ -380,8 +428,6 @@ function renderCompletedTask(task) {
   return lines.join("\n");
 }
 
-// v4.18: chat name is now clickable (deeplink to native chat) when proxy
-// resolved a contact for it. Falls back to plain bold name when no deeplink.
 function renderReply(reply) {
   const lines = [];
   const networkBadge = NET_BADGE[reply.networkFull] || NET_BADGE[reply.network] || "💬";
@@ -531,19 +577,19 @@ async function fetchYesterdaySummary() {
 
 // ── Section builders ─────────────────────────────────────────────────────────
 
-function buildCalendarSection(calendarRes) {
+function buildCalendarSectionLean(calendarRes) {
   if (calendarRes && calendarRes.__timeout) {
-    return `📅 <b>Сегодня</b>\n\n<i>⚠️ Календарь не ответил.</i>`;
+    return `📅 <b>ВСТРЕЧИ СЕГОДНЯ</b>\n\n<i>⚠️ Календарь не ответил.</i>`;
   }
   if (!calendarRes || !calendarRes.ok) {
-    return `📅 <b>Сегодня</b>\n\n<i>❌ Calendar error: ${esc(calendarRes?.error || "unknown")}</i>`;
+    return `📅 <b>ВСТРЕЧИ СЕГОДНЯ</b>\n\n<i>❌ Calendar error: ${esc(calendarRes?.error || "unknown")}</i>`;
   }
   if (!calendarRes.events?.length) {
-    return `📅 <b>Сегодня (${esc(calendarRes.date)})</b>\n\nКалендарь пустой 🌴`;
+    return `📅 <b>ВСТРЕЧИ СЕГОДНЯ</b>\n\nКалендарь пустой 🌴`;
   }
-  const blocks = calendarRes.events.map(renderEvent);
+  const blocks = calendarRes.events.map(renderEventLean);
   return (
-    `📅 <b>Сегодня (${esc(calendarRes.date)})</b>  · <i>${calendarRes.total} встреч</i>\n` +
+    `📅 <b>ВСТРЕЧИ СЕГОДНЯ</b> · <i>${calendarRes.total}</i>\n` +
     `\n` +
     blocks.join("\n\n")
   );
@@ -596,21 +642,40 @@ function buildRepliesSection(repliesResult) {
   );
 }
 
-function buildStaleSection(stale) {
+// v4.19: lean stale section. Hot Negotiations get full lines with snippet.
+// Warm stale get COMPACTED into 1-2 lines at the end:
+//   🟡 Belo (Warm · 25д), Merge (Warm · 25д), BPCE (Warm · 20д)
+function buildStaleSectionLean(stale) {
   if (stale && stale.__timeout) {
-    return `🟡 <b>Заглохли</b>\n\n<i>⚠️ Notion не ответил по сделкам.</i>`;
+    return `🟡 <b>ЗАГЛОХЛИ · решить</b>\n\n<i>⚠️ Notion не ответил по сделкам.</i>`;
   }
   if (!Array.isArray(stale) || stale.length === 0) return null;
 
-  const dealBlocks = stale.map(renderStaleDeal);
+  // Split: hot (Negotiations / Call Scheduled) vs warm
+  const hot  = stale.filter(d => d.stage === "Negotiations" || d.stage === "Call Scheduled");
+  const warm = stale.filter(d => !(d.stage === "Negotiations" || d.stage === "Call Scheduled"));
+
+  const lines = [];
+  for (const d of hot) {
+    lines.push(renderStaleDealLean(d));
+  }
+
+  if (warm.length > 0) {
+    const compact = warm.map(d => {
+      const stageShort = (d.stage || "").replace(/discussions/i, "").trim();
+      const days = d.daysStale != null ? `${d.daysStale}д` : "?";
+      return `${esc(d.name)} (${esc(stageShort)} · ${days})`;
+    }).join(", ");
+    lines.push(`🟡 ${compact}`);
+  }
+
   return (
-    `🟡 <b>Заглохли</b>  · <i>${stale.length} сделок &gt;14d</i>\n` +
+    `🟡 <b>ЗАГЛОХЛИ · решить</b>\n` +
     `\n` +
-    dealBlocks.join("\n\n")
+    lines.join("\n")
   );
 }
 
-// v4.18: topChats names now clickable when deeplink available
 function buildYesterdaySection(summary) {
   if (!summary) {
     return `📆 <b>Что было вчера</b>\n\n<i>⚠️ Не удалось получить summary мессенджеров.</i>`;
@@ -633,7 +698,7 @@ function buildYesterdaySection(summary) {
   if (summary.source === "hub-fresh") {
     sourceLabel = `  · <i>из Messaging Hub</i>`;
   } else if (summary.source === "hub-stale") {
-    sourceLabel = `  · <i>данные за ${esc(summary.dataDate)} (Pavel оффлайн, Beeper-актуалка позже)</i>`;
+    sourceLabel = `  · <i>данные за ${esc(summary.dataDate)}</i>`;
   } else if (summary.source === "hub-empty") {
     return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n\n<i>Активности не было.</i>`;
   }
@@ -666,7 +731,6 @@ function buildYesterdaySection(summary) {
       lines.push("");
       for (const c of net.topChats) {
         const arrow = c.direction === "→" ? "→" : "←";
-        // Truncate name for display, but use full name in clickable link
         const displayName = (c.name || "").length > 40
           ? (c.name || "").slice(0, 40) + "..."
           : c.name;
@@ -687,22 +751,20 @@ function buildYesterdaySection(summary) {
   );
 }
 
-const HUB_FALLBACK_DISCLAIMER =
-  `⚠️ <b>Внимание Anton</b>: данные мессенджеров могут быть частично неактуальными — ` +
-  `Pavel сейчас не подключен к Beeper. Когда подключение восстановится, Pavel пришлёт ` +
-  `актуальную сводку вручную.`;
+// v4.19: NO MORE hub-fallback disclaimer — Anton called it out as noise
+// ("не моя проблема"). If Hub is the source, that fact is shown INSIDE
+// each affected block (e.g. "из Messaging Hub" on yesterday/replies),
+// not in the top-level header.
 
 function composeTodayDigest(
   { calendarRes, tasksData, stale, repliesResult, completedTasks, yesterdaySummary },
-  { header, withDisclaimer = false } = {}
+  { customHeader } = {}
 ) {
   const sections = [];
-  if (header) sections.push(header);
-  if (withDisclaimer && repliesResult?.source === "messaging-hub") {
-    sections.push(HUB_FALLBACK_DISCLAIMER);
-  }
+  // Use lean Russian header by default; allow override (for /digest commands)
+  sections.push(customHeader || buildLeanHeader());
 
-  sections.push(buildCalendarSection(calendarRes));
+  sections.push(buildCalendarSectionLean(calendarRes));
 
   const tasksBlock = buildTasksSectionResilient(tasksData, completedTasks);
   if (tasksBlock) sections.push(tasksBlock);
@@ -713,7 +775,7 @@ function composeTodayDigest(
   const yesterdayBlock = buildYesterdaySection(yesterdaySummary);
   if (yesterdayBlock) sections.push(yesterdayBlock);
 
-  const staleBlock = buildStaleSection(stale);
+  const staleBlock = buildStaleSectionLean(stale);
   if (staleBlock) sections.push(staleBlock);
 
   return sections.join(SECTION_SEP);
@@ -786,10 +848,10 @@ bot.command("ping", ctx => guard(ctx, () => {
 
 bot.command("today", ctx => guard(ctx, async () => {
   const t0 = Date.now();
-  const loadingMsg = await ctx.reply("⏳ Тяну дайджест (yesterday-summary через Claude Haiku, ~30-60s)...");
+  const loadingMsg = await ctx.reply("⏳ Тяну дайджест (~30-60s)...");
   try {
     const data = await fetchTodayDigestData();
-    const text = composeTodayDigest(data, { withDisclaimer: false });
+    const text = composeTodayDigest(data);
 
     await editAndSplit(ctx, loadingMsg, text);
     console.log(`[bot] /today completed in ${Date.now() - t0}ms (${text.length} chars)`);
@@ -807,7 +869,7 @@ bot.command("today", ctx => guard(ctx, async () => {
 
 bot.command("yesterday", ctx => guard(ctx, async () => {
   const t0 = Date.now();
-  const loadingMsg = await ctx.reply("⏳ Собираю summary мессенджеров за вчера (только важные сделки, ~30-60s)...");
+  const loadingMsg = await ctx.reply("⏳ Собираю summary мессенджеров за вчера (~30-60s)...");
   try {
     const summary = await fetchYesterdaySummary();
     if (!summary) {
@@ -849,23 +911,19 @@ bot.command("digest", ctx => guard(ctx, async () => {
     const data = await fetchTodayDigestData();
 
     if (ANTON_TG_ID) {
-      const header = `☀️ <b>Дайджест от Loop OS</b> (отправлен Pavel вручную)`;
-      const text = composeTodayDigest(data, { header, withDisclaimer: true });
+      const customHeader = `${buildLeanHeader()}\n<i>(отправлен Pavel вручную)</i>`;
+      const text = composeTodayDigest(data, { customHeader });
 
       await sendSplit(ANTON_TG_ID, text);
 
-      const hubNote = data.repliesResult?.source === "messaging-hub"
-        ? `\n\n⚠️ Replies взяты из Messaging Hub (Beeper offline) — Anton получил предупреждение.`
-        : "";
-
       await ctx.api.editMessageText(
         ctx.chat.id, loadingMsg.message_id,
-        `✅ Дайджест отправлен Anton'у (TG ID ${ANTON_TG_ID}).${hubNote}`,
+        `✅ Дайджест отправлен Anton'у (TG ID ${ANTON_TG_ID}).`,
         { parse_mode: "HTML" }
       );
     } else {
-      const header = `🧪 <b>Тестовый дайджест</b> · ANTON_TG_ID не задан, шлю тебе`;
-      const text = composeTodayDigest(data, { header, withDisclaimer: true });
+      const customHeader = `🧪 <b>Тестовый дайджест</b> · ANTON_TG_ID не задан, шлю тебе\n\n${buildLeanHeader()}`;
+      const text = composeTodayDigest(data, { customHeader });
 
       await editAndSplit(ctx, loadingMsg, text);
     }
@@ -936,11 +994,8 @@ bot.command("stale", ctx => guard(ctx, async () => {
         { parse_mode: "HTML" }
       );
     }
-    const dealBlocks = stale.map(renderStaleDeal);
-    const text =
-      `🟡 <b>Заглохли</b>  · <i>${stale.length} сделок &gt;14d</i>\n\n` +
-      dealBlocks.join("\n\n");
-    return editAndSplit(ctx, loadingMsg, text);
+    const block = buildStaleSectionLean(stale);
+    return editAndSplit(ctx, loadingMsg, block);
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
     return ctx.api.editMessageText(
@@ -997,8 +1052,8 @@ async function sendMorningPush() {
   console.log(`[cron] morning push start, recipients: ${MORNING_PUSH_USERS.join(",")}`);
   try {
     const data = await fetchTodayDigestData();
-    const header = `☀️ <b>Доброе утро!</b> Дайджест на сегодня.`;
-    const text = composeTodayDigest(data, { header, withDisclaimer: true });
+    // Use the lean header — same as /today
+    const text = composeTodayDigest(data);
     for (const userId of MORNING_PUSH_USERS) {
       try {
         await sendSplit(userId, text);

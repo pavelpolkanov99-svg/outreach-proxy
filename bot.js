@@ -5,7 +5,7 @@ const cron    = require("node-cron");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.20.0-lean-haiku";
+const VERSION      = "4.20.0-anton-template";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -68,7 +68,7 @@ function withTimeout(promise, ms, label) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Russian-localized header
+// Russian header
 // ─────────────────────────────────────────────────────────────────────────────
 
 const RU_MONTHS = [
@@ -104,7 +104,7 @@ function buildLeanHeader() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Message splitting (Telegram 4096 char limit)
+// Message splitting
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MAX_MESSAGE_LEN = 4000;
@@ -157,7 +157,11 @@ async function editAndSplit(ctx, loadingMsg, fullText, opts = {}) {
     link_preview_options: { is_disabled: true },
     ...opts,
   };
-  await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, chunks[0], sendOpts);
+
+  await ctx.api.editMessageText(
+    ctx.chat.id, loadingMsg.message_id, chunks[0], sendOpts
+  );
+
   for (let i = 1; i < chunks.length; i++) {
     await ctx.api.sendMessage(ctx.chat.id, chunks[i], sendOpts);
   }
@@ -252,10 +256,9 @@ function shortStartTime(timeRange) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Render helpers — lean for /today, full for /details and /full
+// LEAN render helpers (used in /today)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Lean event renderer (used in /today)
 function renderEventLean(ev) {
   const lines = [];
   const startTime = shortStartTime(ev.timeRange);
@@ -268,7 +271,6 @@ function renderEventLean(ev) {
   const indent = "       ";
   const crm = ev.notion;
   const p   = ev.attendeePerson;
-
   const headlineParts = [];
 
   if (p) {
@@ -326,7 +328,6 @@ function renderEventLean(ev) {
   return lines.join("\n");
 }
 
-// Lean stale renderer
 function renderStaleDealLean(deal) {
   const stage = deal.stage || "";
   const isHotStage = stage === "Negotiations" || stage === "Call Scheduled";
@@ -342,103 +343,9 @@ function renderStaleDealLean(deal) {
   return headline;
 }
 
-// Full event renderer (used in /full)
-function renderEventFull(ev) {
-  const lines = [];
-  const title = esc(ev.summary);
-  lines.push(`<code>${ev.timeRange}</code>  <b>${title}</b>`);
-
-  if (ev.isInternal) {
-    lines.push(`             <i>internal/focus</i>`);
-    return lines.join("\n");
-  }
-
-  const indent = "             ";
-
-  if (ev.primaryDomain) {
-    lines.push(`${indent}🌐 ${esc(ev.primaryDomain)}`);
-  }
-
-  const p = ev.attendeePerson;
-  if (p) {
-    const personName = p.name || p.email?.split("@")[0] || "?";
-    const titlePart  = p.title ? ` — ${esc(p.title)}` : "";
-    const linkPart   = p.linkedin ? ` · <a href="${esc(p.linkedin)}">LinkedIn</a>` : "";
-    lines.push(`${indent}👤 ${esc(personName)}${titlePart}${linkPart}`);
-  }
-
-  const crm = ev.notion;
-  if (crm) {
-    const t = tierFromCompany(crm);
-    if (t?.hardKill) {
-      const hkDesc = HK_DESCRIPTIONS[t.code] || "Hard Kill";
-      lines.push(`${indent}🔴 <b>Hard Kill — ${esc(t.code)}</b> · ${esc(hkDesc)}`);
-      lines.push(`${indent}   <i>Anton, замни диалог</i>`);
-    } else if (t) {
-      const stagePart = crm.stage ? ` · ${esc(crm.stage)}` : "";
-      const lastTouch = daysAgo(crm.lastContact);
-      const touchPart = lastTouch ? ` · last touch ${lastTouch}` : "";
-      lines.push(`${indent}${t.emoji} <b>${t.tier}</b> · ${t.score}${stagePart}${touchPart}`);
-    } else if (crm.stage) {
-      lines.push(`${indent}⚪ ${esc(crm.stage)}`);
-    }
-
-    if (crm.description) {
-      const shortDesc = crm.description.split(/\n\s*\n/)[0].trim();
-      const truncated = shortDesc.length > 180 ? shortDesc.slice(0, 177) + "..." : shortDesc;
-      lines.push(`${indent}📝 ${esc(truncated)}`);
-    }
-
-    if (crm.insight?.bullets?.length) {
-      const refreshDate = crm.insight.refreshedAt ? ` <i>(${esc(crm.insight.refreshedAt.slice(0, 10))})</i>` : "";
-      lines.push(`${indent}🔍 <b>Refreshed</b>${refreshDate}:`);
-      for (const b of crm.insight.bullets) {
-        lines.push(`${indent}   • ${esc(b)}`);
-      }
-    }
-
-    const visibleTags = (crm.tags || []).filter(t => !/^(MH|P1|P2|P3|Hard Kill)/i.test(t));
-    if (visibleTags.length) {
-      lines.push(`${indent}🏷 ${visibleTags.slice(0, 6).map(esc).join(" · ")}`);
-    }
-  } else {
-    lines.push(`${indent}🆕 <i>not in CRM</i> — cron подхватит ночью`);
-  }
-
-  if (ev.meetUrl) {
-    lines.push(`${indent}📞 <a href="${esc(ev.meetUrl)}">Join</a>`);
-  }
-
-  return lines.join("\n");
-}
-
-function renderStaleDealFull(deal) {
-  const lines = [];
-  const stage = deal.stage || "";
-  const isHotStage = stage === "Negotiations" || stage === "Call Scheduled";
-  const emoji = isHotStage ? "🔴" : "🟡";
-
-  const stagePart = stage ? ` · ${esc(stage)}` : "";
-  lines.push(`${emoji} <b>${esc(deal.name)}</b>${stagePart}`);
-
-  const indent = "   ";
-  const t = tierFromCompany(deal);
-  const ctxParts = [];
-  if (t && !t.hardKill) ctxParts.push(`${t.tier} · ${t.score}`);
-  else if (deal.bdScore != null) ctxParts.push(`BD ${deal.bdScore}`);
-  if (deal.priority) ctxParts.push(deal.priority);
-  if (deal.pipeline) ctxParts.push(deal.pipeline);
-  if (ctxParts.length) lines.push(`${indent}<i>${ctxParts.map(esc).join(" · ")}</i>`);
-
-  if (deal.daysStale != null) {
-    lines.push(`${indent}📅 <b>Нет активности ${deal.daysStale}д</b>`);
-  }
-  if (deal.lastActivitySnippet) {
-    lines.push(`${indent}💬 <i>"${esc(deal.lastActivitySnippet)}"</i>`);
-  }
-
-  return lines.join("\n");
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// FULL render helpers (used in /details and /full — old format)
+// ─────────────────────────────────────────────────────────────────────────────
 
 function renderTask(task) {
   const lines = [];
@@ -461,7 +368,9 @@ function renderTaskGroup(group) {
   const lines = [];
   const emoji = TASK_PRIORITY_EMOJI[group.priority] || "⚪";
   const due = dueLabel(group.daysOverdue);
-  const titleSafe = group.template.length > 80 ? group.template.slice(0, 77) + "..." : group.template;
+  const titleSafe = group.template.length > 80
+    ? group.template.slice(0, 77) + "..."
+    : group.template;
   lines.push(`${emoji} <b>${esc(titleSafe)}</b>  · <b>×${group.count}</b>${due}`);
 
   const companies = group.companies || [];
@@ -519,38 +428,30 @@ function renderReply(reply) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Fetchers
+// Fetch helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function fetchCalendar() {
+  const t0 = Date.now();
   try {
     const r = await axios.get(`${PROXY}/calendar/today`, { timeout: 20_000 });
+    console.log(`[bot] calendar fetched in ${Date.now() - t0}ms`);
     return r.data;
   } catch (err) {
-    console.error("[bot] calendar failed:", err.message);
+    console.error(`[bot] calendar fetch failed in ${Date.now() - t0}ms:`, err.message);
     return { ok: false, error: err.message };
   }
 }
 
-async function fetchTodayLean() {
-  try {
-    const r = await axios.get(`${PROXY}/today/lean`, { timeout: 60_000 });
-    console.log(`[bot] /today/lean fetched in ${r.data?.elapsed || "?"}ms (todo=${r.data?.todoToday?.length || 0}, ai=${r.data?.aiAvailable})`);
-    return r.data;
-  } catch (err) {
-    console.error("[bot] /today/lean failed:", err.message);
-    return null;
-  }
-}
-
-async function fetchStaleDeals({ days = 14, limit = 10 } = {}) {
+async function fetchStaleDeals({ days = 14, limit = 5 } = {}) {
+  const t0 = Date.now();
   try {
     const r = await axios.get(`${PROXY}/notion/stale-deals-enriched`, {
       params: { days, limit }, timeout: 18_000,
     });
     return r.data?.deals || [];
   } catch (err) {
-    console.warn("[bot] stale-enriched failed, trying plain:", err.message);
+    console.warn(`[bot] stale-enriched failed in ${Date.now() - t0}ms:`, err.message);
   }
   try {
     const r = await axios.get(`${PROXY}/notion/stale-deals`, {
@@ -558,12 +459,13 @@ async function fetchStaleDeals({ days = 14, limit = 10 } = {}) {
     });
     return r.data?.deals || [];
   } catch (err) {
-    console.error("[bot] stale failed:", err.message);
+    console.error(`[bot] stale (plain) failed:`, err.message);
     return null;
   }
 }
 
 async function fetchTasksToday({ limit = 20 } = {}) {
+  const t0 = Date.now();
   try {
     const r = await axios.get(`${PROXY}/notion/tasks-today`, {
       params: { limit }, timeout: 15_000,
@@ -573,13 +475,11 @@ async function fetchTasksToday({ limit = 20 } = {}) {
                 : Array.isArray(data.tasks) ? data.tasks.map(t => ({ kind: "single", task: t }))
                 : [];
     const tasksFlat  = Array.isArray(data.tasks) ? data.tasks : [];
-    return {
-      items,
-      totalRaw: data.total ?? tasksFlat.length,
-      overdueRaw: tasksFlat.filter(t => t.daysOverdue > 0).length,
-    };
+    const totalRaw   = data.total ?? tasksFlat.length;
+    const overdueRaw = tasksFlat.filter(t => t.daysOverdue > 0).length;
+    return { items, totalRaw, overdueRaw };
   } catch (err) {
-    console.error("[bot] tasks failed:", err.message);
+    console.error(`[bot] tasks fetch failed in ${Date.now() - t0}ms:`, err.message);
     return null;
   }
 }
@@ -591,7 +491,7 @@ async function fetchTasksCompleted({ days = 3, limit = 20 } = {}) {
     });
     return Array.isArray(r.data?.tasks) ? r.data.tasks : [];
   } catch (err) {
-    console.error("[bot] completed-tasks failed:", err.message);
+    console.error(`[bot] completed-tasks fetch failed:`, err.message);
     return null;
   }
 }
@@ -603,7 +503,7 @@ async function fetchRepliesWaitingResilient({ hoursIdle = 4, limit = 8, days = 7
     });
     return { source: "beeper", replies: r.data?.replies || [] };
   } catch (err) {
-    console.warn("[bot] beeper failed, trying hub:", err.message);
+    console.warn(`[bot] beeper failed (will fallback to hub):`, err.message);
   }
   try {
     const r = await axios.get(`${PROXY}/messaging-hub/replies-waiting`, {
@@ -611,7 +511,7 @@ async function fetchRepliesWaitingResilient({ hoursIdle = 4, limit = 8, days = 7
     });
     return { source: "messaging-hub", replies: r.data?.replies || [] };
   } catch (err) {
-    console.error("[bot] hub failed:", err.message);
+    console.error(`[bot] hub fetch failed:`, err.message);
     return null;
   }
 }
@@ -621,69 +521,116 @@ async function fetchYesterdaySummary() {
     const r = await axios.get(`${PROXY}/yesterday/summary`, { timeout: 60_000 });
     return r.data;
   } catch (err) {
-    console.error("[bot] yesterday summary failed:", err.message);
+    console.error(`[bot] yesterday summary failed:`, err.message);
+    return null;
+  }
+}
+
+// v4.20: fetch the Haiku-merged lean payload — has todoToday + yesterdayPipeline
+async function fetchTodayLean() {
+  const t0 = Date.now();
+  try {
+    const r = await axios.get(`${PROXY}/today/lean`, { timeout: 60_000 });
+    console.log(`[bot] today-lean fetched in ${Date.now() - t0}ms · todo=${r.data?.todoToday?.length || 0} · movement=${r.data?.yesterdayPipeline?.movement?.length || 0} · risks=${r.data?.yesterdayPipeline?.risks?.length || 0} · new=${r.data?.yesterdayPipeline?.newContacts?.length || 0}`);
+    return r.data;
+  } catch (err) {
+    console.error(`[bot] today-lean failed in ${Date.now() - t0}ms:`, err.message);
     return null;
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Section builders — LEAN (for /today)
+// LEAN section builders (for /today)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildCalendarSectionLean(calendarRes) {
-  if (calendarRes?.__timeout) {
+  if (calendarRes && calendarRes.__timeout) {
     return `📅 <b>ВСТРЕЧИ СЕГОДНЯ</b>\n\n<i>⚠️ Календарь не ответил.</i>`;
   }
   if (!calendarRes || !calendarRes.ok) {
-    return `📅 <b>ВСТРЕЧИ СЕГОДНЯ</b>\n\n<i>❌ ${esc(calendarRes?.error || "unknown")}</i>`;
+    return `📅 <b>ВСТРЕЧИ СЕГОДНЯ</b>\n\n<i>❌ Calendar error: ${esc(calendarRes?.error || "unknown")}</i>`;
   }
   if (!calendarRes.events?.length) {
     return `📅 <b>ВСТРЕЧИ СЕГОДНЯ</b>\n\nКалендарь пустой 🌴`;
   }
   const blocks = calendarRes.events.map(renderEventLean);
-  return `📅 <b>ВСТРЕЧИ СЕГОДНЯ</b> · <i>${calendarRes.total}</i>\n\n${blocks.join("\n\n")}`;
-}
-
-// 🔥 СДЕЛАТЬ СЕГОДНЯ — Haiku-driven, numbered list
-function buildTodoTodaySection(leanData) {
-  if (!leanData?.todoToday?.length) return null;
-  const lines = leanData.todoToday.map((item, i) =>
-    `${i + 1}. ${esc(item)}`
+  return (
+    `📅 <b>ВСТРЕЧИ СЕГОДНЯ</b> · <i>${calendarRes.total}</i>\n` +
+    `\n` +
+    blocks.join("\n\n")
   );
-  return `🔥 <b>СДЕЛАТЬ СЕГОДНЯ</b> · <i>${leanData.todoToday.length}</i>\n\n${lines.join("\n")}`;
 }
 
-// 📊 ВЧЕРА В PIPELINE — Haiku-driven, 3 categories
-function buildYesterdayPipelineSection(leanData) {
-  if (!leanData?.yesterdayPipeline) return null;
-  const { movement = [], risks = [], newContacts = [] } = leanData.yesterdayPipeline;
+// v4.20: НОВЫЙ блок — "Сделать сегодня". Берёт готовые items от Haiku (через /today/lean)
+// и нумерует их как 1. 2. 3.
+function buildActionItemsSection(leanData) {
+  if (!leanData || leanData.__timeout) {
+    return null; // graceful skip — better no block than broken block
+  }
+  const items = leanData.todoToday || [];
+  if (items.length === 0) return null;
 
-  if (movement.length === 0 && risks.length === 0 && newContacts.length === 0) {
+  // Items уже отформатированы Haiku как готовые строки. Только нумерация.
+  const numbered = items.map((it, i) => {
+    // Strip leading "N. " if Haiku already prefixed (per prompt — should NOT, but defensive)
+    const cleaned = String(it).replace(/^\d+\.\s*/, "").trim();
+    return `${i + 1}. ${cleaned}`;
+  });
+
+  return (
+    `🔥 <b>СДЕЛАТЬ СЕГОДНЯ</b> · <i>${items.length}</i>\n` +
+    `\n` +
+    numbered.join("\n")
+  );
+}
+
+// v4.20: НОВЫЙ блок — "Вчера в pipeline" с категориями Movement/Risks/Новые.
+function buildYesterdayPipelineSection(leanData) {
+  if (!leanData || leanData.__timeout) {
     return null;
   }
+  const yp = leanData.yesterdayPipeline || {};
+  const movement = Array.isArray(yp.movement) ? yp.movement : [];
+  const risks    = Array.isArray(yp.risks)    ? yp.risks    : [];
+  const newC     = Array.isArray(yp.newContacts) ? yp.newContacts : [];
 
-  const blocks = [];
+  if (movement.length === 0 && risks.length === 0 && newC.length === 0) {
+    return null; // skip when totally empty
+  }
+
+  const sections = [];
 
   if (movement.length > 0) {
-    const items = movement.map(m => `   • ${esc(m)}`).join("\n");
-    blocks.push(`✅ <b>Movement</b>\n${items}`);
-  }
-  if (risks.length > 0) {
-    const items = risks.map(r => `   • ${esc(r)}`).join("\n");
-    blocks.push(`⚠️ <b>Risks</b>\n${items}`);
-  }
-  if (newContacts.length > 0) {
-    const items = newContacts.map(n => `   • ${esc(n)}`).join("\n");
-    blocks.push(`🆕 <b>Новые контакты не в CRM</b>\n${items}`);
+    sections.push(
+      `✅ <b>Movement</b>\n` +
+      movement.map(b => `   • ${esc(b)}`).join("\n")
+    );
   }
 
-  return `📊 <b>ВЧЕРА В PIPELINE</b>\n\n${blocks.join("\n\n")}`;
+  if (risks.length > 0) {
+    sections.push(
+      `⚠️ <b>Risks</b>\n` +
+      risks.map(b => `   • ${esc(b)}`).join("\n")
+    );
+  }
+
+  if (newC.length > 0) {
+    sections.push(
+      `🆕 <b>Новые контакты не в CRM</b>\n` +
+      newC.map(b => `   • ${esc(b)}`).join("\n")
+    );
+  }
+
+  return (
+    `📊 <b>ВЧЕРА В PIPELINE</b>\n` +
+    `\n` +
+    sections.join("\n\n")
+  );
 }
 
-// 🟡 ЗАГЛОХЛИ — same as v4.19 lean
 function buildStaleSectionLean(stale) {
-  if (stale?.__timeout) {
-    return `🟡 <b>ЗАГЛОХЛИ · решить</b>\n\n<i>⚠️ Notion не ответил.</i>`;
+  if (stale && stale.__timeout) {
+    return `🟡 <b>ЗАГЛОХЛИ · решить</b>\n\n<i>⚠️ Notion не ответил по сделкам.</i>`;
   }
   if (!Array.isArray(stale) || stale.length === 0) return null;
 
@@ -691,7 +638,9 @@ function buildStaleSectionLean(stale) {
   const warm = stale.filter(d => !(d.stage === "Negotiations" || d.stage === "Call Scheduled"));
 
   const lines = [];
-  for (const d of hot) lines.push(renderStaleDealLean(d));
+  for (const d of hot) {
+    lines.push(renderStaleDealLean(d));
+  }
 
   if (warm.length > 0) {
     const compact = warm.map(d => {
@@ -702,34 +651,24 @@ function buildStaleSectionLean(stale) {
     lines.push(`🟡 ${compact}`);
   }
 
-  return `🟡 <b>ЗАГЛОХЛИ · решить</b>\n\n${lines.join("\n")}`;
+  return (
+    `🟡 <b>ЗАГЛОХЛИ · решить</b>\n` +
+    `\n` +
+    lines.join("\n")
+  );
 }
 
-function buildFooterLean() {
+function buildFooter() {
   return `<i>/details для деталей · /full для полного дайджеста</i>`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Section builders — FULL (for /details and /full)
+// FULL section builders (used in /details and /full)
 // ─────────────────────────────────────────────────────────────────────────────
 
-function buildCalendarSectionFull(calendarRes) {
-  if (calendarRes?.__timeout) {
-    return `📅 <b>Сегодня</b>\n\n<i>⚠️ Календарь не ответил.</i>`;
-  }
-  if (!calendarRes || !calendarRes.ok) {
-    return `📅 <b>Сегодня</b>\n\n<i>❌ Calendar error: ${esc(calendarRes?.error || "unknown")}</i>`;
-  }
-  if (!calendarRes.events?.length) {
-    return `📅 <b>Сегодня (${esc(calendarRes.date)})</b>\n\nКалендарь пустой 🌴`;
-  }
-  const blocks = calendarRes.events.map(renderEventFull);
-  return `📅 <b>Сегодня (${esc(calendarRes.date)})</b>  · <i>${calendarRes.total} встреч</i>\n\n${blocks.join("\n\n")}`;
-}
-
-function buildTasksSectionResilient(tasksData, completedTasks) {
+function buildTasksSectionFull(tasksData, completedTasks) {
   if (!tasksData || tasksData.__timeout) {
-    return `📋 <b>Задачи</b>\n\n<i>⚠️ Notion не ответил.</i>`;
+    return `📋 <b>Задачи</b>\n\n<i>⚠️ Notion не ответил по задачам.</i>`;
   }
 
   if (tasksData.items?.length) {
@@ -737,7 +676,11 @@ function buildTasksSectionResilient(tasksData, completedTasks) {
     const counter = overdueRaw > 0
       ? `<i>${totalRaw} задач · ${overdueRaw} просрочено</i>`
       : `<i>${totalRaw} задач на сегодня</i>`;
-    return `📋 <b>Задачи</b>  · ${counter}\n\n${items.map(renderTaskItem).join("\n\n")}`;
+    return (
+      `📋 <b>Задачи</b>  · ${counter}\n` +
+      `\n` +
+      items.map(renderTaskItem).join("\n\n")
+    );
   }
 
   if (Array.isArray(completedTasks) && completedTasks.length > 0) {
@@ -745,33 +688,38 @@ function buildTasksSectionResilient(tasksData, completedTasks) {
     const overflow = completedTasks.length > top.length
       ? `\n\n<i>...и ещё ${completedTasks.length - top.length} закрытых задач</i>`
       : "";
-    return `✅ <b>Все задачи под контролем</b>  · <i>${completedTasks.length} закрыто за 3 дня</i>\n\n${top.map(renderCompletedTask).join("\n")}${overflow}`;
+    return (
+      `✅ <b>Все задачи под контролем</b>  · <i>${completedTasks.length} закрыто за 3 дня</i>\n` +
+      `\n` +
+      top.map(renderCompletedTask).join("\n") +
+      overflow
+    );
   }
 
   return null;
 }
 
-function buildRepliesSection(repliesResult) {
+function buildRepliesSectionFull(repliesResult) {
   if (!repliesResult) return null;
   const { source, replies } = repliesResult;
   if (!Array.isArray(replies) || replies.length === 0) return null;
 
   const sourceLabel = source === "messaging-hub" ? " · <i>из Messaging Hub</i>" : "";
-  return `💬 <b>Ждут ответа</b>  · <i>${replies.length} чатов &gt;4h</i>${sourceLabel}\n\n${replies.map(renderReply).join("\n\n")}`;
-}
 
-function buildStaleSectionFull(stale) {
-  if (stale?.__timeout) {
-    return `🟡 <b>Заглохли</b>\n\n<i>⚠️ Notion не ответил.</i>`;
-  }
-  if (!Array.isArray(stale) || stale.length === 0) return null;
-  const dealBlocks = stale.map(renderStaleDealFull);
-  return `🟡 <b>Заглохли</b>  · <i>${stale.length} сделок &gt;14d</i>\n\n${dealBlocks.join("\n\n")}`;
+  return (
+    `💬 <b>Ждут ответа</b>  · <i>${replies.length} чатов &gt;4h</i>${sourceLabel}\n` +
+    `\n` +
+    replies.map(renderReply).join("\n\n")
+  );
 }
 
 function buildYesterdaySectionFull(summary) {
-  if (!summary) return `📆 <b>Что было вчера</b>\n\n<i>⚠️ Не удалось получить summary.</i>`;
-  if (!summary.ok) return null;
+  if (!summary) {
+    return `📆 <b>Что было вчера</b>\n\n<i>⚠️ Не удалось получить summary мессенджеров.</i>`;
+  }
+  if (!summary.ok) {
+    return null;
+  }
   const networks = summary.networks || [];
 
   const isFiltered = summary.filteredBy === "late-stages";
@@ -779,20 +727,22 @@ function buildYesterdaySectionFull(summary) {
   if (isFiltered) {
     const dropCount = summary.dropped || 0;
     filterTag = dropCount > 0
-      ? `  · <i>только важные сделки (скрыто ${dropCount})</i>`
+      ? `  · <i>только важные сделки (скрыто ${dropCount} не-важных)</i>`
       : `  · <i>только важные сделки</i>`;
   }
 
   let sourceLabel = "";
-  if (summary.source === "hub-fresh") sourceLabel = `  · <i>из Messaging Hub</i>`;
-  else if (summary.source === "hub-stale") sourceLabel = `  · <i>данные за ${esc(summary.dataDate)}</i>`;
-  else if (summary.source === "hub-empty") {
+  if (summary.source === "hub-fresh") {
+    sourceLabel = `  · <i>из Messaging Hub</i>`;
+  } else if (summary.source === "hub-stale") {
+    sourceLabel = `  · <i>данные за ${esc(summary.dataDate)}</i>`;
+  } else if (summary.source === "hub-empty") {
     return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n\n<i>Активности не было.</i>`;
   }
 
   if (networks.length === 0) {
     if (isFiltered && summary.totalBeforeFilter > 0) {
-      return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n\n<i>Активности по поздним статусам не было.</i>`;
+      return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n\n<i>Активности по поздним статусам не было (всего ${summary.totalBeforeFilter} чатов, все early-stage или не в CRM).</i>`;
     }
     return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n\n<i>Активности не было.</i>`;
   }
@@ -801,105 +751,186 @@ function buildYesterdaySectionFull(summary) {
   for (const net of networks) {
     const lines = [];
     const emoji = NETWORK_HEADER_EMOJI(net.header);
-    const totalLabel = net.totalChats > 0 ? `  · <i>${net.totalChats} чатов</i>` : "";
+    const totalLabel = net.totalChats > 0
+      ? `  · <i>${net.totalChats} чатов</i>`
+      : "";
     lines.push(`${emoji} <b>${esc(net.header)}</b>${totalLabel}`);
 
     const bullets = (net.summary?.bullets || []).filter(Boolean);
     if (bullets.length > 0) {
       lines.push("");
-      for (const b of bullets) lines.push(`   • ${esc(b)}`);
+      for (const b of bullets) {
+        lines.push(`   • ${esc(b)}`);
+      }
     }
 
     if (Array.isArray(net.topChats) && net.topChats.length > 0 && summary.source !== "hub-stale") {
       lines.push("");
       for (const c of net.topChats) {
         const arrow = c.direction === "→" ? "→" : "←";
-        const displayName = (c.name || "").length > 40 ? (c.name || "").slice(0, 40) + "..." : c.name;
+        const displayName = (c.name || "").length > 40
+          ? (c.name || "").slice(0, 40) + "..."
+          : c.name;
         const clickableName = renderClickableName(displayName, c.deeplink);
         const stagePart = c.crmStage ? ` <i>(${esc(c.crmStage)})</i>` : "";
         const safeSnippet = esc(c.snippet || "");
         lines.push(`   <code>${arrow}</code> ${clickableName}${stagePart}: <i>${safeSnippet}</i>`);
       }
     }
+
     blocks.push(lines.join("\n"));
   }
 
-  return `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n\n${blocks.join("\n\n")}`;
+  return (
+    `📆 <b>Что было вчера (${esc(summary.yesterdayLabel)})</b>${filterTag}${sourceLabel}\n` +
+    `\n` +
+    blocks.join("\n\n")
+  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Composers
+// Composers — /today (lean), /details (full sources), /full (everything)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Lean digest (for /today and morning push)
-async function composeLeanDigest({ customHeader } = {}) {
-  const t0 = Date.now();
-  const [calendarRes, leanData, stale] = await Promise.all([
-    withTimeout(fetchCalendar(), 22_000, "calendar"),
-    withTimeout(fetchTodayLean(), 65_000, "today-lean"),
-    withTimeout(fetchStaleDeals({ days: 14, limit: 10 }), 20_000, "stale"),
-  ]);
-  console.log(`[bot] lean data fetched in ${Date.now() - t0}ms`);
-
+// /today — Anton's lean format. Uses Haiku-merged blocks from /today/lean.
+function composeLeanDigest({ calendarRes, leanData, stale }, { customHeader } = {}) {
   const sections = [];
   sections.push(customHeader || buildLeanHeader());
+
+  // Order per Anton's reference template:
+  //   📅 ВСТРЕЧИ СЕГОДНЯ
+  //   🔥 СДЕЛАТЬ СЕГОДНЯ
+  //   📊 ВЧЕРА В PIPELINE
+  //   🟡 ЗАГЛОХЛИ
+  //   /details · /full
+
   sections.push(buildCalendarSectionLean(calendarRes));
 
-  const todoBlock = buildTodoTodaySection(leanData);
-  if (todoBlock) sections.push(todoBlock);
+  const actionItems = buildActionItemsSection(leanData);
+  if (actionItems) sections.push(actionItems);
 
-  const yesterdayBlock = buildYesterdayPipelineSection(leanData);
-  if (yesterdayBlock) sections.push(yesterdayBlock);
+  const yesterdayPipeline = buildYesterdayPipelineSection(leanData);
+  if (yesterdayPipeline) sections.push(yesterdayPipeline);
 
   const staleBlock = buildStaleSectionLean(stale);
   if (staleBlock) sections.push(staleBlock);
 
-  sections.push(buildFooterLean());
+  sections.push(buildFooter());
 
   return sections.join(SECTION_SEP);
 }
 
-// Full digest (for /full — all the v4.19 stuff)
-async function composeFullDigest({ customHeader, withYesterday = true } = {}) {
+// /details — full source data (Tasks DB + Replies waiting + Stale)
+function composeDetailsDigest({ calendarRes, tasksData, stale, repliesResult, completedTasks }, { customHeader } = {}) {
+  const sections = [];
+  if (customHeader) sections.push(customHeader);
+  else sections.push(`📋 <b>ДЕТАЛИ</b> · <i>полные источники</i>`);
+
+  sections.push(buildCalendarSectionLean(calendarRes));
+
+  const tasksBlock = buildTasksSectionFull(tasksData, completedTasks);
+  if (tasksBlock) sections.push(tasksBlock);
+
+  const repliesBlock = buildRepliesSectionFull(repliesResult);
+  if (repliesBlock) sections.push(repliesBlock);
+
+  const staleBlock = buildStaleSectionLean(stale);
+  if (staleBlock) sections.push(staleBlock);
+
+  return sections.join(SECTION_SEP);
+}
+
+// /full — everything: lean + details + yesterday-summary by network
+function composeFullDigest(allData, { customHeader } = {}) {
+  const sections = [];
+  if (customHeader) sections.push(customHeader);
+  else sections.push(`🗂 <b>ПОЛНЫЙ ДАЙДЖЕСТ</b>`);
+
+  sections.push(buildCalendarSectionLean(allData.calendarRes));
+
+  const actionItems = buildActionItemsSection(allData.leanData);
+  if (actionItems) sections.push(actionItems);
+
+  const yesterdayPipeline = buildYesterdayPipelineSection(allData.leanData);
+  if (yesterdayPipeline) sections.push(yesterdayPipeline);
+
+  const tasksBlock = buildTasksSectionFull(allData.tasksData, allData.completedTasks);
+  if (tasksBlock) sections.push(tasksBlock);
+
+  const repliesBlock = buildRepliesSectionFull(allData.repliesResult);
+  if (repliesBlock) sections.push(repliesBlock);
+
+  const yesterdayBlock = buildYesterdaySectionFull(allData.yesterdaySummary);
+  if (yesterdayBlock) sections.push(yesterdayBlock);
+
+  const staleBlock = buildStaleSectionLean(allData.stale);
+  if (staleBlock) sections.push(staleBlock);
+
+  return sections.join(SECTION_SEP);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Data fetchers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// /today minimal — only what lean digest needs
+async function fetchLeanDigestData() {
   const t0 = Date.now();
-  const [calendarRes, tasksData, stale, repliesResult, yesterdaySummary] = await Promise.all([
-    withTimeout(fetchCalendar(),                                                    20_000, "calendar"),
-    withTimeout(fetchTasksToday({ limit: 20 }),                                     15_000, "tasks"),
-    withTimeout(fetchStaleDeals({ days: 14, limit: 5 }),                            20_000, "stale"),
-    withTimeout(fetchRepliesWaitingResilient({ hoursIdle: 4, limit: 8, days: 7 }), 30_000, "replies"),
-    withYesterday
-      ? withTimeout(fetchYesterdaySummary(),                                        65_000, "yesterday")
-      : Promise.resolve(null),
+  const [calendarRes, leanData, stale] = await Promise.all([
+    withTimeout(fetchCalendar(),                                          20_000, "calendar"),
+    withTimeout(fetchTodayLean(),                                         65_000, "today-lean"),
+    withTimeout(fetchStaleDeals({ days: 14, limit: 5 }),                  20_000, "stale"),
+  ]);
+  console.log(`[bot] lean digest data fetched in ${Date.now() - t0}ms`);
+  return { calendarRes, leanData, stale };
+}
+
+// /details — Tasks + Replies + Stale + Calendar
+async function fetchDetailsData() {
+  const t0 = Date.now();
+  const [calendarRes, tasksData, stale, repliesResult] = await Promise.all([
+    withTimeout(fetchCalendar(),                                          20_000, "calendar"),
+    withTimeout(fetchTasksToday({ limit: 20 }),                           15_000, "tasks"),
+    withTimeout(fetchStaleDeals({ days: 14, limit: 10 }),                 20_000, "stale"),
+    withTimeout(fetchRepliesWaitingResilient({ hoursIdle: 4, limit: 15, days: 7 }), 30_000, "replies"),
   ]);
 
   let completedTasks = null;
   if (tasksData && !tasksData.__timeout && (!tasksData.items || tasksData.items.length === 0)) {
-    completedTasks = await withTimeout(fetchTasksCompleted({ days: 3, limit: 20 }), 12_000, "completed-tasks");
+    completedTasks = await withTimeout(
+      fetchTasksCompleted({ days: 3, limit: 20 }), 12_000, "completed-tasks"
+    );
+    if (completedTasks?.__timeout) completedTasks = null;
+  }
+
+  console.log(`[bot] details data fetched in ${Date.now() - t0}ms`);
+  return { calendarRes, tasksData, stale, repliesResult, completedTasks };
+}
+
+// /full — everything
+async function fetchAllData() {
+  const t0 = Date.now();
+  const [calendarRes, leanData, tasksData, stale, repliesResult, yesterdaySummary] = await Promise.all([
+    withTimeout(fetchCalendar(),                                          20_000, "calendar"),
+    withTimeout(fetchTodayLean(),                                         65_000, "today-lean"),
+    withTimeout(fetchTasksToday({ limit: 20 }),                           15_000, "tasks"),
+    withTimeout(fetchStaleDeals({ days: 14, limit: 10 }),                 20_000, "stale"),
+    withTimeout(fetchRepliesWaitingResilient({ hoursIdle: 4, limit: 15, days: 7 }), 30_000, "replies"),
+    withTimeout(fetchYesterdaySummary(),                                  65_000, "yesterday-summary"),
+  ]);
+
+  let completedTasks = null;
+  if (tasksData && !tasksData.__timeout && (!tasksData.items || tasksData.items.length === 0)) {
+    completedTasks = await withTimeout(
+      fetchTasksCompleted({ days: 3, limit: 20 }), 12_000, "completed-tasks"
+    );
     if (completedTasks?.__timeout) completedTasks = null;
   }
 
   const ySummary = (yesterdaySummary && !yesterdaySummary.__timeout) ? yesterdaySummary : null;
+
   console.log(`[bot] full data fetched in ${Date.now() - t0}ms`);
-
-  const sections = [];
-  sections.push(customHeader || buildLeanHeader());
-  sections.push(buildCalendarSectionFull(calendarRes));
-
-  const tasksBlock = buildTasksSectionResilient(tasksData, completedTasks);
-  if (tasksBlock) sections.push(tasksBlock);
-
-  const repliesBlock = buildRepliesSection(repliesResult);
-  if (repliesBlock) sections.push(repliesBlock);
-
-  if (withYesterday) {
-    const yesterdayBlock = buildYesterdaySectionFull(ySummary);
-    if (yesterdayBlock) sections.push(yesterdayBlock);
-  }
-
-  const staleBlock = buildStaleSectionFull(stale);
-  if (staleBlock) sections.push(staleBlock);
-
-  return sections.join(SECTION_SEP);
+  return { calendarRes, leanData, tasksData, stale, repliesResult, completedTasks, yesterdaySummary: ySummary };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -911,15 +942,15 @@ bot.command("start", ctx => guard(ctx, () => {
     `🤖 Loop OS — Founder Command Center\n\n` +
     `Версия: ${VERSION}\n\n` +
     `Команды:\n` +
-    `/today — lean дайджест (главное за сегодня + Сделать сегодня + Вчера в pipeline)\n` +
-    `/details — задачи + чаты ждущие ответа отдельно\n` +
-    `/full — полный дайджест с разбивкой по сетям\n\n` +
-    `/yesterday — что было вчера (raw)\n` +
+    `/ping — health check\n` +
+    `/today — короткий дайджест на сегодня (Anton-style)\n` +
+    `/details — полные данные: задачи + replies + stale\n` +
+    `/full — всё включая Что было вчера по сетям\n` +
+    `/yesterday — что было вчера в мессенджерах\n` +
+    `/digest — отправить Anton'у (или себе если ID не задан)\n` +
     `/tasks — открытые задачи\n` +
-    `/stale — заглохшие сделки\n` +
-    `/replies — ждут ответа\n` +
-    `/digest — отправить Anton'у\n` +
-    `/ping — health check\n\n` +
+    `/stale — заглохшие сделки (>14d)\n` +
+    `/replies — ждут ответа Anton'а\n\n` +
     `Авто:\n` +
     `• Утренний дайджест 08:30 CET (lean)\n` +
     `• CRM auto-prewarm 23:00 и 08:00 CET`
@@ -934,60 +965,76 @@ bot.command("ping", ctx => guard(ctx, () => {
     : uptimeSec < 3600
       ? `${Math.floor(uptimeSec / 60)}m ${uptimeSec % 60}s`
       : `${Math.floor(uptimeSec / 3600)}h ${Math.floor((uptimeSec % 3600) / 60)}m`;
+
   return ctx.reply(
     `🏓 pong\n\n` +
     `Версия: ${VERSION}\n` +
     `Uptime: ${uptimeStr}\n` +
     `Server: ${now.toISOString()}\n` +
-    `Anton TG ID: ${ANTON_TG_ID || "не задан"}\n` +
+    `Anton TG ID: ${ANTON_TG_ID || "не задан (env ANTON_TG_ID)"}\n` +
     `Your TG ID: ${ctx.from?.id}`
   );
 }));
 
+// /today — Anton's lean digest (default morning view)
 bot.command("today", ctx => guard(ctx, async () => {
   const t0 = Date.now();
-  const loadingMsg = await ctx.reply("⏳ Собираю lean дайджест (~30-60s)...");
+  const loadingMsg = await ctx.reply("⏳ Тяну дайджест (Haiku merge ~30s)...");
   try {
-    const text = await composeLeanDigest();
+    const data = await fetchLeanDigestData();
+    const text = composeLeanDigest(data);
     await editAndSplit(ctx, loadingMsg, text);
     console.log(`[bot] /today completed in ${Date.now() - t0}ms (${text.length} chars)`);
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
     console.error("[bot /today] error:", errMsg);
     try {
-      await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(errMsg)}`);
+      await ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Ошибка: ${esc(errMsg)}`
+      );
     } catch (_) {}
   }
 }));
 
+// /details — full sources for Pavel debugging
 bot.command("details", ctx => guard(ctx, async () => {
   const t0 = Date.now();
-  const loadingMsg = await ctx.reply("⏳ Собираю детальный дайджест (без раздела вчера)...");
+  const loadingMsg = await ctx.reply("⏳ Полные данные (без Haiku)...");
   try {
-    const text = await composeFullDigest({ withYesterday: false });
+    const data = await fetchDetailsData();
+    const text = composeDetailsDigest(data);
     await editAndSplit(ctx, loadingMsg, text);
     console.log(`[bot] /details completed in ${Date.now() - t0}ms (${text.length} chars)`);
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
     console.error("[bot /details] error:", errMsg);
     try {
-      await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(errMsg)}`);
+      await ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Ошибка: ${esc(errMsg)}`
+      );
     } catch (_) {}
   }
 }));
 
+// /full — everything: lean + details + yesterday-by-network
 bot.command("full", ctx => guard(ctx, async () => {
   const t0 = Date.now();
-  const loadingMsg = await ctx.reply("⏳ Собираю полный дайджест (~60s)...");
+  const loadingMsg = await ctx.reply("⏳ Полный дайджест (lean + details + yesterday, ~60s)...");
   try {
-    const text = await composeFullDigest({ withYesterday: true });
+    const data = await fetchAllData();
+    const text = composeFullDigest(data);
     await editAndSplit(ctx, loadingMsg, text);
     console.log(`[bot] /full completed in ${Date.now() - t0}ms (${text.length} chars)`);
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
     console.error("[bot /full] error:", errMsg);
     try {
-      await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(errMsg)}`);
+      await ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Ошибка: ${esc(errMsg)}`
+      );
     } catch (_) {}
   }
 }));
@@ -998,11 +1045,18 @@ bot.command("yesterday", ctx => guard(ctx, async () => {
   try {
     const summary = await fetchYesterdaySummary();
     if (!summary) {
-      return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Не удалось получить summary за вчера.`);
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Не удалось получить summary за вчера.`
+      );
     }
     const block = buildYesterdaySectionFull(summary);
     if (!block) {
-      return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `📆 <b>Что было вчера</b>\n\n<i>Активности не было.</i>`, { parse_mode: "HTML" });
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `📆 <b>Что было вчера</b>\n\n<i>Активности не было.</i>`,
+        { parse_mode: "HTML" }
+      );
     }
     await editAndSplit(ctx, loadingMsg, block);
     console.log(`[bot] /yesterday completed in ${Date.now() - t0}ms (${block.length} chars)`);
@@ -1010,37 +1064,46 @@ bot.command("yesterday", ctx => guard(ctx, async () => {
     const errMsg = err.response?.data?.error || err.message;
     console.error("[bot /yesterday] error:", errMsg);
     try {
-      await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(errMsg)}`);
+      await ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Ошибка: ${esc(errMsg)}`
+      );
     } catch (_) {}
   }
 }));
 
 bot.command("digest", ctx => guard(ctx, async () => {
   const loadingMsg = await ctx.reply(
-    ANTON_TG_ID ? "⏳ Собираю lean дайджест для Anton'а..." : "⏳ Собираю lean дайджест (тестовый — пришлю только тебе)..."
+    ANTON_TG_ID
+      ? "⏳ Собираю lean дайджест для Anton'а..."
+      : "⏳ Собираю lean дайджест (тестовый — пришлю только тебе)..."
   );
 
   try {
+    const data = await fetchLeanDigestData();
+
     if (ANTON_TG_ID) {
       const customHeader = `${buildLeanHeader()}\n<i>(отправлен Pavel вручную)</i>`;
-      const text = await composeLeanDigest({ customHeader });
-
+      const text = composeLeanDigest(data, { customHeader });
       await sendSplit(ANTON_TG_ID, text);
 
       await ctx.api.editMessageText(
         ctx.chat.id, loadingMsg.message_id,
-        `✅ Lean дайджест отправлен Anton'у (TG ID ${ANTON_TG_ID}).`,
+        `✅ Дайджест отправлен Anton'у (TG ID ${ANTON_TG_ID}).`,
         { parse_mode: "HTML" }
       );
     } else {
       const customHeader = `🧪 <b>Тестовый дайджест</b> · ANTON_TG_ID не задан, шлю тебе\n\n${buildLeanHeader()}`;
-      const text = await composeLeanDigest({ customHeader });
+      const text = composeLeanDigest(data, { customHeader });
       await editAndSplit(ctx, loadingMsg, text);
     }
   } catch (err) {
     const errMsg = err.response?.data?.error || err.message;
     console.error("[bot /digest] error:", errMsg);
-    await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(errMsg)}`);
+    await ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id,
+      `❌ Ошибка: ${esc(errMsg)}`
+    );
   }
 }));
 
@@ -1049,22 +1112,38 @@ bot.command("tasks", ctx => guard(ctx, async () => {
   try {
     const tasksData = await fetchTasksToday({ limit: 30 });
     if (tasksData === null) {
-      return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Не удалось получить задачи.`);
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Не удалось получить задачи из Notion.`
+      );
     }
     if (!tasksData.items.length) {
       const completed = await fetchTasksCompleted({ days: 3, limit: 20 });
       if (Array.isArray(completed) && completed.length > 0) {
         const top = completed.slice(0, 10);
-        const overflow = completed.length > top.length ? `\n\n<i>...и ещё ${completed.length - top.length}</i>` : "";
-        const text = `✅ <b>Все задачи под контролем</b>  · <i>${completed.length} закрыто за 3 дня</i>\n\n${top.map(renderCompletedTask).join("\n")}${overflow}`;
+        const overflow = completed.length > top.length
+          ? `\n\n<i>...и ещё ${completed.length - top.length}</i>`
+          : "";
+        const text =
+          `✅ <b>Все задачи под контролем</b>  · <i>${completed.length} закрыто за 3 дня</i>\n\n` +
+          top.map(renderCompletedTask).join("\n") +
+          overflow;
         return editAndSplit(ctx, loadingMsg, text);
       }
-      return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `✅ <b>Все задачи под контролем</b>\n\nНи открытых задач, ни закрытых за 3 дня.`, { parse_mode: "HTML" });
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `✅ <b>Все задачи под контролем</b>\n\nНи открытых задач, ни закрытых за 3 дня.`,
+        { parse_mode: "HTML" }
+      );
     }
-    const text = buildTasksSectionResilient(tasksData, null);
+    const text = buildTasksSectionFull(tasksData, null);
     return editAndSplit(ctx, loadingMsg, text);
   } catch (err) {
-    return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(err.response?.data?.error || err.message)}`);
+    const errMsg = err.response?.data?.error || err.message;
+    return ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id,
+      `❌ Ошибка: ${esc(errMsg)}`
+    );
   }
 }));
 
@@ -1073,15 +1152,26 @@ bot.command("stale", ctx => guard(ctx, async () => {
   try {
     const stale = await fetchStaleDeals({ days: 14, limit: 10 });
     if (stale === null) {
-      return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Не удалось получить данные.`);
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Не удалось получить данные из CRM.`
+      );
     }
     if (stale.length === 0) {
-      return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `✅ <b>Pipeline здоров</b>\n\nНет сделок без активности &gt;14d.`, { parse_mode: "HTML" });
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `✅ <b>Pipeline здоров</b>\n\nНет сделок без активности &gt;14d среди MH/P1/P2.`,
+        { parse_mode: "HTML" }
+      );
     }
     const block = buildStaleSectionLean(stale);
     return editAndSplit(ctx, loadingMsg, block);
   } catch (err) {
-    return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(err.response?.data?.error || err.message)}`);
+    const errMsg = err.response?.data?.error || err.message;
+    return ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id,
+      `❌ Ошибка: ${esc(errMsg)}`
+    );
   }
 }));
 
@@ -1090,20 +1180,33 @@ bot.command("replies", ctx => guard(ctx, async () => {
   try {
     const result = await fetchRepliesWaitingResilient({ hoursIdle: 4, limit: 15, days: 7 });
     if (!result) {
-      return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Beeper и Hub оба недоступны.`);
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Beeper и Messaging Hub оба недоступны.`
+      );
     }
     if (result.replies.length === 0) {
-      return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `✅ <b>Inbox чист</b>\n\nНет чатов где Anton ждёт.`, { parse_mode: "HTML" });
+      return ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `✅ <b>Inbox чист</b>\n\nНет чатов где Anton ещё не ответил &gt;4h.`,
+        { parse_mode: "HTML" }
+      );
     }
-    const block = buildRepliesSection(result);
+    const block = buildRepliesSectionFull(result);
     return editAndSplit(ctx, loadingMsg, block);
   } catch (err) {
-    return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(err.response?.data?.error || err.message)}`);
+    const errMsg = err.response?.data?.error || err.message;
+    return ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id,
+      `❌ Ошибка: ${esc(errMsg)}`
+    );
   }
 }));
 
 bot.on("message:text", ctx => guard(ctx, () => {
-  return ctx.reply(`Команды:\n/today  /details  /full  /yesterday  /tasks  /stale  /replies  /digest  /ping`);
+  return ctx.reply(
+    `Команды:\n/start  /ping  /today  /details  /full  /yesterday  /digest  /tasks  /stale  /replies`
+  );
 }));
 
 bot.catch(err => {
@@ -1118,7 +1221,9 @@ async function sendMorningPush() {
   }
   console.log(`[cron] morning push start, recipients: ${MORNING_PUSH_USERS.join(",")}`);
   try {
-    const text = await composeLeanDigest();
+    // Use lean digest for morning push — Anton wants short
+    const data = await fetchLeanDigestData();
+    const text = composeLeanDigest(data);
     for (const userId of MORNING_PUSH_USERS) {
       try {
         await sendSplit(userId, text);
@@ -1133,7 +1238,7 @@ async function sendMorningPush() {
 }
 
 cron.schedule("30 8 * * *", sendMorningPush, { timezone: "Europe/Prague" });
-console.log("[cron] morning push registered (08:30 Europe/Prague)");
+console.log("[cron] morning push registered (08:30 Europe/Prague, every day)");
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 console.log(`[bot] Loop OS FCC ${VERSION} starting...`);
@@ -1143,5 +1248,5 @@ console.log(`[bot] Morning push recipients: ${MORNING_PUSH_USERS.join(",") || "(
 bot.start().then(() => {
   console.log(`[bot] Loop OS FCC ${VERSION} started at ${STARTED_AT.toISOString()}`);
 }).catch(err => {
-  console.error("[bot] Start error:", err.message);
+  console.error("[bot] Start error (non-fatal):", err.message);
 });

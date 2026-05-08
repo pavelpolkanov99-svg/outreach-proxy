@@ -9,6 +9,137 @@ const {
 
 const router = express.Router();
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BD Scoring Framework v2.2 — formulas, Floor Rules, tier mapping
+//
+// Changelog vs v2.1 (May 8 2026, Anton's patches):
+// - Removed bug: was dividing rawScore by 10, should be /17 (Client) or /14 (Partner)
+// - Removed MH tier (was inflated). P1 ≥7.5 is the new top.
+// - Apply UNKNOWN cap (axes_meta from response): UNKNOWN axes capped at 3
+// - >3 UNKNOWN → "Manual Review" (no tier assigned)
+// - Floor Rules as post-processor caps (G-1, G-2, G-3)
+// - SE modifier band-locked (+0.5 max, cannot move P2→P1)
+// - Apply correct Client vs Partner formula based on category
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildCompactV22(c) {
+  // axis values (raw)
+  const a = (n) => Number(c[`axis${n}_score`]) || 0;
+  // axis meta (FACT | INFERENCE | UNKNOWN)
+  const m = (n) => c[`axis${n}_meta`] || "INFERENCE";
+  // capped axis: UNKNOWN → max 3
+  const ac = (n) => m(n) === "UNKNOWN" ? Math.min(a(n), 3) : a(n);
+
+  // Hard Kill — STOP early
+  if (c.hk_triggered) {
+    return {
+      cat: c.category ?? null,
+      role: c.network_role ?? null,
+      hk: c.hk_criterion || true,
+      score: 0,
+      tier: "Hard Kill",
+      axes: { 1: a(1), 2: a(2), 3: a(3), 4: a(4), 5: a(5), 6: a(6), 7: a(7), 8: a(8), 10: a(10) },
+      axes_meta: {
+        1: m(1), 2: m(2), 3: m(3), 4: m(4), 5: m(5),
+        6: m(6), 7: m(7), 8: m(8), 10: m(10),
+      },
+      sources: c.top_sources ?? [],
+      strat: null,
+      ready: c.readiness ?? null,
+      conf: c.confidence_level ?? null,
+      unknown_count: 0,
+      formula_used: "n/a (Hard Kill)",
+      floor_rule_applied: null,
+      se_applied: false,
+    };
+  }
+
+  // Apply correct formula based on category
+  const isPartner = c.category === "Partner";
+  let rawScore;
+  let formula_used;
+  if (isPartner) {
+    // Partner: (axis3*3 + axis6*3 + axis10*3 + axis5*2 + axis8*2 + axis4) / 14
+    rawScore = (ac(3) + ac(6) + ac(10)) * 3
+             + (ac(5) + ac(8)) * 2
+             + ac(4);
+    rawScore = rawScore / 14;
+    formula_used = "Partner /14";
+  } else {
+    // Client (default): (axis1*3 + axis3*3 + axis6*3 + axis2*2 + axis5*2 + axis8*2 + axis4 + axis7) / 17
+    rawScore = (ac(1) + ac(3) + ac(6)) * 3
+             + (ac(2) + ac(5) + ac(8)) * 2
+             + ac(4) + ac(7);
+    rawScore = rawScore / 17;
+    formula_used = "Client /17";
+  }
+  let score = Math.round(rawScore * 10) / 10;
+
+  // Count UNKNOWN axes
+  const allMeta = [m(1), m(2), m(3), m(4), m(5), m(6), m(7), m(8)];
+  if (isPartner) allMeta.push(m(10));
+  const unknownCount = allMeta.filter(v => v === "UNKNOWN").length;
+
+  // Floor Rules (post-processor caps, applied as max-tier limit)
+  let floorRule = null;
+  if (ac(6) < 3) floorRule = "G-1 (License < 3)";
+  if (ac(1) < 3 && ac(2) < 3) floorRule = "G-2 (XBorder<3 AND Ramp<3)";
+  if (isPartner && ac(10) < 5) floorRule = "G-3 (PartnerFit < 5)";
+
+  // Strategic Entrant — band-locked +0.5
+  const seSignal = c.strategic_entrant_signal && c.strategic_entrant_signal !== "NOT APPLICABLE"
+    ? c.strategic_entrant_signal
+    : null;
+  let seApplied = false;
+  let scorePreSE = score;
+  if (seSignal && a(7) >= 7) {
+    // SE applies +0.5 within band (cannot move P2 → P1)
+    const seScore = Math.min(score + 0.5, score < 7.0 ? 7.49 : 10);
+    if (seScore !== score) {
+      score = Math.round(seScore * 10) / 10;
+      seApplied = true;
+    }
+  }
+
+  // Tier mapping (v2.2 — no MH, P1 ≥7.5)
+  let tier;
+  if (unknownCount > 3) {
+    tier = "Manual Review";
+  } else if (floorRule) {
+    tier = "P3"; // Floor Rules cap at P3
+  } else if (score >= 7.5) {
+    tier = "P1";
+  } else if (score >= 5.0) {
+    tier = "P2";
+  } else if (score >= 3.0) {
+    tier = "P3";
+  } else {
+    tier = "Skip";
+  }
+
+  return {
+    cat: c.category ?? null,
+    role: c.network_role ?? null,
+    hk: false,
+    score,
+    score_pre_se: seApplied ? scorePreSE : null,
+    tier,
+    axes: { 1: a(1), 2: a(2), 3: a(3), 4: a(4), 5: a(5), 6: a(6), 7: a(7), 8: a(8), 10: a(10) },
+    axes_meta: {
+      1: m(1), 2: m(2), 3: m(3), 4: m(4), 5: m(5),
+      6: m(6), 7: m(7), 8: m(8), 10: m(10),
+    },
+    sources: c.top_sources ?? [],
+    strat: seSignal,
+    ready: c.readiness ?? null,
+    conf: c.confidence_level ?? null,
+    unknown_count: unknownCount,
+    formula_used,
+    floor_rule_applied: floorRule,
+    se_applied: seApplied,
+  };
+}
+
 // ── POST /parallel/research/start ─────────────────────────────────────────────
 router.post("/research/start", async (req, res) => {
   if (!PARALLEL_KEY) return res.status(500).json({ error: "PARALLEL_KEY not set" });
@@ -70,27 +201,8 @@ router.get("/result/:taskId/compact", async (req, res) => {
     const c = raw?.output?.content || raw?.content;
     if (!c) return res.json({ ok: true, taskId, status, done, failed, compact: null, error: "No content in output" });
 
-    const a = (n) => Number(c[`axis${n}_score`]) || 0;
-    const rawScore = (a(1)+a(3)+a(6))*3 + (a(2)+a(5)+a(8))*2 + a(4) + a(7);
-    const clientScore = c.hk_triggered ? 0 : Math.round(rawScore * 0.1 * 10) / 10;
-    const tier = c.hk_triggered ? "Hard Kill"
-               : clientScore >= 9.0 ? "MH"
-               : clientScore >= 7.5 ? "P1"
-               : clientScore >= 5.0 ? "P2"
-               : "P3";
-
-    const compact = {
-      cat: c.category ?? null,
-      role: c.network_role ?? null,
-      hk: c.hk_triggered ? c.hk_criterion : false,
-      score: clientScore,
-      tier,
-      axes: { 1: a(1), 2: a(2), 3: a(3), 4: a(4), 5: a(5), 6: a(6), 7: a(7), 8: a(8), 10: a(10) },
-      sources: c.top_sources ?? [],
-      strat: c.strategic_entrant_signal === "NOT APPLICABLE" ? null : c.strategic_entrant_signal,
-      ready: c.readiness ?? null,
-      conf: c.confidence_level ?? null,
-    };
+    // v2.2 scoring (Anton's patches)
+    const compact = buildCompactV22(c);
 
     res.json({ ok: true, taskId, status, done, failed, compact });
   } catch (err) {

@@ -614,6 +614,38 @@ const NOTION_TASKS_DB = "2fa2ac1063c8800b8a92d56de58a6358";
 
 const TASK_PRIORITY_RANK = { "High": 0, "Medium": 1, "Low": 2 };
 
+// Task assignee whitelist: only surface tasks assigned to Anton or Pavel.
+// Roman (CTO) and other teammates have their own tracker; their tasks pollute
+// the BD digest. Override via TASK_ASSIGNEE_IDS env (comma-separated UUIDs).
+//
+// Defaults:
+//   Pavel Polkanov: 2dfd872b-594c-815d-bf92-00022403aa3e
+//   Anton:          22dd872b-594c-8188-94c6-00025f066c59
+const TASK_ASSIGNEE_IDS = (
+  process.env.TASK_ASSIGNEE_IDS ||
+  "2dfd872b-594c-815d-bf92-00022403aa3e,22dd872b-594c-8188-94c6-00025f066c59"
+)
+  .split(",")
+  .map(s => s.trim())
+  .filter(Boolean);
+
+const TASK_ASSIGNEE_NAME_BY_ID = {
+  "2dfd872b-594c-815d-bf92-00022403aa3e": "Pavel",
+  "22dd872b-594c-8188-94c6-00025f066c59": "Anton",
+};
+
+// Build the assignee filter clause — `or` over each whitelisted UUID.
+// Returns null if whitelist is empty (no filtering).
+function buildAssigneeFilter() {
+  if (!TASK_ASSIGNEE_IDS.length) return null;
+  return {
+    or: TASK_ASSIGNEE_IDS.map(uid => ({
+      property: "Assignee",
+      people:   { contains: uid },
+    })),
+  };
+}
+
 // Ymd helper — formats a Date as YYYY-MM-DD without timezone arithmetic surprises
 function toYmd(d) {
   const yyyy = d.getUTCFullYear();
@@ -675,19 +707,14 @@ router.get("/tasks-today", async (req, res) => {
   const todayYmd = toYmd(new Date());
 
   try {
-    // Filter: Status != "Done" AND Due date is on or before today
-    const filter = {
-      and: [
-        {
-          property: "Status",
-          status: { does_not_equal: "Done" },
-        },
-        {
-          property: "Due date",
-          date: { on_or_before: todayYmd },
-        },
-      ],
-    };
+    // Filter: Status != "Done" AND Due date is on or before today AND Assignee in whitelist
+    const filterAnd = [
+      { property: "Status",   status: { does_not_equal: "Done" } },
+      { property: "Due date", date:   { on_or_before: todayYmd } },
+    ];
+    const assigneeFilter = buildAssigneeFilter();
+    if (assigneeFilter) filterAnd.push(assigneeFilter);
+    const filter = { and: filterAnd };
 
     const r = await axios.post(
       `https://api.notion.com/v1/databases/${NOTION_TASKS_DB}/query`,
@@ -723,6 +750,13 @@ router.get("/tasks-today", async (req, res) => {
       const companyRel = props["🏢  CRM Companies"]?.relation || [];
       const linkedCompanyId = companyRel[0]?.id || null;
 
+      // Assignee — array of Notion user objects. We expose names only (privacy).
+      const assigneeArr = props["Assignee"]?.people || [];
+      const assigneeIds = assigneeArr.map(p => p.id).filter(Boolean);
+      const assigneeNames = assigneeIds
+        .map(id => TASK_ASSIGNEE_NAME_BY_ID[id] || (assigneeArr.find(p => p.id === id)?.name || "Unknown"))
+        .filter(Boolean);
+
       let daysOverdue = null;
       if (dueDate) {
         const dueMs = Date.parse(dueDate + "T00:00:00Z");
@@ -742,6 +776,8 @@ router.get("/tasks-today", async (req, res) => {
         dueDate,
         daysOverdue,
         linkedCompanyId,
+        assigneeIds,
+        assigneeNames,
       };
     });
 
@@ -773,6 +809,8 @@ router.get("/tasks-today", async (req, res) => {
       dueDate: t.dueDate,
       daysOverdue: t.daysOverdue,
       companyName: t.linkedCompanyId ? (companyNameById.get(t.linkedCompanyId) || null) : null,
+      assigneeIds: t.assigneeIds,
+      assigneeNames: t.assigneeNames,
       shapeKey: deriveTaskShapeKey(t.name),
     }));
 
@@ -880,15 +918,16 @@ router.get("/tasks-completed", async (req, res) => {
   const cutoffISO = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
 
   try {
-    const filter = {
-      and: [
-        { property: "Status", status: { equals: "Done" } },
-        {
-          timestamp: "last_edited_time",
-          last_edited_time: { on_or_after: cutoffISO },
-        },
-      ],
-    };
+    const filterAnd = [
+      { property: "Status", status: { equals: "Done" } },
+      {
+        timestamp: "last_edited_time",
+        last_edited_time: { on_or_after: cutoffISO },
+      },
+    ];
+    const assigneeFilter = buildAssigneeFilter();
+    if (assigneeFilter) filterAnd.push(assigneeFilter);
+    const filter = { and: filterAnd };
 
     const r = await axios.post(
       `https://api.notion.com/v1/databases/${NOTION_TASKS_DB}/query`,

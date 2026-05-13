@@ -16,6 +16,7 @@ app.use((req, res, next) => {
 const NOTION_TOKEN  = process.env.NOTION_TOKEN;
 const PARALLEL_KEY  = process.env.PARALLEL_KEY;
 const BEEPER_TOKEN  = process.env.BEEPER_TOKEN;
+const BEEPER_CID    = process.env.BEEPER_CLIENT_ID;
 const GITHUB_PAT    = process.env.GITHUB_PAT;
 const GOOGLE_OAUTH  = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REFRESH_TOKEN_PAVEL);
 
@@ -25,6 +26,7 @@ app.use("/heyreach",       require("./routes/heyreach"));
 app.use("/notion",         require("./routes/notion"));
 app.use("/notion",         require("./routes/stale-enrich")); // ← /notion/stale-deals-enriched
 app.use("/parallel",       require("./routes/parallel"));
+app.use("/beeper/oauth",   require("./routes/beeper-oauth")); // ← v3.21 OAuth PKCE flow
 app.use("/beeper",         require("./routes/beeper"));
 app.use("/calendar",       require("./routes/calendar"));
 app.use("/webhook",        require("./routes/webhooks"));
@@ -44,18 +46,26 @@ app.use("/jobs", prewarmInsights.router);
 prewarmInsights.registerJobs();
 
 // ── Health ────────────────────────────────────────────────────────────────────
-app.get("/health", (_, res) => res.json({
-  ok: true,
-  notion:   !!NOTION_TOKEN,
-  parallel: !!PARALLEL_KEY,
-  beeper:   !!BEEPER_TOKEN,
-  github:   !!GITHUB_PAT,
-  calendar: GOOGLE_OAUTH,
-  apollo:   !!process.env.APOLLO_KEY,
-  mcp:      true,
-  version:  "3.20.0",
-}));
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.20.0", status: "ok" }));
+app.get("/health", (_, res) => {
+  // Beeper auth: prefer OAuth client_id presence + persisted token. Legacy env
+  // still counts as "configured" for backwards compat.
+  const beeperAuth = require("./lib/beeper-auth");
+  const beeperStatus = beeperAuth.authStatus();
+  res.json({
+    ok: true,
+    notion:   !!NOTION_TOKEN,
+    parallel: !!PARALLEL_KEY,
+    beeper:   beeperStatus.hasToken,
+    beeperMode: beeperStatus.mode,
+    beeperExpiresInDays: beeperStatus.expiresInDays ?? null,
+    github:   !!GITHUB_PAT,
+    calendar: GOOGLE_OAUTH,
+    apollo:   !!process.env.APOLLO_KEY,
+    mcp:      true,
+    version:  "3.21.0",
+  });
+});
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.21.0", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

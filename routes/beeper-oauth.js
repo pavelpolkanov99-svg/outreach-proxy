@@ -12,6 +12,10 @@
 //   GET /beeper/oauth/status
 //     - Diagnostic: shows current auth mode, token expiry, etc. Safe to expose
 //       (no actual token returned).
+//
+//   GET /beeper/oauth/debug
+//     - Reads process.env at request time. Shows what env keys are visible to
+//       the running process. Heads only — no full secrets leaked.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express = require("express");
@@ -75,18 +79,25 @@ function clearPendingState(state) {
   } catch (_) { /* swallow */ }
 }
 
-// Resolve the redirect URI for this request. Prefer explicit env, fallback to
-// constructing from request host (handy when first deploying).
+// Resolve the redirect URI for this request. Reads at request time so it
+// always reflects current process.env, not module-load snapshot.
 function resolveRedirectUri(req) {
-  if (BEEPER_REDIRECT) return BEEPER_REDIRECT;
+  const fromEnv = process.env.BEEPER_REDIRECT_URI || BEEPER_REDIRECT;
+  if (fromEnv) return fromEnv;
   const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
   const host  = req.headers["x-forwarded-host"]  || req.get("host");
   return `${proto}://${host}/beeper/oauth/callback`;
 }
 
+// Helper: get fresh client_id at request time, not module load.
+function getClientIdFresh() {
+  return process.env.BEEPER_CLIENT_ID || BEEPER_CLIENT_ID || null;
+}
+
 // ── GET /beeper/oauth/start ──────────────────────────────────────────────────
 router.get("/start", (req, res) => {
-  if (!BEEPER_CLIENT_ID) {
+  const clientId = getClientIdFresh();
+  if (!clientId) {
     return res.status(500).send(
       "BEEPER_CLIENT_ID env not set. Register a client via Beeper /oauth/register first."
     );
@@ -199,7 +210,36 @@ router.get("/callback", async (req, res) => {
 
 // ── GET /beeper/oauth/status ─────────────────────────────────────────────────
 router.get("/status", (req, res) => {
-  res.json(authStatus());
+  // Read fresh from process.env, not module-load snapshot.
+  const status = authStatus();
+  if (!status.clientId) {
+    status.clientId = process.env.BEEPER_CLIENT_ID || null;
+  }
+  res.json(status);
+});
+
+// ── GET /beeper/oauth/debug ──────────────────────────────────────────────────
+// Reads process.env at request time. Shows what env keys process actually sees.
+// Heads only — values truncated to 6 chars to avoid leaking secrets.
+router.get("/debug", (req, res) => {
+  const interesting = ["BEEPER_CLIENT_ID", "BEEPER_REDIRECT_URI", "BEEPER_URL", "BEEPER_TOKEN", "BEEPER_TOKEN_FILE", "NOTION_TOKEN", "APOLLO_KEY"];
+  const seen = {};
+  for (const k of interesting) {
+    const v = process.env[k];
+    seen[k] = v ? `[set, len=${v.length}, head="${v.slice(0, 6)}..."]` : "[MISSING]";
+  }
+  const allBeeperKeys = Object.keys(process.env).filter(k => k.toUpperCase().includes("BEEPER"));
+  res.json({
+    runtimeEnv:           seen,
+    allBeeperEnvKeysSeen: allBeeperKeys,
+    moduleLoadSnapshot:   {
+      BEEPER_CLIENT_ID: BEEPER_CLIENT_ID || null,
+      BEEPER_REDIRECT:  BEEPER_REDIRECT  || null,
+    },
+    nodeVersion: process.version,
+    pid:         process.pid,
+    uptime_s:    Math.round(process.uptime()),
+  });
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────────────

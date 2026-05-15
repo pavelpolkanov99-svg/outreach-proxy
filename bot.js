@@ -5,7 +5,7 @@ const cron    = require("node-cron");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.21.0-no-stale-in-today";
+const VERSION      = "4.22.0-founder-focus";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -96,11 +96,11 @@ function buildRussianHeaderDate() {
   };
   const weekday = wkMap[wkShort] || "";
 
-  return `Сегодня ${day} ${RU_MONTHS[month - 1]}, ${weekday}.`;
+  return `${day} ${RU_MONTHS[month - 1]}, ${weekday}`;
 }
 
 function buildLeanHeader() {
-  return `☀️ <b>Доброе утро.</b> ${buildRussianHeaderDate()}`;
+  return `☀️ <b>Доброе утро.</b> ${buildRussianHeaderDate()}.`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -526,13 +526,14 @@ async function fetchYesterdaySummary() {
   }
 }
 
-// v4.20: fetch the Haiku-merged lean payload — has todoToday + yesterdayPipeline
+// v4.22: fetch the new structured payload from /today/lean
 async function fetchTodayLean() {
   const t0 = Date.now();
   try {
     const r = await axios.get(`${PROXY}/today/lean`, { timeout: 60_000 });
-    console.log(`[bot] today-lean fetched in ${Date.now() - t0}ms · todo=${r.data?.todoToday?.length || 0} · movement=${r.data?.yesterdayPipeline?.movement?.length || 0} · risks=${r.data?.yesterdayPipeline?.risks?.length || 0} · new=${r.data?.yesterdayPipeline?.newContacts?.length || 0}`);
-    return r.data;
+    const d = r.data || {};
+    console.log(`[bot] today-lean fetched in ${Date.now() - t0}ms · mainMoves=${d.mainMoves?.length || 0} · replies=${d.repliesWaiting?.length || 0} · stuck=${d.stuckNoDeadline?.length || 0} · win=${d.yesterdayPipeline?.win?.length || 0} · movement=${d.yesterdayPipeline?.movement?.length || 0}`);
+    return d;
   } catch (err) {
     console.error(`[bot] today-lean failed in ${Date.now() - t0}ms:`, err.message);
     return null;
@@ -540,7 +541,7 @@ async function fetchTodayLean() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LEAN section builders (for /today)
+// LEAN section builders (for /today) — v4.22 founder-focused format
 // ─────────────────────────────────────────────────────────────────────────────
 
 function buildCalendarSectionLean(calendarRes) {
@@ -561,63 +562,107 @@ function buildCalendarSectionLean(calendarRes) {
   );
 }
 
-// v4.20: НОВЫЙ блок — "Сделать сегодня". Берёт готовые items от Haiku (через /today/lean)
-// и нумерует их как 1. 2. 3.
-function buildActionItemsSection(leanData) {
-  if (!leanData || leanData.__timeout) {
-    return null; // graceful skip — better no block than broken block
-  }
-  const items = leanData.todoToday || [];
-  if (items.length === 0) return null;
+// v4.22: NEW — structured main moves with action + context
+function buildMainMovesSection(leanData) {
+  if (!leanData || leanData.__timeout) return null;
+  const moves = leanData.mainMoves || [];
+  if (moves.length === 0) return null;
 
-  // Items уже отформатированы Haiku как готовые строки. Только нумерация.
-  const numbered = items.map((it, i) => {
-    // Strip leading "N. " if Haiku already prefixed (per prompt — should NOT, but defensive)
-    const cleaned = String(it).replace(/^\d+\.\s*/, "").trim();
-    return `${i + 1}. ${cleaned}`;
+  const lines = moves.map((m, i) => {
+    const rank = m.rank || (i + 1);
+    const tierEmoji = m.tierEmoji || "";
+    const tierLabel = m.tierLabel ? `<b>${esc(m.tierLabel)}</b>` : "";
+    const company = m.company ? `<b>${esc(m.company)}</b>` : "";
+    const action = m.action ? esc(m.action) : "";
+    const context = m.context ? esc(m.context) : "";
+
+    // Header: "1. 🟢 BCB Group (MH 8.9) — написать Paul follow-up..."
+    const tierPart = tierEmoji && tierLabel ? `${tierEmoji} ${tierLabel}` : (tierEmoji || tierLabel);
+    const headerBits = [company];
+    if (tierPart) headerBits.push(tierPart);
+    const header = `${rank}. ${headerBits.filter(Boolean).join(" · ")} — ${action}`;
+    if (context) {
+      return `${header}\n   ↳ <i>${context}</i>`;
+    }
+    return header;
   });
 
   return (
-    `🔥 <b>СДЕЛАТЬ СЕГОДНЯ</b> · <i>${items.length}</i>\n` +
+    `🎯 <b>ГЛАВНЫЕ ХОДЫ</b> · <i>${moves.length}</i>\n` +
     `\n` +
-    numbered.join("\n")
+    lines.join("\n\n")
   );
 }
 
-// v4.20: НОВЫЙ блок — "Вчера в pipeline" с категориями Movement/Risks/Новые.
-function buildYesterdayPipelineSection(leanData) {
-  if (!leanData || leanData.__timeout) {
-    return null;
-  }
-  const yp = leanData.yesterdayPipeline || {};
-  const movement = Array.isArray(yp.movement) ? yp.movement : [];
-  const risks    = Array.isArray(yp.risks)    ? yp.risks    : [];
-  const newC     = Array.isArray(yp.newContacts) ? yp.newContacts : [];
+// v4.22: NEW — replies waiting (inbound from non-CRM/low-tier)
+function buildRepliesWaitingSection(leanData) {
+  if (!leanData || leanData.__timeout) return null;
+  const replies = leanData.repliesWaiting || [];
+  if (replies.length === 0) return null;
 
-  if (movement.length === 0 && risks.length === 0 && newC.length === 0) {
-    return null; // skip when totally empty
-  }
+  const lines = replies.map(r => {
+    const networkBadge = NET_BADGE[r.network] || "💬";
+    const tierEmoji = r.tierEmoji || "";
+    const tierLabel = r.tierLabel ? esc(r.tierLabel) : "";
+    const idle = r.daysIdle ? ` · ${esc(r.daysIdle)}` : "";
+    const name = r.name ? `<b>${esc(r.name)}</b>` : "";
+    const networkPart = r.network ? esc(r.network) : "";
+
+    // Header: "• Anastasia Skrypnyk · LinkedIn · 🆕 not in CRM · 2д"
+    const meta = [networkPart, tierEmoji + (tierLabel ? " " + tierLabel : "")]
+      .filter(s => s && s.trim()).join(" · ");
+    const header = `${networkBadge} ${name}${meta ? " · " + meta : ""}${idle}`;
+    const context = r.context ? `   <i>${esc(r.context)}</i>` : "";
+    return context ? `${header}\n${context}` : header;
+  });
+
+  return (
+    `💬 <b>ОТВЕТЫ ЖДУТ</b> · <i>${replies.length}</i>\n` +
+    `\n` +
+    lines.join("\n\n")
+  );
+}
+
+// v4.22: NEW — stuck deals without deadline, one-liner compressed
+function buildStuckNoDeadlineSection(leanData) {
+  if (!leanData || leanData.__timeout) return null;
+  const stuck = leanData.stuckNoDeadline || [];
+  if (stuck.length === 0) return null;
+
+  const parts = stuck.map(s => {
+    const name = esc(s.name || "?");
+    const days = s.daysStuck != null ? `${s.daysStuck}д` : "?д";
+    const stage = s.stageShort ? `, ${esc(s.stageShort)}` : "";
+    return `<b>${name}</b> (${days}${stage})`;
+  });
+
+  return (
+    `🪦 <b>STUCK БЕЗ DEADLINE</b> · <i>${stuck.length}</i>\n` +
+    parts.join(" · ") +
+    `\n<i>↳ snooze, Lost, или попытка — посмотри на неделе · /stale</i>`
+  );
+}
+
+// v4.22: REPLACED — yesterday pipeline (only win + movement, no risks/newContacts)
+function buildYesterdayPipelineSection(leanData) {
+  if (!leanData || leanData.__timeout) return null;
+  const yp = leanData.yesterdayPipeline || {};
+  const win      = Array.isArray(yp.win)      ? yp.win      : [];
+  const movement = Array.isArray(yp.movement) ? yp.movement : [];
+
+  if (win.length === 0 && movement.length === 0) return null;
 
   const sections = [];
-
+  if (win.length > 0) {
+    sections.push(
+      `✅ <b>Win</b>\n` +
+      win.map(b => `   • ${esc(b)}`).join("\n")
+    );
+  }
   if (movement.length > 0) {
     sections.push(
-      `✅ <b>Movement</b>\n` +
+      `🔄 <b>Movement</b> <i>(не требует действий сегодня)</i>\n` +
       movement.map(b => `   • ${esc(b)}`).join("\n")
-    );
-  }
-
-  if (risks.length > 0) {
-    sections.push(
-      `⚠️ <b>Risks</b>\n` +
-      risks.map(b => `   • ${esc(b)}`).join("\n")
-    );
-  }
-
-  if (newC.length > 0) {
-    sections.push(
-      `🆕 <b>Новые контакты не в CRM</b>\n` +
-      newC.map(b => `   • ${esc(b)}`).join("\n")
     );
   }
 
@@ -628,6 +673,7 @@ function buildYesterdayPipelineSection(leanData) {
   );
 }
 
+// Legacy stale section kept for /details and /stale commands
 function buildStaleSectionLean(stale) {
   if (stale && stale.__timeout) {
     return `🟡 <b>ЗАГЛОХЛИ · решить</b>\n\n<i>⚠️ Notion не ответил по сделкам.</i>`;
@@ -659,7 +705,7 @@ function buildStaleSectionLean(stale) {
 }
 
 function buildFooter() {
-  return `<i>/details для деталей · /full для полного дайджеста · /stale для заглохших сделок</i>`;
+  return `<i>/details · /full · /stale · /replies</i>`;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -792,22 +838,29 @@ function buildYesterdaySectionFull(summary) {
 // Composers — /today (lean), /details (full sources), /full (everything)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// /today — Anton's lean format. Uses Haiku-merged blocks from /today/lean.
-// v4.21: stale block REMOVED from /today (still in /details, /full, /stale).
+// /today — v4.22 founder-focused lean digest
+//
+// Order:
+//   📅 Встречи сегодня
+//   🎯 Главные ходы (3-5)
+//   💬 Ответы ждут
+//   🪦 Stuck без deadline (one-liner)
+//   📊 Вчера в pipeline (win + movement)
+//   /commands
 function composeLeanDigest({ calendarRes, leanData }, { customHeader } = {}) {
   const sections = [];
   sections.push(customHeader || buildLeanHeader());
 
-  // Order per Anton's reference template (v4.21 — без stale):
-  //   📅 ВСТРЕЧИ СЕГОДНЯ
-  //   🔥 СДЕЛАТЬ СЕГОДНЯ
-  //   📊 ВЧЕРА В PIPELINE
-  //   /details · /full · /stale
-
   sections.push(buildCalendarSectionLean(calendarRes));
 
-  const actionItems = buildActionItemsSection(leanData);
-  if (actionItems) sections.push(actionItems);
+  const mainMoves = buildMainMovesSection(leanData);
+  if (mainMoves) sections.push(mainMoves);
+
+  const repliesWaiting = buildRepliesWaitingSection(leanData);
+  if (repliesWaiting) sections.push(repliesWaiting);
+
+  const stuckCompressed = buildStuckNoDeadlineSection(leanData);
+  if (stuckCompressed) sections.push(stuckCompressed);
 
   const yesterdayPipeline = buildYesterdayPipelineSection(leanData);
   if (yesterdayPipeline) sections.push(yesterdayPipeline);
@@ -837,7 +890,7 @@ function composeDetailsDigest({ calendarRes, tasksData, stale, repliesResult, co
   return sections.join(SECTION_SEP);
 }
 
-// /full — everything: lean + details + yesterday-summary by network
+// /full — everything
 function composeFullDigest(allData, { customHeader } = {}) {
   const sections = [];
   if (customHeader) sections.push(customHeader);
@@ -845,12 +898,20 @@ function composeFullDigest(allData, { customHeader } = {}) {
 
   sections.push(buildCalendarSectionLean(allData.calendarRes));
 
-  const actionItems = buildActionItemsSection(allData.leanData);
-  if (actionItems) sections.push(actionItems);
+  // v4.22 sections from lean payload
+  const mainMoves = buildMainMovesSection(allData.leanData);
+  if (mainMoves) sections.push(mainMoves);
+
+  const repliesWaiting = buildRepliesWaitingSection(allData.leanData);
+  if (repliesWaiting) sections.push(repliesWaiting);
+
+  const stuckCompressed = buildStuckNoDeadlineSection(allData.leanData);
+  if (stuckCompressed) sections.push(stuckCompressed);
 
   const yesterdayPipeline = buildYesterdayPipelineSection(allData.leanData);
   if (yesterdayPipeline) sections.push(yesterdayPipeline);
 
+  // Plus full details
   const tasksBlock = buildTasksSectionFull(allData.tasksData, allData.completedTasks);
   if (tasksBlock) sections.push(tasksBlock);
 
@@ -870,7 +931,6 @@ function composeFullDigest(allData, { customHeader } = {}) {
 // Data fetchers
 // ─────────────────────────────────────────────────────────────────────────────
 
-// /today minimal — only what lean digest needs (v4.21: no stale)
 async function fetchLeanDigestData() {
   const t0 = Date.now();
   const [calendarRes, leanData] = await Promise.all([
@@ -881,7 +941,6 @@ async function fetchLeanDigestData() {
   return { calendarRes, leanData };
 }
 
-// /details — Tasks + Replies + Stale + Calendar
 async function fetchDetailsData() {
   const t0 = Date.now();
   const [calendarRes, tasksData, stale, repliesResult] = await Promise.all([
@@ -903,7 +962,6 @@ async function fetchDetailsData() {
   return { calendarRes, tasksData, stale, repliesResult, completedTasks };
 }
 
-// /full — everything
 async function fetchAllData() {
   const t0 = Date.now();
   const [calendarRes, leanData, tasksData, stale, repliesResult, yesterdaySummary] = await Promise.all([
@@ -939,7 +997,7 @@ bot.command("start", ctx => guard(ctx, () => {
     `Версия: ${VERSION}\n\n` +
     `Команды:\n` +
     `/ping — health check\n` +
-    `/today — короткий дайджест на сегодня (Anton-style)\n` +
+    `/today — дайджест на сегодня (founder-focused)\n` +
     `/details — полные данные: задачи + replies + stale\n` +
     `/full — всё включая Что было вчера по сетям\n` +
     `/yesterday — что было вчера в мессенджерах\n` +
@@ -948,7 +1006,7 @@ bot.command("start", ctx => guard(ctx, () => {
     `/stale — заглохшие сделки (>14d)\n` +
     `/replies — ждут ответа Anton'а\n\n` +
     `Авто:\n` +
-    `• Утренний дайджест 08:30 CET (lean)\n` +
+    `• Утренний дайджест 08:30 CET\n` +
     `• CRM auto-prewarm 23:00 и 08:00 CET`
   );
 }));
@@ -972,7 +1030,6 @@ bot.command("ping", ctx => guard(ctx, () => {
   );
 }));
 
-// /today — Anton's lean digest (default morning view)
 bot.command("today", ctx => guard(ctx, async () => {
   const t0 = Date.now();
   const loadingMsg = await ctx.reply("⏳ Тяну дайджест (Haiku merge ~30s)...");
@@ -993,7 +1050,6 @@ bot.command("today", ctx => guard(ctx, async () => {
   }
 }));
 
-// /details — full sources for Pavel debugging
 bot.command("details", ctx => guard(ctx, async () => {
   const t0 = Date.now();
   const loadingMsg = await ctx.reply("⏳ Полные данные (без Haiku)...");
@@ -1014,7 +1070,6 @@ bot.command("details", ctx => guard(ctx, async () => {
   }
 }));
 
-// /full — everything: lean + details + yesterday-by-network
 bot.command("full", ctx => guard(ctx, async () => {
   const t0 = Date.now();
   const loadingMsg = await ctx.reply("⏳ Полный дайджест (lean + details + yesterday, ~60s)...");
@@ -1217,7 +1272,6 @@ async function sendMorningPush() {
   }
   console.log(`[cron] morning push start, recipients: ${MORNING_PUSH_USERS.join(",")}`);
   try {
-    // Use lean digest for morning push — Anton wants short
     const data = await fetchLeanDigestData();
     const text = composeLeanDigest(data);
     for (const userId of MORNING_PUSH_USERS) {

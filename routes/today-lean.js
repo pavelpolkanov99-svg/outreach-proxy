@@ -34,7 +34,6 @@ async function fetchHotStale() {
       params: { days: 14, limit: 10 }, timeout: 15_000,
     });
     const deals = r.data?.deals || [];
-    // Hot = Negotiations / Call Scheduled — Anton MUST decide on these
     return deals;
   } catch (err) {
     console.warn("[today-lean] stale failed:", err.message);
@@ -43,7 +42,6 @@ async function fetchHotStale() {
 }
 
 async function fetchReplies() {
-  // Try Beeper first; fallback to messaging-hub
   try {
     const r = await axios.get(`${PROXY}/beeper/replies-waiting`, {
       params: { hoursIdle: 4, limit: 15, days: 7 }, timeout: 12_000,
@@ -64,7 +62,6 @@ async function fetchReplies() {
 }
 
 async function fetchYesterdayActivity() {
-  // Use /yesterday/activity (raw chats, no AI) — we'll do our own AI-classify
   try {
     const r = await axios.get(`${PROXY}/yesterday/activity`, {
       timeout: 15_000,
@@ -78,19 +75,18 @@ async function fetchYesterdayActivity() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Build the merged input for Haiku.
-// We pre-summarize each source into compact text so the prompt stays tight
-// (saves tokens, keeps cost <$0.02 per call).
+// Pre-summarize each source into compact text so the prompt stays tight.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function summarizeRepliesForPrompt(repliesData) {
   if (!repliesData?.replies?.length) return "(no replies waiting)";
-  return repliesData.replies.slice(0, 12).map(r => {
+  return repliesData.replies.slice(0, 15).map(r => {
     const tier   = r.notion?.bdScore != null
       ? `BD ${r.notion.bdScore}`
       : (r.notion ? "in-CRM" : "not-in-CRM");
     const stage  = r.notion?.stage ? `, ${r.notion.stage}` : "";
     const idle   = r.hoursIdle ? `${Math.round(r.hoursIdle)}h` : "?h";
-    const snippet = (r.lastMsgText || "").slice(0, 150).replace(/\n/g, " ");
+    const snippet = (r.lastMsgText || "").slice(0, 200).replace(/\n/g, " ");
     const company = r.notion?.name || "(no CRM match)";
     return `- "${r.name}" [${r.networkFull || "?"}] · ${company} · ${tier}${stage} · idle ${idle}\n  msg: "${snippet}"`;
   }).join("\n");
@@ -98,15 +94,12 @@ function summarizeRepliesForPrompt(repliesData) {
 
 function summarizeStaleForPrompt(staleData) {
   if (!staleData?.length) return "(no stale deals)";
-  // Only HOT stales matter for "Сделать сегодня" — Negotiations/Call Scheduled
-  const hot = staleData.filter(d =>
-    d.stage === "Negotiations" || d.stage === "Call Scheduled"
-  );
-  if (!hot.length) return "(no hot stale deals)";
-  return hot.slice(0, 6).map(d => {
+  // Pass ALL stale to Haiku (not just hot) — Haiku decides what has deadline-pressure
+  // (i.e. action-able now) vs what's just stuck without urgent trigger.
+  return staleData.slice(0, 10).map(d => {
     const days = d.daysStale != null ? `${d.daysStale}д` : "?д";
     const score = d.bdScore != null ? `BD ${d.bdScore}` : "no-score";
-    const snippet = (d.lastActivitySnippet || "").slice(0, 150).replace(/\n/g, " ");
+    const snippet = (d.lastActivitySnippet || "").slice(0, 200).replace(/\n/g, " ");
     return `- ${d.name} · ${d.stage} · ${score} · stuck ${days}\n  last: "${snippet}"`;
   }).join("\n");
 }
@@ -118,7 +111,7 @@ function summarizeTasksForPrompt(tasksData) {
   return overdue.slice(0, 8).map(t => {
     const days = t.daysOverdue != null ? `${t.daysOverdue}d overdue` : "?";
     const company = t.companyName ? ` (${t.companyName})` : "";
-    const desc = (t.description || "").slice(0, 100).replace(/\n/g, " ");
+    const desc = (t.description || "").slice(0, 120).replace(/\n/g, " ");
     return `- ${t.name}${company} · ${days}${desc ? `\n  desc: "${desc}"` : ""}`;
   }).join("\n");
 }
@@ -133,15 +126,16 @@ function summarizeYesterdayForPrompt(activityData) {
       const direction = msgs.some(m => m.isSender)
         ? (msgs.every(m => m.isSender) ? "outbound" : "two-way")
         : "inbound";
-      const text = (msgs[msgs.length - 1].text || "").slice(0, 200).replace(/\n/g, " ");
-      lines.push(`- "${chat.name}" [${chat.networkFull || group.header}] · ${direction}\n  last: "${text}"`);
+      const text = (msgs[msgs.length - 1].text || "").slice(0, 250).replace(/\n/g, " ");
+      const crmHint = chat.crmCompany ? ` [CRM: ${chat.crmCompany}${chat.crmStage ? "/" + chat.crmStage : ""}${chat.crmBdScore != null ? "/BD " + chat.crmBdScore : ""}]` : " [not in CRM]";
+      lines.push(`- "${chat.name}" [${chat.networkFull || group.header}]${crmHint} · ${direction}\n  last: "${text}"`);
     }
   }
-  return lines.length ? lines.slice(0, 25).join("\n") : "(no yesterday activity)";
+  return lines.length ? lines.slice(0, 30).join("\n") : "(no yesterday activity)";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// The single Haiku call — all the magic happens here.
+// The single Haiku call — produces the new structured payload.
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function callHaikuMerge(payload) {
@@ -150,45 +144,126 @@ async function callHaikuMerge(payload) {
     return null;
   }
 
-  const systemPrompt = `Ты ассистент BD-команды Plexo (B2B stablecoin clearing network для финтехов).
-Anton — CEO. Твоя задача — превратить сырые данные за сегодня и вчера в ДВА коротких блока.
+  const systemPrompt = `Ты ассистент Anton'а — CEO Plexo (B2B stablecoin clearing для финтехов).
+Anton — занятой фаундер. За 20 секунд он должен понять что делать сегодня. Каждое слово на счету.
 
 ВАЖНЫЕ ПРАВИЛА:
-- BD Tier по score: MH ≥9.0, P1 ≥7.5, P2 = 5-7.4, P3 <5. Всегда показывай tier (🟢 MH X.X / 🟢 P1 X.X / 🟡 P2 X.X / ⚪ P3 X.X).
-- Если в CRM нет — пиши "🆕 not in CRM".
-- Hard Kill компании (HK-1..HK-11) — Anton ДОЛЖЕН их закрывать как Lost.
-- На русском, лаконично, без воды. Каждый action item — ОДНА строка до 110 символов.
+- BD Tier по score: MH ≥9.0, P1 ≥7.5, P2 = 5-7.4, P3 <5.
+- Используй emoji tier: 🟢 для MH/P1, 🟡 для P2, ⚪ для P3, 🆕 для not-in-CRM
+- Hard Kill (HK-1..HK-11) — Anton должен закрывать как Lost.
+- На русском, без воды. Конкретные глаголы (написать, ответить, отправить, добить, закрыть, re-engage).
+- НИКАКИХ вопросительных знаков в концах — Anton не должен думать "что делать"; он должен ВИДЕТЬ что делать.
+- НЕТ ДУБЛЕЙ: если компания в mainMoves — её не должно быть в repliesWaiting или yesterdayPipeline.
 
-БЛОК 1: "todoToday" — топ-7 actionable items, отсортированные по приоритету:
-  Priority: 1) MH/P1 чаты ждут ответа > 2) hot stale (Negotiations/Call Scheduled >20д) > 3) P2 warm стоит > 4) tasks
-  Формат каждого item:
-    "Ответить <Person> (<Company> · <Tier emoji+code>) — <что просят/что они сказали>"
-    "Решить с <X> (<Company> · <Stage>) — <что произошло, suggest action: добить/закрыть/Lost?>"
-    "<Company> · <Stage> · <N>д тишины — добить или закрыть → Lost"
-  Если items < 7 — это нормально, не выдумывай. Если 0 — верни пустой массив.
+ТЕБЕ НУЖНО ВЕРНУТЬ ЧЕТЫРЕ БЛОКА.
 
-БЛОК 2: "yesterdayPipeline" — три категории за вчерашний день:
-  - "movement": positive progress — новые ответы от качественных лидов, продвижение по stage, теплые outbound. Формат: "<Company> (<Tier>) — <что произошло>"
-  - "risks": negative signals — отказ от интеграции, "still working on details" уже несколько недель, тишина после deadline. Формат: "<Company> (<Stage>) — <риск>"  
-  - "newContacts": первые контакты ещё не в CRM, но звучат релевантно (финтех, банк, payments). Формат: "<Person/Company> (<Network>) — <о чём пишет>"
-  Каждый bullet — до 100 символов.
-  Если в категории нет ничего — верни пустой массив для неё.
-  Не дублируй одну компанию в разные категории.
+═══════════════════════════════════════════════════
+БЛОК 1 — "mainMoves" — ровно 3-5 главных хода на сегодня
+═══════════════════════════════════════════════════
+Это самые важные действия дня. Anton реально сделает их сегодня. Качество > количество.
 
-ОТВЕТ — строго JSON:
+Критерии что попадает:
+- MH/P1 контакты ждут ответа от Anton'а (replies waiting)
+- Stuck сделки с DEADLINE (Negotiations >20д где был hard deadline или явная договорённость)
+- Hot stale (Negotiations/Call Scheduled) высокого tier'а
+
+НЕ попадают сюда (это в другие блоки):
+- Stuck сделки БЕЗ deadline (без явной договорённости о сроке) → блок stuckNoDeadline
+- Inbound от новых людей не в CRM → блок repliesWaiting
+- P2/P3 inbound где нет срочности → блок repliesWaiting
+
+Сортировка: по tier (MH сверху, P1, P2, P3) → потом по urgency (days).
+
+Каждый main move — это объект:
 {
-  "todoToday": ["item1", "item2", ...],
+  "rank": 1,
+  "tierEmoji": "🟢",
+  "tierLabel": "MH 8.9",
+  "company": "BCB Group",
+  "action": "написать Paul follow-up по 23.02 синку",  ← глагол + объект, до 70 символов
+  "context": "stuck 30д · самая ценная сделка в pipeline, не теряем"  ← почему сейчас + что произойдёт, до 100 символов
+}
+
+Не пиши слово "Решить" или "Добить" в action — Anton не понимает что это значит. Пиши конкретно:
+плохо: "Добить LeoPay"
+хорошо: "финальное 'да/нет' перед закрытием Lost"
+
+═══════════════════════════════════════════════════
+БЛОК 2 — "repliesWaiting" — кто ещё ждёт ответа Anton'а
+═══════════════════════════════════════════════════
+Все inbound сообщения waiting reply, КРОМЕ тех что уже в mainMoves.
+Если человек/компания не в CRM или P2/P3 — он почти наверняка сюда (не в mainMoves).
+Если P1/MH inbound — он скорее в mainMoves, тут можно его пропустить.
+
+Каждый — объект:
+{
+  "name": "Anastasia Skrypnyk",
+  "network": "LinkedIn",  ← или "WhatsApp", "Telegram"
+  "tierEmoji": "🆕",  ← или 🟡/⚪ если в CRM
+  "tierLabel": "🆕 not in CRM",  ← или например "P2 6.2"
+  "daysIdle": "2д",  ← или "6h" если меньше суток
+  "context": "dispute rate calculator vs Visa/MC — релевантно нашему KYC/AML stack"  ← о чём пишут + ПОЧЕМУ нам это интересно, до 110 символов
+}
+
+Если новый контакт пишет про релевантную нам тему (финтех, stablecoin, payments, compliance, banking, regulation) — объясни **зачем нам отвечать** (потенциальный partner / source of intel / etc).
+
+Макс 5 items. Сортировка по relevance (CRM > 🆕 релевантные > 🆕 нерелевантные).
+
+═══════════════════════════════════════════════════
+БЛОК 3 — "stuckNoDeadline" — короткий список stuck без deadline
+═══════════════════════════════════════════════════
+Сделки которые stuck >14д, НО без явного deadline/договорённости. Anton НЕ должен сегодня их трогать — это просто напоминание что они есть.
+
+Каждый — объект:
+{
+  "name": "VelaFi",
+  "daysStuck": 28,
+  "stageShort": "Negotiations"  ← или "P2"
+}
+
+Макс 5 items. Если нет stuck без deadline — верни пустой массив.
+
+═══════════════════════════════════════════════════
+БЛОК 4 — "yesterdayPipeline" — что произошло вчера
+═══════════════════════════════════════════════════
+ТОЛЬКО две категории:
+- "win": реальные wins — закрытые шаги (NDA подписана, integration done, deal moved to Negotiations, P1 lead согласился на call)
+- "movement": positive activity которая не требует action от Anton'а сегодня (потому что либо уже в mainMoves либо неважно)
+
+НЕ включай сюда:
+- Risks → они должны быть в mainMoves если есть action, или в stuckNoDeadline если нет
+- Новые контакты → они в repliesWaiting если ждут ответа
+
+Каждый item — строка до 100 символов: "<Company/Person> (<Tier>) — <что произошло>"
+
+Макс 5 win + 5 movement. Если категория пустая — пустой массив.
+
+═══════════════════════════════════════════════════
+ОТВЕТ — строго JSON, без markdown, без комментариев:
+
+{
+  "mainMoves": [
+    {"rank": 1, "tierEmoji": "🟢", "tierLabel": "MH 8.9", "company": "BCB Group", "action": "...", "context": "..."},
+    ...
+  ],
+  "repliesWaiting": [
+    {"name": "...", "network": "LinkedIn", "tierEmoji": "🆕", "tierLabel": "🆕 not in CRM", "daysIdle": "2д", "context": "..."},
+    ...
+  ],
+  "stuckNoDeadline": [
+    {"name": "VelaFi", "daysStuck": 28, "stageShort": "Negotiations"},
+    ...
+  ],
   "yesterdayPipeline": {
-    "movement": ["item1", ...],
-    "risks": ["item1", ...],
-    "newContacts": ["item1", ...]
+    "win": ["..."],
+    "movement": ["..."]
   }
 }`;
 
   const userPrompt = `=== REPLIES WAITING (>4h, нужен ответ Anton'а) ===
 ${payload.repliesText}
 
-=== HOT STALE DEALS (Negotiations/Call Scheduled stuck) ===
+=== STALE DEALS (все stuck >14д, ты решаешь у кого есть deadline-pressure для mainMoves) ===
 ${payload.staleText}
 
 === OVERDUE TASKS ===
@@ -197,7 +272,8 @@ ${payload.tasksText}
 === YESTERDAY ACTIVITY (все мессенджеры, raw) ===
 ${payload.yesterdayText}
 
-Сделай два блока: todoToday (топ-7) + yesterdayPipeline (Movement/Risks/Новые).`;
+Сделай четыре блока: mainMoves (3-5), repliesWaiting (до 5), stuckNoDeadline (до 5), yesterdayPipeline (win + movement).
+АНТИ-ДУБЛИКАЦИЯ: одна компания/контакт идёт ТОЛЬКО в один блок.`;
 
   try {
     const t0 = Date.now();
@@ -205,7 +281,7 @@ ${payload.yesterdayText}
       "https://api.anthropic.com/v1/messages",
       {
         model: ANTHROPIC_MODEL,
-        max_tokens: 1500,
+        max_tokens: 2500,
         system: systemPrompt,
         messages: [{ role: "user", content: userPrompt }],
       },
@@ -215,7 +291,7 @@ ${payload.yesterdayText}
           "anthropic-version": "2023-06-01",
           "content-type": "application/json",
         },
-        timeout: 40_000,
+        timeout: 50_000,
       }
     );
     console.log(`[today-lean] Haiku call done in ${Date.now() - t0}ms`);
@@ -226,11 +302,12 @@ ${payload.yesterdayText}
     const parsed = JSON.parse(clean);
 
     return {
-      todoToday: Array.isArray(parsed.todoToday) ? parsed.todoToday.slice(0, 7) : [],
+      mainMoves:       Array.isArray(parsed.mainMoves)       ? parsed.mainMoves.slice(0, 5)       : [],
+      repliesWaiting:  Array.isArray(parsed.repliesWaiting)  ? parsed.repliesWaiting.slice(0, 5)  : [],
+      stuckNoDeadline: Array.isArray(parsed.stuckNoDeadline) ? parsed.stuckNoDeadline.slice(0, 5) : [],
       yesterdayPipeline: {
-        movement:    Array.isArray(parsed.yesterdayPipeline?.movement)    ? parsed.yesterdayPipeline.movement.slice(0, 6)    : [],
-        risks:       Array.isArray(parsed.yesterdayPipeline?.risks)       ? parsed.yesterdayPipeline.risks.slice(0, 6)       : [],
-        newContacts: Array.isArray(parsed.yesterdayPipeline?.newContacts) ? parsed.yesterdayPipeline.newContacts.slice(0, 6) : [],
+        win:      Array.isArray(parsed.yesterdayPipeline?.win)      ? parsed.yesterdayPipeline.win.slice(0, 5)      : [],
+        movement: Array.isArray(parsed.yesterdayPipeline?.movement) ? parsed.yesterdayPipeline.movement.slice(0, 5) : [],
       },
     };
   } catch (err) {
@@ -246,15 +323,12 @@ ${payload.yesterdayText}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Main endpoint: GET /today/lean
-// Pulls all sources in parallel, calls Haiku once, returns structured payload.
-// Bot does the rendering.
 // ─────────────────────────────────────────────────────────────────────────────
 
 router.get("/lean", async (req, res) => {
   const t0 = Date.now();
   console.log(`[today-lean] === START ===`);
 
-  // Parallel fetch
   const [tasks, stale, replies, yesterday] = await Promise.all([
     fetchTasks(),
     fetchHotStale(),
@@ -264,7 +338,6 @@ router.get("/lean", async (req, res) => {
 
   console.log(`[today-lean] sources fetched in ${Date.now() - t0}ms — tasks:${tasks?.length ?? "null"} stale:${stale?.length ?? "null"} replies:${replies?.replies?.length ?? "null"} yesterday-groups:${yesterday?.groups?.length ?? "null"}`);
 
-  // Build merged prompt payload
   const payload = {
     repliesText:   summarizeRepliesForPrompt(replies),
     staleText:     summarizeStaleForPrompt(stale),
@@ -272,17 +345,20 @@ router.get("/lean", async (req, res) => {
     yesterdayText: summarizeYesterdayForPrompt(yesterday),
   };
 
-  // Single Haiku call
   const haikuResult = await callHaikuMerge(payload);
 
   const elapsed = Date.now() - t0;
-  console.log(`[today-lean] === END === ${elapsed}ms · todo=${haikuResult?.todoToday?.length || 0} · movement=${haikuResult?.yesterdayPipeline?.movement?.length || 0} · risks=${haikuResult?.yesterdayPipeline?.risks?.length || 0} · new=${haikuResult?.yesterdayPipeline?.newContacts?.length || 0}`);
+  console.log(`[today-lean] === END === ${elapsed}ms · mainMoves=${haikuResult?.mainMoves?.length || 0} · replies=${haikuResult?.repliesWaiting?.length || 0} · stuck=${haikuResult?.stuckNoDeadline?.length || 0} · win=${haikuResult?.yesterdayPipeline?.win?.length || 0} · movement=${haikuResult?.yesterdayPipeline?.movement?.length || 0}`);
 
   res.json({
     ok: true,
     elapsed,
-    todoToday:         haikuResult?.todoToday || [],
-    yesterdayPipeline: haikuResult?.yesterdayPipeline || { movement: [], risks: [], newContacts: [] },
+    mainMoves:         haikuResult?.mainMoves || [],
+    repliesWaiting:    haikuResult?.repliesWaiting || [],
+    stuckNoDeadline:   haikuResult?.stuckNoDeadline || [],
+    yesterdayPipeline: haikuResult?.yesterdayPipeline || { win: [], movement: [] },
+    // Legacy fields for bw-compat (in case bot still reads them) — empty arrays
+    todoToday: [],
     sources: {
       tasksCount:    tasks?.length || 0,
       staleCount:    stale?.length || 0,

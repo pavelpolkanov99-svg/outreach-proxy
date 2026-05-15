@@ -86,12 +86,41 @@ function todayBoundaries(timeZone) {
 }
 
 // ── Internal-attendee detection ──────────────────────────────────────────────
+// Internal email domains. @remide.xyz is legacy (pre-rebrand), @plexo.global is current.
+// Any @*.calendar.google.com is a resource calendar (e.g., meeting room).
 function isInternalAttendee(email) {
   if (!email) return true;
   const e = email.toLowerCase();
   if (e.endsWith("@remide.xyz")) return true;
+  if (e.endsWith("@plexo.global")) return true;
   if (e.endsWith(".calendar.google.com")) return true;
   return false;
+}
+
+// Title patterns that strongly indicate an internal team event regardless
+// of attendees. Word-boundary (case-insensitive) matching so "weekly"
+// in "Weekly Sync" hits but random words don't false-positive.
+const INTERNAL_TITLE_PATTERNS = [
+  /\bweekly\b/i, /\bstandup\b/i, /\bstand[- ]?up\b/i, /\bdaily\b/i, /\bsync\b/i,
+  /\b1[-:]?on[-:]?1\b/i, /\b1:1\b/i, /\bteam\b/i, /\bretro(spective)?\b/i,
+  /\bsprint\b/i, /\bdemo\b/i, /\binternal\b/i, /\ball[-\s]?hands\b/i,
+  /\bkickoff\b/i, /\bkick[-\s]?off\b/i, /\bplanning\b/i, /\bgrooming\b/i,
+  /\bcheck[-\s]?in\b/i,
+];
+
+function titleIsInternal(summary) {
+  if (!summary) return false;
+  return INTERNAL_TITLE_PATTERNS.some(rx => rx.test(summary));
+}
+
+// "Recurring team meeting with token externals" detector.
+// Catches: weekly team sync where 1-2 external advisors/contractors are invited.
+// Rule: recurring event + internal ≥ 3 + external ≤ 2 = internal team meeting.
+function isRecurringTeamMeeting(ev, internalCount, externalCount) {
+  if (!ev.recurringEventId) return false;
+  if (internalCount < 3) return false;
+  if (externalCount > 2) return false;
+  return true;
 }
 
 // ── Helper: format event for digest output ───────────────────────────────────
@@ -109,7 +138,17 @@ function formatEvent(ev, viewerTimeZone) {
     ? "all-day"
     : `${fmt.format(start)}–${fmt.format(end)}`;
 
-  const attendees = (ev.attendees || [])
+  // Count internal vs external (before filtering self) for team-meeting heuristic
+  const allAttendees = ev.attendees || [];
+  let internalCount = 0;
+  let externalCount = 0;
+  for (const a of allAttendees) {
+    if (isInternalAttendee(a.email)) internalCount++;
+    else externalCount++;
+  }
+
+  // External attendees that are visible in the digest (excluding self)
+  const attendees = allAttendees
     .filter(a => !a.self && !isInternalAttendee(a.email))
     .map(a => ({
       email:    a.email,
@@ -120,6 +159,23 @@ function formatEvent(ev, viewerTimeZone) {
   const externalDomains = [...new Set(
     attendees.map(a => (a.email || "").split("@")[1]).filter(Boolean)
   )];
+
+  // Three internal-detection signals (any one is sufficient):
+  //   1. No external attendees at all (original rule)
+  //   2. Title matches an internal-meeting pattern (Weekly Sync, Standup, etc.)
+  //   3. Recurring team meeting with 1-2 token externals
+  const noExternals      = attendees.length === 0;
+  const titleSignals     = titleIsInternal(ev.summary);
+  const teamMeetingShape = isRecurringTeamMeeting(ev, internalCount, externalCount);
+  const isInternal = noExternals || titleSignals || teamMeetingShape;
+
+  // Internal reason — useful for /details debug and for explaining to humans
+  let internalReason = null;
+  if (isInternal) {
+    if (noExternals)           internalReason = "no-externals";
+    else if (titleSignals)     internalReason = "internal-title";
+    else if (teamMeetingShape) internalReason = "recurring-team-meeting";
+  }
 
   return {
     id:          ev.id,
@@ -135,7 +191,9 @@ function formatEvent(ev, viewerTimeZone) {
     meetUrl:     ev.conferenceUrl || ev.hangoutLink || null,
     attendees,
     externalDomains,
-    isInternal:  attendees.length === 0,
+    isInternal,
+    internalReason,
+    isRecurring: !!ev.recurringEventId,
     eventType:   ev.eventType || "default",
   };
 }

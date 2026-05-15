@@ -430,4 +430,301 @@ router.get("/health", async (_req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Write endpoints (v3.22+ for conversational layer)
+// ─────────────────────────────────────────────────────────────────────────────
+// Added for the upcoming conversational bot. Lets Anton/Pavel ask Loop OS to
+// create/update/delete calendar events via Telegram chat. Each operation is
+// gated by an [✅ Yes / ❌ No] approval prompt before bot calls these endpoints.
+//
+// Notification behavior: defaults to externalOnly (matches Google Calendar
+// native default). Pass notificationLevel="ALL"|"NONE" to override.
+
+// Map our notificationLevel → Google's sendUpdates parameter.
+// Default is externalOnly (= internal teammates don't get spammed).
+function mapNotificationLevel(level) {
+  const normalized = String(level || "").toUpperCase();
+  if (normalized === "ALL")  return "all";
+  if (normalized === "NONE") return "none";
+  return "externalOnly";
+}
+
+// Build a Google Calendar event body from our flat input shape.
+function buildEventBody(input) {
+  const body = {};
+  if (input.summary !== undefined)     body.summary     = input.summary;
+  if (input.description !== undefined) body.description = input.description;
+  if (input.location !== undefined)    body.location    = input.location;
+
+  // Time handling: timed events use dateTime, all-day uses date.
+  if (input.allDay && input.startTime && input.endTime) {
+    body.start = { date: input.startTime.split("T")[0] };
+    body.end   = { date: input.endTime.split("T")[0] };
+  } else {
+    if (input.startTime) {
+      body.start = { dateTime: input.startTime };
+      if (input.timeZone) body.start.timeZone = input.timeZone;
+    }
+    if (input.endTime) {
+      body.end = { dateTime: input.endTime };
+      if (input.timeZone) body.end.timeZone = input.timeZone;
+    }
+  }
+
+  if (Array.isArray(input.attendeeEmails) && input.attendeeEmails.length) {
+    body.attendees = input.attendeeEmails.map(email => ({ email }));
+  }
+
+  if (input.addGoogleMeetUrl) {
+    body.conferenceData = {
+      createRequest: {
+        requestId: `loop-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        conferenceSolutionKey: { type: "hangoutsMeet" },
+      },
+    };
+  }
+
+  if (input.visibility) body.visibility = input.visibility;
+  if (input.colorId)    body.colorId    = String(input.colorId);
+
+  return body;
+}
+
+// ── POST /calendar/create-event ──────────────────────────────────────────────
+//
+// Body:
+//   summary           string   required — event title
+//   startTime         string   required — ISO 8601
+//   endTime           string   required — ISO 8601
+//   description       string   optional
+//   location          string   optional
+//   attendeeEmails    string[] optional
+//   addGoogleMeetUrl  boolean  optional
+//   timeZone          string   optional — IANA TZ (e.g., 'Europe/Prague')
+//   allDay            boolean  optional
+//   visibility        string   optional — 'default' | 'public' | 'private'
+//   colorId           string   optional — '1'..'11'
+//   notificationLevel string   optional — 'EXTERNAL_ONLY' (default) | 'ALL' | 'NONE'
+//   calendarId        string   optional — defaults to anton@remide.xyz
+router.post("/create-event", async (req, res) => {
+  const {
+    summary, startTime, endTime,
+    description, location,
+    attendeeEmails, addGoogleMeetUrl,
+    timeZone, allDay, visibility, colorId,
+    notificationLevel, calendarId,
+  } = req.body || {};
+
+  if (!summary || !startTime || !endTime) {
+    return res.status(400).json({ ok: false, error: "summary, startTime, endTime required" });
+  }
+
+  const targetCalendar = calendarId || DEFAULT_CALENDAR_ID;
+  const sendUpdates    = mapNotificationLevel(notificationLevel);
+
+  try {
+    const token = await getAccessToken();
+    const body = buildEventBody({
+      summary, startTime, endTime,
+      description, location,
+      attendeeEmails, addGoogleMeetUrl,
+      timeZone, allDay, visibility, colorId,
+    });
+
+    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(targetCalendar)}/events`;
+    const r = await axios.post(url, body, {
+      params: {
+        sendUpdates,
+        conferenceDataVersion: addGoogleMeetUrl ? 1 : 0,
+      },
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      timeout: 15_000,
+    });
+
+    const meetUrl = r.data.hangoutLink
+      || r.data.conferenceData?.entryPoints?.find(e => e.entryPointType === "video")?.uri
+      || null;
+
+    console.log(`[calendar/create-event] OK eventId=${r.data.id} sendUpdates=${sendUpdates}`);
+
+    res.json({
+      ok: true,
+      eventId:    r.data.id,
+      htmlLink:   r.data.htmlLink,
+      meetUrl,
+      summary:    r.data.summary,
+      start:      r.data.start,
+      end:        r.data.end,
+      attendees:  r.data.attendees || [],
+      calendarId: targetCalendar,
+      sendUpdates,
+    });
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const detail = err.response?.data || err.message;
+    console.error("[calendar/create-event] error:", JSON.stringify(detail));
+    res.status(status).json({
+      ok: false,
+      error: typeof detail === "string" ? detail : (detail.error?.message || detail.error_description || err.message),
+    });
+  }
+});
+
+// ── POST /calendar/update-event ──────────────────────────────────────────────
+//
+// Body:
+//   eventId               string   required
+//   summary               string   optional
+//   startTime             string   optional — ISO 8601
+//   endTime               string   optional — ISO 8601
+//   description           string   optional
+//   location              string   optional
+//   addedAttendeeEmails   string[] optional
+//   removedAttendeeEmails string[] optional
+//   addGoogleMeetUrl      boolean  optional — also recreates Meet link
+//   timeZone              string   optional
+//   visibility            string   optional
+//   colorId               string   optional
+//   notificationLevel     string   optional — 'EXTERNAL_ONLY' (default) | 'ALL' | 'NONE'
+//   calendarId            string   optional
+//
+// Attendee handling: this endpoint merges added/removed lists into the
+// existing attendee list (fetches the event first, then PATCHes). Pass
+// attendeeEmails (full replacement list) is NOT supported here to avoid
+// accidental "I forgot one and dropped them" mistakes.
+router.post("/update-event", async (req, res) => {
+  const {
+    eventId,
+    summary, startTime, endTime,
+    description, location,
+    addedAttendeeEmails, removedAttendeeEmails,
+    addGoogleMeetUrl,
+    timeZone, visibility, colorId,
+    notificationLevel, calendarId,
+  } = req.body || {};
+
+  if (!eventId) {
+    return res.status(400).json({ ok: false, error: "eventId required" });
+  }
+
+  const targetCalendar = calendarId || DEFAULT_CALENDAR_ID;
+  const sendUpdates    = mapNotificationLevel(notificationLevel);
+
+  try {
+    const token = await getAccessToken();
+
+    // For attendee add/remove, fetch current attendees first, then merge.
+    let attendees = undefined;
+    if (Array.isArray(addedAttendeeEmails) || Array.isArray(removedAttendeeEmails)) {
+      const getUrl = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(targetCalendar)}/events/${encodeURIComponent(eventId)}`;
+      const currentEv = await axios.get(getUrl, {
+        headers: { Authorization: `Bearer ${token}` }, timeout: 10_000,
+      });
+      const existing = currentEv.data.attendees || [];
+      const toRemove = new Set((removedAttendeeEmails || []).map(e => String(e).toLowerCase()));
+      attendees = existing.filter(a => !toRemove.has((a.email || "").toLowerCase()));
+      for (const email of (addedAttendeeEmails || [])) {
+        if (!attendees.some(a => (a.email || "").toLowerCase() === email.toLowerCase())) {
+          attendees.push({ email });
+        }
+      }
+    }
+
+    const body = {};
+    if (summary !== undefined)     body.summary     = summary;
+    if (description !== undefined) body.description = description;
+    if (location !== undefined)    body.location    = location;
+    if (startTime) {
+      body.start = { dateTime: startTime };
+      if (timeZone) body.start.timeZone = timeZone;
+    }
+    if (endTime) {
+      body.end = { dateTime: endTime };
+      if (timeZone) body.end.timeZone = timeZone;
+    }
+    if (attendees !== undefined) body.attendees = attendees;
+    if (visibility) body.visibility = visibility;
+    if (colorId)    body.colorId    = String(colorId);
+    if (addGoogleMeetUrl) {
+      body.conferenceData = {
+        createRequest: {
+          requestId: `loop-update-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          conferenceSolutionKey: { type: "hangoutsMeet" },
+        },
+      };
+    }
+
+    if (Object.keys(body).length === 0) {
+      return res.status(400).json({ ok: false, error: "No fields to update" });
+    }
+
+    const patchUrl = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(targetCalendar)}/events/${encodeURIComponent(eventId)}`;
+    const r = await axios.patch(patchUrl, body, {
+      params: {
+        sendUpdates,
+        conferenceDataVersion: addGoogleMeetUrl ? 1 : 0,
+      },
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      timeout: 15_000,
+    });
+
+    console.log(`[calendar/update-event] OK eventId=${r.data.id} sendUpdates=${sendUpdates} fields=${Object.keys(body).join(",")}`);
+
+    res.json({
+      ok: true,
+      eventId:   r.data.id,
+      htmlLink:  r.data.htmlLink,
+      summary:   r.data.summary,
+      start:     r.data.start,
+      end:       r.data.end,
+      attendees: r.data.attendees || [],
+      updated:   Object.keys(body),
+      calendarId: targetCalendar,
+      sendUpdates,
+    });
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const detail = err.response?.data || err.message;
+    console.error("[calendar/update-event] error:", JSON.stringify(detail));
+    res.status(status).json({
+      ok: false,
+      error: typeof detail === "string" ? detail : (detail.error?.message || detail.error_description || err.message),
+    });
+  }
+});
+
+// ── POST /calendar/delete-event ──────────────────────────────────────────────
+//
+// Body:
+//   eventId           string required
+//   notificationLevel string optional — 'EXTERNAL_ONLY' (default) | 'ALL' | 'NONE'
+//   calendarId        string optional
+router.post("/delete-event", async (req, res) => {
+  const { eventId, notificationLevel, calendarId } = req.body || {};
+  if (!eventId) return res.status(400).json({ ok: false, error: "eventId required" });
+
+  const targetCalendar = calendarId || DEFAULT_CALENDAR_ID;
+  const sendUpdates    = mapNotificationLevel(notificationLevel);
+
+  try {
+    const token = await getAccessToken();
+    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(targetCalendar)}/events/${encodeURIComponent(eventId)}`;
+    await axios.delete(url, {
+      params: { sendUpdates },
+      headers: { Authorization: `Bearer ${token}` },
+      timeout: 15_000,
+    });
+    console.log(`[calendar/delete-event] OK eventId=${eventId} sendUpdates=${sendUpdates}`);
+    res.json({ ok: true, eventId, deleted: true, calendarId: targetCalendar, sendUpdates });
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const detail = err.response?.data || err.message;
+    console.error("[calendar/delete-event] error:", JSON.stringify(detail));
+    res.status(status).json({
+      ok: false,
+      error: typeof detail === "string" ? detail : (detail.error?.message || detail.error_description || err.message),
+    });
+  }
+});
+
 module.exports = router;

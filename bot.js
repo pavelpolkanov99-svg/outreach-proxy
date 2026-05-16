@@ -2,10 +2,17 @@ const { Bot } = require("grammy");
 const axios   = require("axios");
 const cron    = require("node-cron");
 
+// ── Conversational layer modules (Phase 1-4) ──────────────────────────────────
+// These are only exercised when CONVERSATIONAL_MODE_ENABLED === "true".
+// require() is safe regardless — the modules are side-effect-free on load.
+const agent          = require("./lib/agent");
+const approvalFlow   = require("./lib/approval-flow");
+const conversationStore = require("./lib/conversation-store");
+
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.22.0-founder-focus";
+const VERSION      = "4.23.0-conversational";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -19,6 +26,15 @@ const MORNING_PUSH_USERS = (process.env.MORNING_PUSH_USERS || "156632707")
 const ANTON_TG_ID = process.env.ANTON_TG_ID
   ? parseInt(process.env.ANTON_TG_ID.trim(), 10)
   : null;
+
+// ── Conversational mode feature flag ──────────────────────────────────────────
+// When false (default), bot behaves exactly as before: slash commands only,
+// any other text gets the "Команды:" reply. When true, non-command text is
+// routed to the Claude agent. Toggle via Railway env, no redeploy needed.
+const CONVERSATIONAL_MODE = process.env.CONVERSATIONAL_MODE_ENABLED === "true";
+
+// Pavel's TG id is known; Anton's comes from ANTON_TG_ID env.
+const PAVEL_TG_ID = 156632707;
 
 const bot = new Bot(BOT_TOKEN);
 
@@ -42,6 +58,16 @@ function guard(ctx, fn) {
     return ctx.reply("⛔ Access denied.");
   }
   return fn();
+}
+
+// Resolve a TG user id to a logical identity for the agent: "anton" | "pavel".
+// Pavel is known by id. Anton is ANTON_TG_ID if set; otherwise any other
+// allowed user is treated as "anton" (safe default until env is configured).
+function whoIs(ctx) {
+  const id = ctx.from?.id;
+  if (id === PAVEL_TG_ID) return "pavel";
+  if (ANTON_TG_ID && id === ANTON_TG_ID) return "anton";
+  return "anton";
 }
 
 // ── HTML escape ──────────────────────────────────────────────────────────────
@@ -839,14 +865,6 @@ function buildYesterdaySectionFull(summary) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // /today — v4.22 founder-focused lean digest
-//
-// Order:
-//   📅 Встречи сегодня
-//   🎯 Главные ходы (3-5)
-//   💬 Ответы ждут
-//   🪦 Stuck без deadline (one-liner)
-//   📊 Вчера в pipeline (win + movement)
-//   /commands
 function composeLeanDigest({ calendarRes, leanData }, { customHeader } = {}) {
   const sections = [];
   sections.push(customHeader || buildLeanHeader());
@@ -898,7 +916,6 @@ function composeFullDigest(allData, { customHeader } = {}) {
 
   sections.push(buildCalendarSectionLean(allData.calendarRes));
 
-  // v4.22 sections from lean payload
   const mainMoves = buildMainMovesSection(allData.leanData);
   if (mainMoves) sections.push(mainMoves);
 
@@ -911,7 +928,6 @@ function composeFullDigest(allData, { customHeader } = {}) {
   const yesterdayPipeline = buildYesterdayPipelineSection(allData.leanData);
   if (yesterdayPipeline) sections.push(yesterdayPipeline);
 
-  // Plus full details
   const tasksBlock = buildTasksSectionFull(allData.tasksData, allData.completedTasks);
   if (tasksBlock) sections.push(tasksBlock);
 
@@ -988,14 +1004,188 @@ async function fetchAllData() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Conversational layer — handlers (Phase 5)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Only active when CONVERSATIONAL_MODE === true. Routes plain (non-slash) text
+// messages to the Claude agent, renders agent results, and handles approval
+// inline-keyboard callbacks.
+
+// Render an agent result object into Telegram messages.
+// `statusMsg` is the "⏳ Думаю..." message we can edit into the final answer.
+async function renderAgentResult(ctx, statusMsg, result) {
+  // Budget warning — check once, append if just crossed
+  let budgetNote = "";
+  try {
+    const crossing = conversationStore.checkBudgetCrossing();
+    if (crossing) {
+      budgetNote = `\n\n<i>💸 Сегодня потрачено $${crossing.costUsd.toFixed(2)} — дневной бюджет $${crossing.budgetDailyUsd} пройден (${crossing.msgs} сообщений). Не блокирую, просто для инфо.</i>`;
+    }
+  } catch (_) { /* budget check is best-effort */ }
+
+  if (result.kind === "final") {
+    const text = (result.text && result.text.trim())
+      ? result.text
+      : "(пустой ответ)";
+    await editAndSplit(ctx, statusMsg, esc(text) + budgetNote);
+    return;
+  }
+
+  if (result.kind === "approval") {
+    const { pending } = result;
+    const { approvalId } = approvalFlow.createApproval(pending);
+    const summary = pending.approvalSummary || `Выполнить ${pending.toolName}`;
+    const body =
+      `🔐 <b>Нужно подтверждение</b>\n\n` +
+      `${summary}\n\n` +
+      `<i>Это write-операция. Подтверди или отклони.</i>` +
+      budgetNote;
+    await ctx.api.editMessageText(
+      ctx.chat.id, statusMsg.message_id, body,
+      {
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+        reply_markup: approvalFlow.buildInlineKeyboard(approvalId),
+      }
+    );
+    return;
+  }
+
+  if (result.kind === "tool_failed") {
+    const body =
+      `⚠️ <b>Не получилось выполнить</b> <code>${esc(result.toolName)}</code>\n` +
+      `Попробовал ${result.attempts || 2} раза. Ошибка:\n<i>${esc(result.error || "unknown")}</i>\n\n` +
+      `@Rvn2332 — глянь логи?\n\n` +
+      `<i>Напиши что делать — попробую заново или поменяю параметры.</i>` +
+      budgetNote;
+    await ctx.api.editMessageText(
+      ctx.chat.id, statusMsg.message_id, body,
+      { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
+    );
+    return;
+  }
+
+  if (result.kind === "cancelled") {
+    // Superseded by a newer turn — quietly note it. Don't spam.
+    await ctx.api.editMessageText(
+      ctx.chat.id, statusMsg.message_id,
+      `<i>↩️ Запрос отменён (пришло новое сообщение).</i>`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Unknown kind — defensive
+  await ctx.api.editMessageText(
+    ctx.chat.id, statusMsg.message_id,
+    `<i>Неизвестный результат агента: ${esc(result.kind)}</i>`,
+    { parse_mode: "HTML" }
+  );
+}
+
+// Handle a plain text message in conversational mode.
+async function handleConversation(ctx) {
+  const text = ctx.message?.text || "";
+  const from = whoIs(ctx);
+  const fromUserId = ctx.from?.id;
+
+  const statusMsg = await ctx.reply("⏳ Думаю...");
+
+  try {
+    const result = await agent.runAgentTurn({ text, from, fromUserId });
+    await renderAgentResult(ctx, statusMsg, result);
+  } catch (err) {
+    console.error("[bot] handleConversation error:", err.message);
+    try {
+      await ctx.api.editMessageText(
+        ctx.chat.id, statusMsg.message_id,
+        `❌ Внутренняя ошибка: ${esc(err.message)}\n\n@Rvn2332`,
+        { parse_mode: "HTML" }
+      );
+    } catch (_) {}
+  }
+}
+
+// Handle an approval button tap.
+async function handleApprovalCallback(ctx) {
+  const data = ctx.callbackQuery?.data || "";
+  const parsed = approvalFlow.parseCallbackData(data);
+  if (!parsed) {
+    // Not ours — ignore silently
+    return ctx.answerCallbackQuery();
+  }
+
+  const { approvalId, decision } = parsed;
+  const approved = decision === "yes";
+
+  // Acknowledge the tap immediately so the spinner stops
+  await ctx.answerCallbackQuery({
+    text: approved ? "✅ Выполняю..." : "❌ Отменено",
+  });
+
+  const resolved = approvalFlow.resolveApproval(approvalId, approved);
+
+  if (!resolved.ok) {
+    let msg;
+    if (resolved.reason === "already_resolved") {
+      msg = `<i>Уже обработано ранее (${resolved.priorApproved ? "выполнено" : "отклонено"}).</i>`;
+    } else if (resolved.reason === "expired") {
+      msg = `<i>⏱ Подтверждение устарело (&gt;30 мин). Запрос отменён — повтори если нужно.</i>`;
+    } else if (resolved.reason === "stale") {
+      msg = `<i>↩️ Подтверждение неактуально (был новый запрос). Отменено.</i>`;
+    } else {
+      msg = `<i>Подтверждение не найдено. Возможно бот перезапускался — повтори запрос.</i>`;
+    }
+    try {
+      await ctx.editMessageText(msg, { parse_mode: "HTML" });
+    } catch (_) {
+      await ctx.reply(msg, { parse_mode: "HTML" });
+    }
+    return;
+  }
+
+  // Update the approval message to show the decision was registered
+  const decisionLabel = approved ? "✅ Подтверждено" : "❌ Отклонено";
+  try {
+    await ctx.editMessageText(
+      `${decisionLabel} — ${approved ? "выполняю" : "не выполняю"}...`,
+      { parse_mode: "HTML" }
+    );
+  } catch (_) {}
+
+  // Continue the agent loop
+  const statusMsg = await ctx.reply("⏳ Продолжаю...");
+  try {
+    const result = await agent.continueAfterApproval({
+      pending:  resolved.pending,
+      approved: resolved.approved,
+    });
+    await renderAgentResult(ctx, statusMsg, result);
+  } catch (err) {
+    console.error("[bot] handleApprovalCallback error:", err.message);
+    try {
+      await ctx.api.editMessageText(
+        ctx.chat.id, statusMsg.message_id,
+        `❌ Ошибка после подтверждения: ${esc(err.message)}\n\n@Rvn2332`,
+        { parse_mode: "HTML" }
+      );
+    } catch (_) {}
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Commands
 // ─────────────────────────────────────────────────────────────────────────────
 
 bot.command("start", ctx => guard(ctx, () => {
+  const convLine = CONVERSATIONAL_MODE
+    ? `\n💬 <b>Чат-режим включён</b> — пиши обычным текстом, отвечу как Claude с доступом к Notion/Beeper/Apollo/Calendar.\n`
+    : "";
   return ctx.reply(
     `🤖 Loop OS — Founder Command Center\n\n` +
-    `Версия: ${VERSION}\n\n` +
-    `Команды:\n` +
+    `Версия: ${VERSION}\n` +
+    convLine +
+    `\nКоманды:\n` +
     `/ping — health check\n` +
     `/today — дайджест на сегодня (founder-focused)\n` +
     `/details — полные данные: задачи + replies + stale\n` +
@@ -1004,10 +1194,12 @@ bot.command("start", ctx => guard(ctx, () => {
     `/digest — отправить Anton'у (или себе если ID не задан)\n` +
     `/tasks — открытые задачи\n` +
     `/stale — заглохшие сделки (>14d)\n` +
-    `/replies — ждут ответа Anton'а\n\n` +
-    `Авто:\n` +
+    `/replies — ждут ответа Anton'а\n` +
+    (CONVERSATIONAL_MODE ? `/new — сбросить контекст чата\n/budget — расход за сегодня\n` : "") +
+    `\nАвто:\n` +
     `• Утренний дайджест 08:30 CET\n` +
-    `• CRM auto-prewarm 23:00 и 08:00 CET`
+    `• CRM auto-prewarm 23:00 и 08:00 CET`,
+    { parse_mode: "HTML" }
   );
 }));
 
@@ -1025,6 +1217,7 @@ bot.command("ping", ctx => guard(ctx, () => {
     `Версия: ${VERSION}\n` +
     `Uptime: ${uptimeStr}\n` +
     `Server: ${now.toISOString()}\n` +
+    `Chat mode: ${CONVERSATIONAL_MODE ? "ON" : "OFF"}\n` +
     `Anton TG ID: ${ANTON_TG_ID || "не задан (env ANTON_TG_ID)"}\n` +
     `Your TG ID: ${ctx.from?.id}`
   );
@@ -1254,11 +1447,85 @@ bot.command("replies", ctx => guard(ctx, async () => {
   }
 }));
 
+// ── Conversational-mode commands (only meaningful when CONVERSATIONAL_MODE) ────
+
+bot.command("new", ctx => guard(ctx, () => {
+  if (!CONVERSATIONAL_MODE) {
+    return ctx.reply("Чат-режим выключен. /new недоступна.");
+  }
+  try {
+    const res = conversationStore.resetConversation({ keepSummary: true, reason: "/new command" });
+    approvalFlow.invalidateAll("/new command");
+    return ctx.reply(
+      `🆕 Контекст сброшен (было ${res.oldTurns} реплик).` +
+      (res.keptSummary ? `\n<i>Краткое summary прошлого разговора сохранено.</i>` : ""),
+      { parse_mode: "HTML" }
+    );
+  } catch (err) {
+    return ctx.reply(`❌ Не получилось сбросить: ${esc(err.message)}`);
+  }
+}));
+
+bot.command("budget", ctx => guard(ctx, () => {
+  if (!CONVERSATIONAL_MODE) {
+    return ctx.reply("Чат-режим выключен. /budget недоступна.");
+  }
+  try {
+    const view = conversationStore.getView();
+    const c = view.costsToday;
+    return ctx.reply(
+      `💸 <b>Расход за сегодня</b>\n\n` +
+      `Потрачено: $${(c.usd || 0).toFixed(4)}\n` +
+      `Сообщений: ${c.msgs || 0}\n` +
+      `Дневной бюджет: $${view.budgetDailyUsd} (soft — не блокирую)\n` +
+      `Реплик в контексте: ${view.totalTurns}`,
+      { parse_mode: "HTML" }
+    );
+  } catch (err) {
+    return ctx.reply(`❌ Ошибка: ${esc(err.message)}`);
+  }
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plain text handler — routes to conversational agent OR shows command list
+// ─────────────────────────────────────────────────────────────────────────────
+
 bot.on("message:text", ctx => guard(ctx, () => {
+  const text = ctx.message?.text || "";
+
+  // Slash commands that weren't matched by a bot.command() handler above
+  // (e.g. a typo'd /foo). Keep old behavior — show the command list.
+  const isSlash = text.trim().startsWith("/");
+
+  if (CONVERSATIONAL_MODE && !isSlash) {
+    // Route to the Claude agent
+    return handleConversation(ctx);
+  }
+
+  // Default (conversational mode off, OR an unrecognized slash command)
   return ctx.reply(
-    `Команды:\n/start  /ping  /today  /details  /full  /yesterday  /digest  /tasks  /stale  /replies`
+    `Команды:\n/start  /ping  /today  /details  /full  /yesterday  /digest  /tasks  /stale  /replies` +
+    (CONVERSATIONAL_MODE ? `  /new  /budget` : "")
   );
 }));
+
+// ── Approval inline-keyboard callback handler ────────────────────────────────
+bot.on("callback_query:data", async (ctx) => {
+  // Only conversational mode produces approval buttons
+  if (!CONVERSATIONAL_MODE) {
+    return ctx.answerCallbackQuery();
+  }
+  // Auth check — only allowed users can resolve approvals
+  if (!isAllowed(ctx)) {
+    return ctx.answerCallbackQuery({ text: "⛔ Access denied" });
+  }
+  try {
+    await handleApprovalCallback(ctx);
+  } catch (err) {
+    console.error("[bot] callback_query handler error:", err.message);
+    try { await ctx.answerCallbackQuery({ text: "Ошибка обработки" }); } catch (_) {}
+  }
+});
 
 bot.catch(err => {
   console.error("[bot] Error:", err.message);
@@ -1295,6 +1562,7 @@ console.log(`[bot] Loop OS FCC ${VERSION} starting...`);
 console.log(`[bot] Proxy URL: ${PROXY}`);
 console.log(`[bot] Anton TG ID: ${ANTON_TG_ID || "(not set)"}`);
 console.log(`[bot] Morning push recipients: ${MORNING_PUSH_USERS.join(",") || "(none)"}`);
+console.log(`[bot] Conversational mode: ${CONVERSATIONAL_MODE ? "ENABLED" : "disabled"}`);
 bot.start().then(() => {
   console.log(`[bot] Loop OS FCC ${VERSION} started at ${STARTED_AT.toISOString()}`);
 }).catch(err => {

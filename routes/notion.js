@@ -51,9 +51,70 @@ function buildCompanyProps({
   return props;
 }
 
-// ── GET /notion/db-schema ─────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /notion/db-schema
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Two modes:
+//
+//  1. WITH ?db_id=<uuid> — returns the schema of ANY Notion database:
+//       { ok, db_id, title, properties: [ { name, type, options? }, ... ] }
+//     For select / status / multi_select properties, `options` lists the
+//     valid option names. This lets a caller (the conversational agent) learn
+//     the EXACT property names AND valid values before building a filter —
+//     eliminating the whole "Could not find property with name or id" /
+//     "invalid option" class of errors.
+//
+//  2. WITHOUT db_id — legacy behaviour, unchanged: returns
+//       { companies: [{name,type}], people: [{name,type}] }
+//     for the two hardcoded CRM databases. Existing callers keep working.
+
+// Extract a compact, caller-friendly property list from a Notion DB object.
+// Includes option names for select/status/multi_select so the agent also
+// knows the valid VALUES, not just the property name.
+function extractSchemaProperties(db) {
+  return Object.entries(db.properties || {}).map(([name, prop]) => {
+    const entry = { name, type: prop.type };
+    if (prop.type === "select" && prop.select?.options) {
+      entry.options = prop.select.options.map(o => o.name);
+    } else if (prop.type === "status" && prop.status?.options) {
+      entry.options = prop.status.options.map(o => o.name);
+    } else if (prop.type === "multi_select" && prop.multi_select?.options) {
+      entry.options = prop.multi_select.options.map(o => o.name);
+    }
+    return entry;
+  });
+}
+
 router.get("/db-schema", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+
+  const dbId = (req.query.db_id || "").trim();
+
+  // Mode 1 — any database by id
+  if (dbId) {
+    try {
+      const r = await axios.get(
+        `https://api.notion.com/v1/databases/${dbId}`,
+        { headers: notionHeaders(), timeout: 12_000 }
+      );
+      const title = (r.data.title || [])
+        .map(t => t.plain_text || t.text?.content || "")
+        .join("") || null;
+      return res.json({
+        ok: true,
+        db_id: dbId,
+        title,
+        properties: extractSchemaProperties(r.data),
+      });
+    } catch (err) {
+      return res.status(err.response?.status || 500).json({
+        error: err.response?.data?.message || err.message,
+      });
+    }
+  }
+
+  // Mode 2 — legacy: the two CRM databases, original { name, type } shape
   try {
     const [companies, people] = await Promise.all([
       axios.get(`https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}`, { headers: notionHeaders() }),

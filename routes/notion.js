@@ -634,6 +634,13 @@ const TASK_ASSIGNEE_NAME_BY_ID = {
   "22dd872b-594c-8188-94c6-00025f066c59": "Anton",
 };
 
+// Inverse map — resolve an assignee string ("anton"/"pavel", case-insensitive)
+// to a Notion user UUID. Used by POST /create-task.
+const TASK_ASSIGNEE_ID_BY_NAME = {
+  "pavel": "2dfd872b-594c-815d-bf92-00022403aa3e",
+  "anton": "22dd872b-594c-8188-94c6-00025f066c59",
+};
+
 // Build the assignee filter clause — `or` over each whitelisted UUID.
 // Returns null if whitelist is empty (no filtering).
 function buildAssigneeFilter() {
@@ -1002,6 +1009,172 @@ router.get("/tasks-completed", async (req, res) => {
   } catch (err) {
     res.status(err.response?.status || 500).json({
       error: err.response?.data?.message || err.message,
+    });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /notion/create-task — create a task in the Tasks Tracker DB
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Body:
+//   taskName     string  required — Task name (title)
+//   description  string  optional — Description (rich_text)
+//   summary      string  optional — Summary (rich_text)
+//   dueDate      string  optional — Due date, "YYYY-MM-DD"
+//   priority     string  optional — "High" | "Medium" | "Low"
+//   status       string  optional — Status (default "Not started")
+//   assignee     string  optional — "anton" | "pavel" (case-insensitive)
+//   channel      string|string[] optional — Channel multi_select (Email/WhatsApp/...)
+//   taskType     string|string[] optional — Task type multi_select
+//   companyName  string  optional — resolved to a CRM Companies relation
+//   personName   string  optional — resolved to a CRM People relation
+//
+// Company/person resolution is best-effort: if the name isn't found, the task
+// is still created and the response flags companyResolved/personResolved=false.
+router.post("/create-task", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+
+  const {
+    taskName, description, summary,
+    dueDate, priority, status,
+    assignee, channel, taskType,
+    companyName, personName,
+  } = req.body || {};
+
+  if (!taskName || typeof taskName !== "string" || !taskName.trim()) {
+    return res.status(400).json({ error: "taskName required" });
+  }
+
+  // Validate dueDate shape if provided (YYYY-MM-DD). Notion rejects bad dates
+  // with an opaque error; catch it early with a clear message.
+  if (dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(String(dueDate).trim())) {
+    return res.status(400).json({ error: `dueDate must be YYYY-MM-DD, got "${dueDate}"` });
+  }
+
+  try {
+    // ── Resolve linked Company (best-effort title 'contains' query) ──────────
+    let companyPageId   = null;
+    let companyResolved = false;
+    if (companyName && String(companyName).trim()) {
+      try {
+        const cq = await axios.post(
+          `https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}/query`,
+          { filter: { property: "Company name", title: { contains: String(companyName).trim().slice(0, 100) } }, page_size: 1 },
+          { headers: notionHeaders() }
+        );
+        if (cq.data.results.length > 0) {
+          companyPageId   = cq.data.results[0].id;
+          companyResolved = true;
+        }
+      } catch (_) { /* best-effort — leave unresolved */ }
+    }
+
+    // ── Resolve linked Person (best-effort title 'contains' query) ───────────
+    let personPageId   = null;
+    let personResolved = false;
+    if (personName && String(personName).trim()) {
+      try {
+        const pq = await axios.post(
+          `https://api.notion.com/v1/databases/${NOTION_PEOPLE_DB}/query`,
+          { filter: { property: "Name", title: { contains: String(personName).trim().slice(0, 100) } }, page_size: 1 },
+          { headers: notionHeaders() }
+        );
+        if (pq.data.results.length > 0) {
+          personPageId   = pq.data.results[0].id;
+          personResolved = true;
+        }
+      } catch (_) { /* best-effort — leave unresolved */ }
+    }
+
+    // ── Resolve assignee string → Notion user UUID ───────────────────────────
+    let assigneeId       = null;
+    let assigneeResolved = false;
+    if (assignee && typeof assignee === "string") {
+      assigneeId = TASK_ASSIGNEE_ID_BY_NAME[assignee.trim().toLowerCase()] || null;
+      assigneeResolved = !!assigneeId;
+    }
+
+    // ── Build the page properties ────────────────────────────────────────────
+    const props = {
+      "Task name": { title: [{ text: { content: taskName.trim().slice(0, 2000) } }] },
+    };
+
+    if (description && String(description).trim()) {
+      props["Description"] = { rich_text: [{ text: { content: String(description).trim().slice(0, 2000) } }] };
+    }
+    if (summary && String(summary).trim()) {
+      props["Summary"] = { rich_text: [{ text: { content: String(summary).trim().slice(0, 2000) } }] };
+    }
+    if (dueDate && String(dueDate).trim()) {
+      props["Due date"] = { date: { start: String(dueDate).trim() } };
+    }
+    if (priority && String(priority).trim()) {
+      props["Priority"] = { select: { name: String(priority).trim() } };
+    }
+    // Status defaults to "Not started" if not supplied.
+    props["Status"] = { status: { name: (status && String(status).trim()) || "Not started" } };
+
+    if (assigneeId) {
+      props["Assignee"] = { people: [{ id: assigneeId }] };
+    }
+
+    const channelArr = parseIfString(channel);
+    const channelList = Array.isArray(channelArr)
+      ? channelArr
+      : (channelArr ? [channelArr] : []);
+    if (channelList.length) {
+      props["Channel"] = { multi_select: channelList.map(c => ({ name: String(c) })) };
+    }
+
+    const taskTypeArr = parseIfString(taskType);
+    const taskTypeList = Array.isArray(taskTypeArr)
+      ? taskTypeArr
+      : (taskTypeArr ? [taskTypeArr] : []);
+    if (taskTypeList.length) {
+      props["Task type"] = { multi_select: taskTypeList.map(t => ({ name: String(t) })) };
+    }
+
+    if (companyPageId) {
+      props["🏢  CRM Companies"] = { relation: [{ id: companyPageId }] };
+    }
+    if (personPageId) {
+      props["👤  CRM People"] = { relation: [{ id: personPageId }] };
+    }
+
+    // ── Create the page ──────────────────────────────────────────────────────
+    const created = await axios.post(
+      "https://api.notion.com/v1/pages",
+      { parent: { database_id: NOTION_TASKS_DB }, properties: props },
+      { headers: notionHeaders() }
+    );
+
+    console.log(`[notion/create-task] OK pageId=${created.data.id} name="${taskName.trim().slice(0, 60)}" assignee=${assignee || "-"} due=${dueDate || "-"}`);
+
+    res.json({
+      ok: true,
+      pageId: created.data.id,
+      url: created.data.url,
+      taskName: taskName.trim(),
+      dueDate: dueDate || null,
+      priority: priority || null,
+      status: (status && String(status).trim()) || "Not started",
+      assignee: assignee || null,
+      assigneeResolved,
+      companyResolved,
+      personResolved,
+      // Surface unresolved references so the caller can warn the user.
+      warnings: [
+        (companyName && !companyResolved) ? `Company "${companyName}" not found — task created without company link` : null,
+        (personName  && !personResolved)  ? `Person "${personName}" not found — task created without person link`   : null,
+        (assignee    && !assigneeResolved) ? `Assignee "${assignee}" not recognized (use "anton" or "pavel") — task created unassigned` : null,
+      ].filter(Boolean),
+    });
+  } catch (err) {
+    const detail = err.response?.data;
+    console.error("[notion/create-task] error:", JSON.stringify(detail || err.message));
+    res.status(err.response?.status || 500).json({
+      error: detail?.message || err.message,
     });
   }
 });

@@ -76,6 +76,50 @@ function esc(text) {
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+// ── Markdown → Telegram HTML ─────────────────────────────────────────────────
+// The conversational agent (Claude) formats replies in Markdown (**bold**,
+// *italic*, `code`, # headers, - bullets), but messages are sent with
+// parse_mode "HTML" — so raw Markdown shows literal ** and * to the user.
+// This converts the common Markdown Claude produces into Telegram-safe HTML.
+// Order matters: escape HTML special chars FIRST, then insert our own tags,
+// otherwise the <b>/<i> tags we add get escaped into &lt;b&gt;.
+// Telegram HTML supports only <b> <i> <u> <s> <code> <pre> <a> — no headers
+// or lists, so headers become bold lines and bullets become "• ".
+function mdToTelegramHtml(md) {
+  if (!md) return "";
+  let s = String(md);
+
+  // 1. Escape HTML special chars first.
+  s = s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  // 2. Fenced code blocks ```...``` → <pre> (before inline code).
+  s = s.replace(/```[a-zA-Z0-9]*\n?([\s\S]*?)```/g, (_m, code) => {
+    return `<pre>${code.replace(/\n$/, "")}</pre>`;
+  });
+
+  // 3. Inline code `code` → <code>
+  s = s.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+
+  // 4. Bold: **text** or __text__ → <b>
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  s = s.replace(/__([^_\n]+)__/g, "<b>$1</b>");
+
+  // 5. Italic: *text* or _text_ → <i> (after bold so ** pairs are consumed).
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*([^*]|$)/g, "$1<i>$2</i>$3");
+  s = s.replace(/(^|[^_])_([^_\n]+)_([^_]|$)/g, "$1<i>$2</i>$3");
+
+  // 6. Markdown headers (#, ##, ###) → bold line.
+  s = s.replace(/^#{1,6}\s+(.+)$/gm, "<b>$1</b>");
+
+  // 7. Bullet markers at line start (-, *, +) → "• ".
+  s = s.replace(/^[ \t]*[-*+]\s+/gm, "• ");
+
+  // 8. Markdown links [text](url) → <a href="url">text</a>
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2">$1</a>');
+
+  return s;
+}
+
 function renderClickableName(name, deeplinkUrl) {
   const safeName = esc(name);
   if (!deeplinkUrl) return `<b>${safeName}</b>`;
@@ -1027,7 +1071,7 @@ async function renderAgentResult(ctx, statusMsg, result) {
     const text = (result.text && result.text.trim())
       ? result.text
       : "(пустой ответ)";
-    await editAndSplit(ctx, statusMsg, esc(text) + budgetNote);
+    await editAndSplit(ctx, statusMsg, mdToTelegramHtml(text) + budgetNote);
     return;
   }
 

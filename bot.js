@@ -38,6 +38,13 @@ const PAVEL_TG_ID = 156632707;
 
 const bot = new Bot(BOT_TOKEN);
 
+// Bot identity — filled from bot.botInfo once the bot starts (see bot.start()
+// below). Used by the group-chat handler to detect @BotUsername mentions.
+// grammy populates bot.botInfo during init(); ctx.me is unreliable across
+// versions, so we cache it here ourselves.
+let BOT_USERNAME = null;
+let BOT_ID       = null;
+
 process.on("uncaughtException", err => {
   console.error("[bot] Uncaught exception (ignored):", err.message);
 });
@@ -68,6 +75,46 @@ function whoIs(ctx) {
   if (id === PAVEL_TG_ID) return "pavel";
   if (ANTON_TG_ID && id === ANTON_TG_ID) return "anton";
   return "anton";
+}
+
+// ── Group-chat support ───────────────────────────────────────────────────────
+// The bot can live in a group (e.g. the Plexo sales chat) alongside Pavel and
+// Anton. In a group it must stay SILENT on normal chatter and only act when
+// explicitly addressed: an @-mention of the bot, a slash command, or a reply
+// to one of the bot's own messages. This keeps the agent (and its API spend)
+// off the founders' back-and-forth.
+
+function isGroupChat(ctx) {
+  const t = ctx.chat?.type;
+  return t === "group" || t === "supergroup";
+}
+
+// Strip a leading/anywhere @BotUsername mention from text. Returns the cleaned
+// text plus whether the bot was actually mentioned. botUsername comes from
+// bot.botInfo (populated by grammy at startup) — no hardcoding, no env needed.
+function stripBotMention(text, botUsername) {
+  const raw = String(text || "");
+  if (!botUsername) return { mentioned: false, text: raw };
+
+  // Case-insensitive @username match, as its own word.
+  const re = new RegExp(`@${botUsername}\\b`, "ig");
+  const mentioned = re.test(raw);
+  if (!mentioned) return { mentioned: false, text: raw };
+
+  // Remove every occurrence of the mention, then tidy whitespace.
+  const cleaned = raw.replace(re, " ").replace(/\s{2,}/g, " ").trim();
+  return { mentioned: true, text: cleaned };
+}
+
+// Decide whether a group message is addressed to the bot: an @-mention, or a
+// reply to one of the bot's own messages.
+function isAddressedToBotInGroup(ctx, botUsername, botId) {
+  const text = ctx.message?.text || "";
+  const { mentioned } = stripBotMention(text, botUsername);
+  if (mentioned) return true;
+  const replyTo = ctx.message?.reply_to_message;
+  if (replyTo && replyTo.from?.id === botId) return true;
+  return false;
 }
 
 // ── HTML escape ──────────────────────────────────────────────────────────────
@@ -1128,8 +1175,10 @@ async function renderAgentResult(ctx, statusMsg, result) {
 }
 
 // Handle a plain text message in conversational mode.
-async function handleConversation(ctx) {
-  const text = ctx.message?.text || "";
+// `overrideText` lets the caller pass already-cleaned text — e.g. in a group
+// the @BotUsername mention is stripped before the text reaches the agent.
+async function handleConversation(ctx, overrideText) {
+  const text = (overrideText != null ? overrideText : ctx.message?.text) || "";
   const from = whoIs(ctx);
   const fromUserId = ctx.from?.id;
 
@@ -1536,11 +1585,41 @@ bot.command("budget", ctx => guard(ctx, () => {
 
 bot.on("message:text", ctx => guard(ctx, () => {
   const text = ctx.message?.text || "";
-
-  // Slash commands that weren't matched by a bot.command() handler above
-  // (e.g. a typo'd /foo). Keep old behavior — show the command list.
   const isSlash = text.trim().startsWith("/");
 
+  // ── Group chats ────────────────────────────────────────────────────────────
+  // In a group the bot must NOT react to the founders' normal chatter. It acts
+  // only when addressed: a slash command, an @-mention, or a reply to the bot.
+  // Anything else → stay completely silent (return without sending).
+  if (isGroupChat(ctx)) {
+    // Slash commands in groups are already handled by bot.command() above;
+    // an unmatched slash command here we simply ignore (no "Команды:" spam).
+    if (isSlash) return;
+
+    const botUsername = BOT_USERNAME;
+    const botId       = BOT_ID;
+
+    if (!isAddressedToBotInGroup(ctx, botUsername, botId)) {
+      // Normal group chatter — not for the bot. Silent.
+      return;
+    }
+
+    if (!CONVERSATIONAL_MODE) {
+      // Addressed, but chat mode is off — give a short hint, don't go silent
+      // (the user explicitly tagged the bot, they deserve a reply).
+      return ctx.reply("Чат-режим выключен — отвечаю только на команды (/today, /ping, ...).");
+    }
+
+    // Addressed + chat mode on → strip the @mention, route the rest to agent.
+    const { text: cleaned } = stripBotMention(text, botUsername);
+    if (!cleaned) {
+      // Bare "@RemiDe_SalesOS_bot" with no actual request.
+      return ctx.reply("Да? Напиши что нужно — например: «@" + (botUsername || "bot") + " добавь INXY в Notion».");
+    }
+    return handleConversation(ctx, cleaned);
+  }
+
+  // ── Private chats (1:1) — original behavior ────────────────────────────────
   if (CONVERSATIONAL_MODE && !isSlash) {
     // Route to the Claude agent
     return handleConversation(ctx);
@@ -1608,7 +1687,12 @@ console.log(`[bot] Anton TG ID: ${ANTON_TG_ID || "(not set)"}`);
 console.log(`[bot] Morning push recipients: ${MORNING_PUSH_USERS.join(",") || "(none)"}`);
 console.log(`[bot] Conversational mode: ${CONVERSATIONAL_MODE ? "ENABLED" : "disabled"}`);
 bot.start().then(() => {
+  if (bot.botInfo) {
+    BOT_USERNAME = bot.botInfo.username || null;
+    BOT_ID       = bot.botInfo.id || null;
+  }
   console.log(`[bot] Loop OS FCC ${VERSION} started at ${STARTED_AT.toISOString()}`);
+  console.log(`[bot] Bot identity: @${BOT_USERNAME || "?"} (id ${BOT_ID || "?"})`);
 }).catch(err => {
   console.error("[bot] Start error (non-fatal):", err.message);
 });

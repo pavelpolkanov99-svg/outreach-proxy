@@ -1311,6 +1311,7 @@ bot.command("ping", ctx => guard(ctx, () => {
     `Uptime: ${uptimeStr}\n` +
     `Server: ${now.toISOString()}\n` +
     `Chat mode: ${CONVERSATIONAL_MODE ? "ON" : "OFF"}\n` +
+    `Bot: @${BOT_USERNAME || "?"}\n` +
     `Anton TG ID: ${ANTON_TG_ID || "не задан (env ANTON_TG_ID)"}\n` +
     `Your TG ID: ${ctx.from?.id}`
   );
@@ -1613,7 +1614,7 @@ bot.on("message:text", ctx => guard(ctx, () => {
     // Addressed + chat mode on → strip the @mention, route the rest to agent.
     const { text: cleaned } = stripBotMention(text, botUsername);
     if (!cleaned) {
-      // Bare "@RemiDe_SalesOS_bot" with no actual request.
+      // Bare "@RemideSalesOSBot" with no actual request.
       return ctx.reply("Да? Напиши что нужно — например: «@" + (botUsername || "bot") + " добавь INXY в Notion».");
     }
     return handleConversation(ctx, cleaned);
@@ -1686,13 +1687,25 @@ console.log(`[bot] Proxy URL: ${PROXY}`);
 console.log(`[bot] Anton TG ID: ${ANTON_TG_ID || "(not set)"}`);
 console.log(`[bot] Morning push recipients: ${MORNING_PUSH_USERS.join(",") || "(none)"}`);
 console.log(`[bot] Conversational mode: ${CONVERSATIONAL_MODE ? "ENABLED" : "disabled"}`);
-bot.start().then(() => {
-  if (bot.botInfo) {
-    BOT_USERNAME = bot.botInfo.username || null;
-    BOT_ID       = bot.botInfo.id || null;
+// Resolve bot identity BEFORE starting the poller. bot.init() fetches
+// botInfo (getMe) and resolves; bot.start() runs the long-polling loop and
+// for a polling bot its promise never resolves, so a .then() on it would
+// never run — which previously left BOT_USERNAME null and broke @-mention
+// detection in groups. So: await init() first, cache identity, then start.
+(async () => {
+  try {
+    await bot.init();
+    if (bot.botInfo) {
+      BOT_USERNAME = bot.botInfo.username || null;
+      BOT_ID       = bot.botInfo.id || null;
+    }
+    console.log(`[bot] Bot identity: @${BOT_USERNAME || "?"} (id ${BOT_ID || "?"})`);
+  } catch (err) {
+    console.error("[bot] bot.init() failed — @-mentions in groups may not work:", err.message);
   }
+
   console.log(`[bot] Loop OS FCC ${VERSION} started at ${STARTED_AT.toISOString()}`);
-  console.log(`[bot] Bot identity: @${BOT_USERNAME || "?"} (id ${BOT_ID || "?"})`);
-}).catch(err => {
-  console.error("[bot] Start error (non-fatal):", err.message);
-});
+  bot.start().catch(err => {
+    console.error("[bot] Start error (non-fatal):", err.message);
+  });
+})();

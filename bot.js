@@ -7,10 +7,13 @@ const agent          = require("./lib/agent");
 const approvalFlow   = require("./lib/approval-flow");
 const conversationStore = require("./lib/conversation-store");
 
+// ── Test fixture (no Apify spend) ─────────────────────────────────────────────
+const TEST_POSTS = require("./lib/comment-test-posts");
+
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.24.0-comments";
+const VERSION      = "4.24.1-comments-test";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -774,6 +777,37 @@ function buildCommentKeyboard(cardId) {
   };
 }
 
+// Send pre-generated cards to a user (shared by /comments and /comments_test)
+async function sendCommentCardsToUser(userId, cards) {
+  if (!cards.length) {
+    await bot.api.sendMessage(userId,
+      `💬 <b>LinkedIn Comments</b>\n\n<i>Нет релевантных постов сегодня.</i>`,
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  await bot.api.sendMessage(userId,
+    `💬 <b>LinkedIn Comments</b> · ${cards.length} постов\n<i>Нажми 1️⃣ 2️⃣ 3️⃣ чтобы апрувнуть, ✕ чтобы пропустить</i>`,
+    { parse_mode: "HTML" }
+  );
+
+  for (let i = 0; i < cards.length; i++) {
+    const card   = cards[i];
+    const cardId = storeCommentCard(card, userId);
+    const text   = buildCommentCardText(card, i + 1, cards.length);
+    try {
+      await bot.api.sendMessage(userId, text, {
+        parse_mode: "HTML",
+        link_preview_options: { is_disabled: true },
+        reply_markup: buildCommentKeyboard(cardId),
+      });
+    } catch (err) {
+      console.error(`[bot] failed to send card ${i + 1}:`, err.message);
+    }
+  }
+}
+
 async function fetchAndSendCommentCards(userId, maxCards = 7) {
   await bot.api.sendMessage(userId,
     `💬 <b>LinkedIn Comments</b> — подбираю посты (~60s)...`,
@@ -803,33 +837,7 @@ async function fetchAndSendCommentCards(userId, maxCards = 7) {
     return;
   }
 
-  if (!cards.length) {
-    await bot.api.sendMessage(userId,
-      `💬 <b>LinkedIn Comments</b>\n\n<i>Нет релевантных постов сегодня.</i>`,
-      { parse_mode: "HTML" }
-    );
-    return;
-  }
-
-  await bot.api.sendMessage(userId,
-    `💬 <b>LinkedIn Comments</b> · найдено ${cards.length} постов\n<i>Нажми 1️⃣ 2️⃣ 3️⃣ чтобы апрувнуть комментарий, ✕ чтобы пропустить</i>`,
-    { parse_mode: "HTML" }
-  );
-
-  for (let i = 0; i < cards.length; i++) {
-    const card   = cards[i];
-    const cardId = storeCommentCard(card, userId);
-    const text   = buildCommentCardText(card, i + 1, cards.length);
-    try {
-      await bot.api.sendMessage(userId, text, {
-        parse_mode: "HTML",
-        link_preview_options: { is_disabled: true },
-        reply_markup: buildCommentKeyboard(cardId),
-      });
-    } catch (err) {
-      console.error(`[bot] failed to send card ${i + 1}:`, err.message);
-    }
-  }
+  await sendCommentCardsToUser(userId, cards);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -933,7 +941,7 @@ bot.command("start", ctx => guard(ctx, () => {
     `🤖 Loop OS — Founder Command Center\n\nВерсия: ${VERSION}\n${convLine}\nКоманды:\n` +
     `/ping — health check\n/today — дайджест на сегодня\n/details — полные данные\n/full — всё\n` +
     `/yesterday — что было вчера\n/digest — отправить Anton'у\n/tasks — задачи\n/stale — заглохшие сделки\n` +
-    `/replies — ждут ответа\n/comments — LinkedIn комментарии на апрув\n` +
+    `/replies — ждут ответа\n/comments — LinkedIn комментарии\n/comments_test — тест на фикстуре (без Apify)\n` +
     (CONVERSATIONAL_MODE ? `/new — сбросить контекст\n/budget — расход\n` : "") +
     `\nАвто:\n• Утренний дайджест 08:30 CET\n• LinkedIn комментарии 09:00 CET\n• CRM auto-prewarm 23:00 и 08:00 CET`,
     { parse_mode: "HTML" }
@@ -1085,12 +1093,57 @@ bot.command("replies", ctx => guard(ctx, async () => {
   }
 }));
 
-// ── /comments — LinkedIn comment approval cards ───────────────────────────────
+// ── /comments — LinkedIn comment approval cards (live Apify) ─────────────────
 bot.command("comments", ctx => guard(ctx, async () => {
   const userId = ctx.from?.id;
   fetchAndSendCommentCards(userId, 7).catch(err => {
     console.error("[bot /comments] error:", err.message);
   });
+}));
+
+// ── /comments_test — same flow but uses hardcoded fixture (no Apify spend) ───
+bot.command("comments_test", ctx => guard(ctx, async () => {
+  const userId = ctx.from?.id;
+  const loadingMsg = await ctx.reply(
+    `🧪 <b>Comments Test</b> — генерирую на фикстуре (7 постов, без Apify)...`,
+    { parse_mode: "HTML" }
+  );
+
+  try {
+    const batchRes = await axios.post(`${PROXY}/comments/batch`,
+      { posts: TEST_POSTS.map(p => ({
+          id:          p.id,
+          url:         p.url,
+          text:        p.text,
+          authorName:  p.authorName,
+          authorTitle: p.authorTitle || "",
+          company:     p.company || "",
+        })),
+        maxCards: 7,
+      },
+      { timeout: 180_000 }
+    );
+
+    if (!batchRes.data?.ok) throw new Error(batchRes.data?.error || "Batch failed");
+    const cards = batchRes.data.cards || [];
+
+    await ctx.api.editMessageText(
+      ctx.chat.id, loadingMsg.message_id,
+      `🧪 <b>Comments Test</b> — готово, ${cards.length} карточек`,
+      { parse_mode: "HTML" }
+    );
+
+    await sendCommentCardsToUser(userId, cards);
+  } catch (err) {
+    console.error("[bot /comments_test] error:", err.message);
+    try {
+      await ctx.api.editMessageText(
+        ctx.chat.id, loadingMsg.message_id,
+        `❌ Ошибка: ${esc(err.message)}`,
+        { parse_mode: "HTML" }
+      );
+    } catch (_) {}
+  }
 }));
 
 bot.command("new", ctx => guard(ctx, () => {
@@ -1144,13 +1197,13 @@ bot.on("message:text", ctx => guard(ctx, () => {
 
   if (CONVERSATIONAL_MODE && !isSlash) return handleConversation(ctx);
   return ctx.reply(
-    `Команды:\n/start  /ping  /today  /details  /full  /yesterday  /digest  /tasks  /stale  /replies  /comments` +
+    `Команды:\n/start  /ping  /today  /details  /full  /yesterday  /digest  /tasks  /stale  /replies  /comments  /comments_test` +
     (CONVERSATIONAL_MODE ? `  /new  /budget` : "")
   );
 }));
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Callback query handler — handles both approval flow AND comment cards
+// Callback query handler
 // ─────────────────────────────────────────────────────────────────────────────
 
 bot.on("callback_query:data", async (ctx) => {
@@ -1158,26 +1211,19 @@ bot.on("callback_query:data", async (ctx) => {
 
   const data = ctx.callbackQuery?.data || "";
 
-  // ── Comment card callbacks (cc:cardId:decision) ───────────────────────────
   if (data.startsWith("cc:")) {
     const parts = data.split(":");
     const cardId   = parts[1];
-    const decision = parts[2]; // "1", "2", "3", "skip"
+    const decision = parts[2];
 
     const entry = commentCards.get(cardId);
-    if (!entry) {
-      return ctx.answerCallbackQuery({ text: "⏱ Карточка устарела" });
-    }
-    if (entry.resolved) {
-      return ctx.answerCallbackQuery({ text: "Уже обработано" });
-    }
+    if (!entry) return ctx.answerCallbackQuery({ text: "⏱ Карточка устарела" });
+    if (entry.resolved) return ctx.answerCallbackQuery({ text: "Уже обработано" });
     entry.resolved = true;
 
     if (decision === "skip") {
       await ctx.answerCallbackQuery({ text: "✕ Пропущено" });
-      try {
-        await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
-      } catch (_) {}
+      try { await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }); } catch (_) {}
       return;
     }
 
@@ -1186,27 +1232,17 @@ bot.on("callback_query:data", async (ctx) => {
     if (!draft) return ctx.answerCallbackQuery({ text: "Вариант не найден" });
 
     await ctx.answerCallbackQuery({ text: `✅ Вариант ${draftN} выбран` });
+    try { await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } }); } catch (_) {}
 
-    // Remove keyboard, show selected draft
-    try {
-      await ctx.editMessageReplyMarkup({ reply_markup: { inline_keyboard: [] } });
-    } catch (_) {}
-
-    const authorName = entry.card.authorName || "";
-    const postUrl    = entry.card.postUrl || "";
-    const mention    = authorName ? `@${authorName.replace(/\s+/g, "")}` : "";
-
+    const postUrl = entry.card.postUrl || "";
     await ctx.reply(
-      `✅ <b>Выбран вариант ${draftN}</b>\n\n` +
-      `<i>Текст комментария:</i>\n${esc(draft.text)}\n\n` +
-      (mention ? `<i>Упомянуть: ${esc(mention)}</i>\n` : "") +
-      (postUrl ? `<a href="${esc(postUrl)}">🔗 Открыть пост для ручного постинга</a>` : "<i>URL поста не сохранён</i>"),
+      `✅ <b>Вариант ${draftN}</b>\n\n${esc(draft.text)}\n\n` +
+      (postUrl ? `<a href="${esc(postUrl)}">🔗 Открыть пост для постинга</a>` : "<i>URL поста недоступен</i>"),
       { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
     );
     return;
   }
 
-  // ── Approval flow callbacks ───────────────────────────────────────────────
   if (!CONVERSATIONAL_MODE) return ctx.answerCallbackQuery();
   try {
     await handleApprovalCallback(ctx);

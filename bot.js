@@ -13,7 +13,7 @@ const TEST_POSTS = require("./lib/comment-test-posts");
 // ── Config ────────────────────────────────────────────────────────────────────
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.24.1-comments-test";
+const VERSION      = "4.25.0-group";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -23,6 +23,11 @@ const ALLOWED_USERS = (process.env.ALLOWED_USERS || "")
 
 const MORNING_PUSH_USERS = (process.env.MORNING_PUSH_USERS || "156632707")
   .split(",").map(s => parseInt(s.trim())).filter(Boolean);
+
+// Group chat for cron pushes — set GROUP_CHAT_ID env var in Railway
+const GROUP_CHAT_ID = process.env.GROUP_CHAT_ID
+  ? parseInt(process.env.GROUP_CHAT_ID.trim(), 10)
+  : null;
 
 const ANTON_TG_ID = process.env.ANTON_TG_ID
   ? parseInt(process.env.ANTON_TG_ID.trim(), 10)
@@ -184,11 +189,25 @@ async function editAndSplit(ctx, loadingMsg, fullText, opts = {}) {
   }
 }
 
-async function sendSplit(userId, fullText, opts = {}) {
+async function sendSplit(chatId, fullText, opts = {}) {
   const chunks = splitForTelegram(fullText);
   const sendOpts = { parse_mode: "HTML", link_preview_options: { is_disabled: true }, ...opts };
   for (const chunk of chunks) {
-    await bot.api.sendMessage(userId, chunk, sendOpts);
+    await bot.api.sendMessage(chatId, chunk, sendOpts);
+  }
+}
+
+// Send to all push targets: personal users + group (if configured)
+async function sendToAllTargets(text, label = "push") {
+  const targets = [...MORNING_PUSH_USERS];
+  if (GROUP_CHAT_ID && !targets.includes(GROUP_CHAT_ID)) targets.push(GROUP_CHAT_ID);
+  for (const chatId of targets) {
+    try {
+      await sendSplit(chatId, text);
+      console.log(`[cron] ${label} sent to ${chatId}`);
+    } catch (err) {
+      console.error(`[cron] ${label} to ${chatId} failed:`, err.message);
+    }
   }
 }
 
@@ -777,7 +796,6 @@ function buildCommentKeyboard(cardId) {
   };
 }
 
-// Send pre-generated cards to a user (shared by /comments and /comments_test)
 async function sendCommentCardsToUser(userId, cards) {
   if (!cards.length) {
     await bot.api.sendMessage(userId,
@@ -941,9 +959,10 @@ bot.command("start", ctx => guard(ctx, () => {
     `🤖 Loop OS — Founder Command Center\n\nВерсия: ${VERSION}\n${convLine}\nКоманды:\n` +
     `/ping — health check\n/today — дайджест на сегодня\n/details — полные данные\n/full — всё\n` +
     `/yesterday — что было вчера\n/digest — отправить Anton'у\n/tasks — задачи\n/stale — заглохшие сделки\n` +
-    `/replies — ждут ответа\n/comments — LinkedIn комментарии\n/comments_test — тест на фикстуре (без Apify)\n` +
+    `/replies — ждут ответа\n/comments — LinkedIn комментарии\n/comments_test — тест (без Apify)\n` +
+    `/test_push — тест крона в группу прямо сейчас\n` +
     (CONVERSATIONAL_MODE ? `/new — сбросить контекст\n/budget — расход\n` : "") +
-    `\nАвто:\n• Утренний дайджест 08:30 CET\n• LinkedIn комментарии 09:00 CET\n• CRM auto-prewarm 23:00 и 08:00 CET`,
+    `\nАвто:\n• Утренний дайджест 08:30 CET → личка + группа\n• LinkedIn комментарии 09:00 CET → личка\n• CRM auto-prewarm 23:00 и 08:00 CET`,
     { parse_mode: "HTML" }
   );
 }));
@@ -955,7 +974,7 @@ bot.command("ping", ctx => guard(ctx, () => {
   return ctx.reply(
     `🏓 pong\n\nВерсия: ${VERSION}\nUptime: ${uptimeStr}\nServer: ${now.toISOString()}\n` +
     `Chat mode: ${CONVERSATIONAL_MODE ? "ON" : "OFF"}\nBot: @${BOT_USERNAME || "?"}\n` +
-    `Anton TG ID: ${ANTON_TG_ID || "не задан (env ANTON_TG_ID)"}\nYour TG ID: ${ctx.from?.id}`
+    `Anton TG ID: ${ANTON_TG_ID || "не задан"}\nGroup chat ID: ${GROUP_CHAT_ID || "не задан (env GROUP_CHAT_ID)"}\nYour TG ID: ${ctx.from?.id}`
   );
 }));
 
@@ -1093,7 +1112,6 @@ bot.command("replies", ctx => guard(ctx, async () => {
   }
 }));
 
-// ── /comments — LinkedIn comment approval cards (live Apify) ─────────────────
 bot.command("comments", ctx => guard(ctx, async () => {
   const userId = ctx.from?.id;
   fetchAndSendCommentCards(userId, 7).catch(err => {
@@ -1101,48 +1119,61 @@ bot.command("comments", ctx => guard(ctx, async () => {
   });
 }));
 
-// ── /comments_test — same flow but uses hardcoded fixture (no Apify spend) ───
 bot.command("comments_test", ctx => guard(ctx, async () => {
   const userId = ctx.from?.id;
   const loadingMsg = await ctx.reply(
     `🧪 <b>Comments Test</b> — генерирую на фикстуре (7 постов, без Apify)...`,
     { parse_mode: "HTML" }
   );
-
   try {
     const batchRes = await axios.post(`${PROXY}/comments/batch`,
       { posts: TEST_POSTS.map(p => ({
-          id:          p.id,
-          url:         p.url,
-          text:        p.text,
-          authorName:  p.authorName,
-          authorTitle: p.authorTitle || "",
-          company:     p.company || "",
+          id: p.id, url: p.url, text: p.text,
+          authorName: p.authorName, authorTitle: p.authorTitle || "", company: p.company || "",
         })),
         maxCards: 7,
       },
       { timeout: 180_000 }
     );
-
     if (!batchRes.data?.ok) throw new Error(batchRes.data?.error || "Batch failed");
     const cards = batchRes.data.cards || [];
-
-    await ctx.api.editMessageText(
-      ctx.chat.id, loadingMsg.message_id,
-      `🧪 <b>Comments Test</b> — готово, ${cards.length} карточек`,
-      { parse_mode: "HTML" }
-    );
-
+    await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id,
+      `🧪 <b>Comments Test</b> — готово, ${cards.length} карточек`, { parse_mode: "HTML" });
     await sendCommentCardsToUser(userId, cards);
   } catch (err) {
     console.error("[bot /comments_test] error:", err.message);
-    try {
-      await ctx.api.editMessageText(
-        ctx.chat.id, loadingMsg.message_id,
-        `❌ Ошибка: ${esc(err.message)}`,
-        { parse_mode: "HTML" }
-      );
-    } catch (_) {}
+    try { await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(err.message)}`, { parse_mode: "HTML" }); } catch (_) {}
+  }
+}));
+
+// ── /test_push — немедленно шлёт дайджест в личку + группу для проверки ──────
+bot.command("test_push", ctx => guard(ctx, async () => {
+  const loadingMsg = await ctx.reply("⏳ Тестирую push в группу...", { parse_mode: "HTML" });
+  try {
+    const data = await fetchLeanDigestData();
+    const customHeader = `🧪 <b>Test Push</b> · проверка крона\n\n${buildLeanHeader()}`;
+    const text = composeLeanDigest(data, { customHeader });
+
+    const targets = [...MORNING_PUSH_USERS];
+    if (GROUP_CHAT_ID && !targets.includes(GROUP_CHAT_ID)) targets.push(GROUP_CHAT_ID);
+
+    const results = [];
+    for (const chatId of targets) {
+      try {
+        await sendSplit(chatId, text);
+        results.push(`✅ ${chatId}`);
+      } catch (err) {
+        results.push(`❌ ${chatId}: ${err.message}`);
+      }
+    }
+
+    await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id,
+      `🧪 <b>Test Push готово</b>\n\n${results.join("\n")}`,
+      { parse_mode: "HTML" }
+    );
+  } catch (err) {
+    const errMsg = err.response?.data?.error || err.message;
+    try { await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(errMsg)}`); } catch (_) {}
   }
 }));
 
@@ -1176,10 +1207,6 @@ bot.command("budget", ctx => guard(ctx, () => {
   }
 }));
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Message handler
-// ─────────────────────────────────────────────────────────────────────────────
-
 bot.on("message:text", ctx => guard(ctx, () => {
   const text = ctx.message?.text || "";
   const isSlash = text.trim().startsWith("/");
@@ -1197,14 +1224,10 @@ bot.on("message:text", ctx => guard(ctx, () => {
 
   if (CONVERSATIONAL_MODE && !isSlash) return handleConversation(ctx);
   return ctx.reply(
-    `Команды:\n/start  /ping  /today  /details  /full  /yesterday  /digest  /tasks  /stale  /replies  /comments  /comments_test` +
+    `Команды:\n/start  /ping  /today  /details  /full  /yesterday  /digest  /tasks  /stale  /replies  /comments  /comments_test  /test_push` +
     (CONVERSATIONAL_MODE ? `  /new  /budget` : "")
   );
 }));
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Callback query handler
-// ─────────────────────────────────────────────────────────────────────────────
 
 bot.on("callback_query:data", async (ctx) => {
   if (!isAllowed(ctx)) return ctx.answerCallbackQuery({ text: "⛔ Access denied" });
@@ -1261,23 +1284,20 @@ bot.catch(err => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function sendMorningPush() {
-  if (MORNING_PUSH_USERS.length === 0) { console.log("[cron] morning push skipped — no recipients"); return; }
-  console.log(`[cron] morning push start, recipients: ${MORNING_PUSH_USERS.join(",")}`);
+  console.log("[cron] morning push start");
   try {
     const data = await fetchLeanDigestData();
     const text = composeLeanDigest(data);
-    for (const userId of MORNING_PUSH_USERS) {
-      try { await sendSplit(userId, text); console.log(`[cron] morning push sent to ${userId}`); }
-      catch (err) { console.error(`[cron] morning push to ${userId} failed:`, err.message); }
-    }
-  } catch (err) { console.error("[cron] morning push aggregate failed:", err.message); }
+    await sendToAllTargets(text, "morning-push");
+  } catch (err) {
+    console.error("[cron] morning push failed:", err.message);
+  }
 }
 
 async function sendCommentsPush() {
-  const recipients = MORNING_PUSH_USERS;
-  if (!recipients.length) { console.log("[cron] comments push skipped — no recipients"); return; }
-  console.log(`[cron] comments push start, recipients: ${recipients.join(",")}`);
-  for (const userId of recipients) {
+  console.log("[cron] comments push start");
+  // Comments cards go to personal users only (approval flow needs 1:1 chat)
+  for (const userId of MORNING_PUSH_USERS) {
     try {
       await fetchAndSendCommentCards(userId, 7);
       console.log(`[cron] comments push sent to ${userId}`);
@@ -1289,8 +1309,8 @@ async function sendCommentsPush() {
 
 cron.schedule("30 8 * * *", sendMorningPush,  { timezone: "Europe/Prague" });
 cron.schedule("0 9 * * *",  sendCommentsPush, { timezone: "Europe/Prague" });
-console.log("[cron] morning push registered (08:30 Europe/Prague)");
-console.log("[cron] comments push registered (09:00 Europe/Prague)");
+console.log("[cron] morning push registered (08:30 Europe/Prague → личка + группа)");
+console.log("[cron] comments push registered (09:00 Europe/Prague → личка)");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Start
@@ -1300,6 +1320,7 @@ console.log(`[bot] Loop OS FCC ${VERSION} starting...`);
 console.log(`[bot] Proxy URL: ${PROXY}`);
 console.log(`[bot] Anton TG ID: ${ANTON_TG_ID || "(not set)"}`);
 console.log(`[bot] Morning push recipients: ${MORNING_PUSH_USERS.join(",") || "(none)"}`);
+console.log(`[bot] Group chat ID: ${GROUP_CHAT_ID || "(not set — set GROUP_CHAT_ID env)"}`);
 console.log(`[bot] Conversational mode: ${CONVERSATIONAL_MODE ? "ENABLED" : "disabled"}`);
 
 (async () => {

@@ -34,6 +34,7 @@ app.use("/mcp",            require("./routes/mcp"));
 app.use("/messaging-hub",  require("./routes/messaging-hub"));
 app.use("/yesterday",      require("./routes/yesterday"));
 app.use("/today",          require("./routes/today-lean")); // ← v4.20 /today/lean
+app.use("/apify",          require("./routes/apify"));      // ← LinkedIn post scraping
 
 // ── Beeper sync job (mounted under /beeper/*) ─────────────────────────────────
 const beeperSync = require("./jobs/beeper-sync");
@@ -61,11 +62,12 @@ app.get("/health", (_, res) => {
     github:   !!GITHUB_PAT,
     calendar: GOOGLE_OAUTH,
     apollo:   !!process.env.APOLLO_KEY,
+    apify:    !!process.env.APIFY_TOKEN,
     mcp:      true,
-    version:  "3.21.0",
+    version:  "3.22.0",
   });
 });
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.21.0", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.22.0", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

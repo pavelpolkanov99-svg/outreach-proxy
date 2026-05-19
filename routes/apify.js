@@ -49,20 +49,20 @@ router.post("/linkedin-posts", async (req, res) => {
   }
 
   const {
-    queries         = DEFAULT_QUERIES,
+    queries          = DEFAULT_QUERIES,
     maxPostsPerQuery = 15,
-    postedLimit     = "week",
-    authorsIndustry = DEFAULT_INDUSTRIES,
+    postedLimit      = "week",
+    authorsIndustry  = DEFAULT_INDUSTRIES,
   } = req.body || {};
 
   const input = {
-    searchQueries:       queries,
-    maxPostsPerQuery:    maxPostsPerQuery,
-    postedLimit:         postedLimit,
-    sortBy:              "date",
-    contentType:         "All",
-    authorsIndustryId:   authorsIndustry,
-    profileScraperMode:  "Short",
+    searchQueries:      queries,
+    maxPostsPerQuery:   maxPostsPerQuery,
+    postedLimit:        postedLimit,
+    sortBy:             "date",
+    contentType:        "all",          // lowercase — Apify enum requirement
+    authorsIndustryId:  authorsIndustry,
+    profileScraperMode: "Short",
   };
 
   try {
@@ -71,7 +71,7 @@ router.post("/linkedin-posts", async (req, res) => {
       `${APIFY_BASE}/acts/harvestapi~linkedin-post-search/run-sync-get-dataset-items`,
       input,
       {
-        params: { token: APIFY_TOKEN },
+        params:  { token: APIFY_TOKEN },
         headers: { "Content-Type": "application/json" },
         timeout: 130_000,
       }
@@ -80,7 +80,7 @@ router.post("/linkedin-posts", async (req, res) => {
     const raw = Array.isArray(runRes.data) ? runRes.data : [];
 
     // Deduplicate by post id — multiple queries can return the same post
-    const seen = new Set();
+    const seen  = new Set();
     const posts = [];
     for (const post of raw) {
       const id = post.id || post.postId || post.url;
@@ -90,22 +90,18 @@ router.post("/linkedin-posts", async (req, res) => {
         id:          post.id || post.postId,
         url:         post.url || post.postUrl,
         text:        post.text || post.content || "",
-        authorName:  post.authorName || post.author?.name || "",
+        authorName:  post.authorName  || post.author?.name  || "",
         authorTitle: post.authorTitle || post.author?.title || "",
-        authorUrl:   post.authorUrl  || post.author?.url  || "",
+        authorUrl:   post.authorUrl   || post.author?.url   || "",
         company:     post.companyName || post.author?.company || "",
         postedAt:    post.postedAt || post.date || null,
-        likes:       post.numLikes   || post.likes   || 0,
+        likes:       post.numLikes    || post.likes    || 0,
         comments:    post.numComments || post.comments || 0,
         reposts:     post.numReposts  || post.reposts  || 0,
       });
     }
 
-    return res.json({
-      ok:    true,
-      total: posts.length,
-      posts,
-    });
+    return res.json({ ok: true, total: posts.length, posts });
 
   } catch (err) {
     const status = err.response?.status;
@@ -117,15 +113,15 @@ router.post("/linkedin-posts", async (req, res) => {
 
 // ─── POST /apify/linkedin-reactions ──────────────────────────────────────────
 // Body params:
-//   postUrls  string[]  — LinkedIn post/comment URLs to check
-//   maxReactionsPerPost number — default 50
+//   postUrls            string[]  — LinkedIn post/comment URLs to check
+//   maxReactionsPerPost number    — default 50
 router.post("/linkedin-reactions", async (req, res) => {
   if (!APIFY_TOKEN) {
     return res.status(500).json({ ok: false, error: "APIFY_TOKEN not set" });
   }
 
   const {
-    postUrls = [],
+    postUrls            = [],
     maxReactionsPerPost = 50,
   } = req.body || {};
 
@@ -134,7 +130,7 @@ router.post("/linkedin-reactions", async (req, res) => {
   }
 
   const input = {
-    posts: postUrls,
+    posts:              postUrls,
     maxReactionsPerPost,
     profileScraperMode: "Short",
   };
@@ -144,7 +140,7 @@ router.post("/linkedin-reactions", async (req, res) => {
       `${APIFY_BASE}/acts/harvestapi~linkedin-post-reactions/run-sync-get-dataset-items`,
       input,
       {
-        params: { token: APIFY_TOKEN },
+        params:  { token: APIFY_TOKEN },
         headers: { "Content-Type": "application/json" },
         timeout: 60_000,
       }

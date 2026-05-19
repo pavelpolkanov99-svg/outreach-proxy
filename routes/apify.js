@@ -17,7 +17,6 @@ const router  = express.Router();
 const APIFY_TOKEN  = process.env.APIFY_TOKEN;
 const APIFY_BASE   = "https://api.apify.com/v2";
 
-// Default search config — overridable per-request
 const DEFAULT_QUERIES = [
   "stablecoins",
   "stablecoin settlement",
@@ -38,11 +37,6 @@ const DEFAULT_INDUSTRIES = [
 ];
 
 // ─── POST /apify/linkedin-posts ───────────────────────────────────────────────
-// Body params (all optional — defaults used if omitted):
-//   queries          string[]  — search keywords
-//   maxPostsPerQuery number    — default 15
-//   postedLimit      string    — "week" | "month" | "day" (default "week")
-//   authorsIndustry  string[]  — industry filters
 router.post("/linkedin-posts", async (req, res) => {
   if (!APIFY_TOKEN) {
     return res.status(500).json({ ok: false, error: "APIFY_TOKEN not set" });
@@ -60,13 +54,12 @@ router.post("/linkedin-posts", async (req, res) => {
     maxPostsPerQuery:   maxPostsPerQuery,
     postedLimit:        postedLimit,
     sortBy:             "date",
-    contentType:        "all",          // lowercase — Apify enum requirement
+    contentType:        "all",
     authorsIndustryId:  authorsIndustry,
-    profileScraperMode: "Short",
+    profileScraperMode: "short",   // lowercase — Apify enum requirement
   };
 
   try {
-    // Run the actor synchronously (waits until finished, up to 120s)
     const runRes = await axios.post(
       `${APIFY_BASE}/acts/harvestapi~linkedin-post-search/run-sync-get-dataset-items`,
       input,
@@ -79,7 +72,6 @@ router.post("/linkedin-posts", async (req, res) => {
 
     const raw = Array.isArray(runRes.data) ? runRes.data : [];
 
-    // Deduplicate by post id — multiple queries can return the same post
     const seen  = new Set();
     const posts = [];
     for (const post of raw) {
@@ -112,9 +104,6 @@ router.post("/linkedin-posts", async (req, res) => {
 });
 
 // ─── POST /apify/linkedin-reactions ──────────────────────────────────────────
-// Body params:
-//   postUrls            string[]  — LinkedIn post/comment URLs to check
-//   maxReactionsPerPost number    — default 50
 router.post("/linkedin-reactions", async (req, res) => {
   if (!APIFY_TOKEN) {
     return res.status(500).json({ ok: false, error: "APIFY_TOKEN not set" });
@@ -132,7 +121,7 @@ router.post("/linkedin-reactions", async (req, res) => {
   const input = {
     posts:              postUrls,
     maxReactionsPerPost,
-    profileScraperMode: "Short",
+    profileScraperMode: "short",   // lowercase
   };
 
   try {

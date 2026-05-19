@@ -1,7 +1,8 @@
 const express = require("express");
 const app     = express();
 
-app.use(express.json());
+// ── Body parser — 10mb limit to handle large Apify post batches ───────────────
+app.use(express.json({ limit: "10mb" }));
 
 // ── CORS ──────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -64,10 +65,10 @@ app.get("/health", (_, res) => {
     apify:    !!process.env.APIFY_TOKEN,
     comments: !!process.env.ANTHROPIC_API_KEY,
     mcp:      true,
-    version:  "3.23.0",
+    version:  "3.24.0",
   });
 });
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.23.0", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.24.0", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

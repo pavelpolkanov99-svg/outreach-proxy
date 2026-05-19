@@ -35,6 +35,7 @@ app.use("/messaging-hub",  require("./routes/messaging-hub"));
 app.use("/yesterday",      require("./routes/yesterday"));
 app.use("/today",          require("./routes/today-lean")); // ← v4.20 /today/lean
 app.use("/apify",          require("./routes/apify"));      // ← LinkedIn post scraping
+app.use("/comments",       require("./routes/comments"));   // ← Comment generation
 
 // ── Beeper sync job (mounted under /beeper/*) ─────────────────────────────────
 const beeperSync = require("./jobs/beeper-sync");
@@ -48,8 +49,6 @@ prewarmInsights.registerJobs();
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => {
-  // Beeper auth: prefer OAuth client_id presence + persisted token. Legacy env
-  // still counts as "configured" for backwards compat.
   const beeperAuth = require("./lib/beeper-auth");
   const beeperStatus = beeperAuth.authStatus();
   res.json({
@@ -63,11 +62,12 @@ app.get("/health", (_, res) => {
     calendar: GOOGLE_OAUTH,
     apollo:   !!process.env.APOLLO_KEY,
     apify:    !!process.env.APIFY_TOKEN,
+    comments: !!process.env.ANTHROPIC_API_KEY,
     mcp:      true,
-    version:  "3.22.0",
+    version:  "3.23.0",
   });
 });
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.22.0", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.23.0", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

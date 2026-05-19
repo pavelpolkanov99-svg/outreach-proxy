@@ -1,15 +1,4 @@
 // routes/comments.js
-//
-// LinkedIn comment generation endpoint for the daily approval cron.
-//
-// POST /comments/generate
-//   Takes one LinkedIn post (text + author metadata) and returns 3 comment
-//   drafts written in Anton's voice, grounded in S3/S4 sources, passing all
-//   6 editorial gates internally.
-//
-// POST /comments/batch
-//   Takes an array of posts (from /apify/linkedin-posts), runs relevance
-//   filtering, generates comments for top N, returns approval-ready cards.
 
 const express  = require("express");
 const axios    = require("axios");
@@ -19,7 +8,6 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ANTHROPIC_URL     = "https://api.anthropic.com/v1/messages";
 const MODEL             = "claude-sonnet-4-5";
 
-// ─── Plexo S4 context (hardcoded, never used promotionally in comments) ───────
 const PLEXO_S4 = `
 Plexo is a stablecoin clearing network for licensed financial institutions.
 Positioning: "SWIFT for stablecoins."
@@ -40,7 +28,6 @@ HARD RULE: Never mention Plexo by name in comments. Never pitch.
 S4 shows up as operator framing only: "we see this pattern", "I think", "curious if".
 `.trim();
 
-// ─── Comment generation system prompt (based on linkedin-comment SKILL.md) ───
 const COMMENT_SYSTEM_PROMPT = `
 You are generating LinkedIn comment drafts for Anton Titov, CEO of a stablecoin clearing company.
 Anton's voice: fast, concrete, slightly imperfect, opinionated. Like a founder who typed from a phone because the point mattered.
@@ -72,36 +59,23 @@ Draft 3 — Question/Discovery: open with a reframe of the post's claim, ask one
 - YES ellipsis for real pauses: "just a bit of controversy...", "and it just works... better than anything"
 - YES first-person: "I think", "we see this", "curious if"
 - YES short punchy closers: "Pain first, liquidity second, regulation third."
-- Calibration ceiling (most polished): "slight pushback: OpenFX had traction before GENIUS. Regulation adds legitimacy and speed, but the initial pull came from a very real pain point: intercompany cross-border FX flows."
-- Calibration floor (raw voice): "Just a bit of controversy... The traction of OpenFX has started before GENIUS popped out. It adds the legitimacy and speed up scaling, but do not power up it initially."
+- Calibration ceiling: "slight pushback: OpenFX had traction before GENIUS. Regulation adds legitimacy and speed, but the initial pull came from a very real pain point: intercompany cross-border FX flows."
+- Calibration floor: "Just a bit of controversy... The traction of OpenFX has started before GENIUS popped out. It adds the legitimacy and speed up scaling, but do not power up it initially."
 - Target: the space between. When in doubt, stay closer to the floor.
 
 ## TRUTH RULES
 - Public fact + analysis: always safe. Use freely.
 - Industry pattern: safe if widely known (UAT cycles, mobile money windows, weekend settlement gaps).
-- Personal experience ("We've seen 3 PSPs...", "I talked to 4 banks"): ONLY if actually happened. If unsure, rephrase as public fact or industry pattern.
-- Default to public facts and industry patterns. The comment can be personal without being fabricated.
+- Personal experience: ONLY if actually happened. If unsure, rephrase as public fact or industry pattern.
+- Default to public facts and industry patterns.
 
 ## GATE CHECKS (run internally, do NOT show in output)
-Before outputting, verify each draft passes ALL 6 gates:
-G5 (Alive): at least 1 phone-voice marker (ellipsis/fragment/casual softener). Zero em dashes.
+G5 (Alive): at least 1 phone-voice marker. Zero em dashes.
 G6 (Truth): All claims are public facts or industry patterns. No invented experience.
 G2 (Source Fidelity): Pins to THIS specific post. Would not fit a different post by same company.
-G1 (Bullshit): Delete first sentence — comment still loses info. No restatement, no triple-choice, no jargon soup.
+G1 (Bullshit): No restatement, no triple-choice, no jargon soup.
 G3 (Value): at least 1 specific number/mechanism/named entity NOT in original post.
 G4 (Interaction): Question specific enough that only someone with direct experience can answer. One path.
-
-If a draft fails any gate, rewrite it before outputting. Never output a failing draft.
-
-## DEADLY SINS (instant redraft)
-Sin 1: All 3 drafts share the same skeleton
-Sin 2: First sentence rephrases what the post already said
-Sin 3: Triple-choice question "which X: A, B, or C?"
-Sin 4: "From your perspective/side/view"
-Sin 5: Zero "I" or "we" in the comment
-Sin 6: Comment works equally well under a different post by same company
-Sin 7: Abstract nouns that survive the "stuff" test
-Sin 8: Fabricated experience claims
 
 ## OUTPUT FORMAT
 Return ONLY valid JSON. No markdown, no preamble, no explanation.
@@ -117,7 +91,6 @@ Return ONLY valid JSON. No markdown, no preamble, no explanation.
 }
 `.trim();
 
-// ─── Build user prompt for one post ──────────────────────────────────────────
 function buildPostPrompt(post) {
   const lines = [];
   lines.push("## POST TO COMMENT ON");
@@ -133,7 +106,6 @@ function buildPostPrompt(post) {
   return lines.join("\n");
 }
 
-// ─── Call Claude API ──────────────────────────────────────────────────────────
 async function generateComments(post) {
   if (!ANTHROPIC_API_KEY) throw new Error("ANTHROPIC_API_KEY not set");
 
@@ -143,9 +115,7 @@ async function generateComments(post) {
       model:      MODEL,
       max_tokens: 1500,
       system:     COMMENT_SYSTEM_PROMPT,
-      messages: [
-        { role: "user", content: buildPostPrompt(post) }
-      ],
+      messages: [{ role: "user", content: buildPostPrompt(post) }],
     },
     {
       headers: {
@@ -157,9 +127,7 @@ async function generateComments(post) {
     }
   );
 
-  const raw = response.data?.content?.[0]?.text || "";
-
-  // Strip markdown code fences if present
+  const raw   = response.data?.content?.[0]?.text || "";
   const clean = raw.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
 
   let parsed;
@@ -168,11 +136,9 @@ async function generateComments(post) {
   } catch (e) {
     throw new Error(`Claude returned invalid JSON: ${clean.slice(0, 200)}`);
   }
-
   return parsed;
 }
 
-// ─── Relevance filter ─────────────────────────────────────────────────────────
 const RELEVANCE_KEYWORDS = [
   "stablecoin", "usdc", "usdt", "crypto", "blockchain", "defi",
   "cross-border", "cross border", "remittance", "payment", "fintech",
@@ -183,11 +149,10 @@ const RELEVANCE_KEYWORDS = [
 ];
 
 function isRelevant(post) {
-  const text = (post.text || "").toLowerCase();
+  const text   = (post.text || "").toLowerCase();
   const strong = ["stablecoin", "usdc", "usdt", "cross-border", "cbdc", "swift"];
   if (strong.some(kw => text.includes(kw))) return true;
-  const matches = RELEVANCE_KEYWORDS.filter(kw => text.includes(kw));
-  return matches.length >= 2;
+  return RELEVANCE_KEYWORDS.filter(kw => text.includes(kw)).length >= 2;
 }
 
 function isCommentable(post) {
@@ -204,7 +169,6 @@ router.post("/generate", async (req, res) => {
   if (!post?.text) {
     return res.status(400).json({ ok: false, error: "post.text required" });
   }
-
   try {
     const result = await generateComments(post);
     return res.json({
@@ -224,8 +188,11 @@ router.post("/generate", async (req, res) => {
 });
 
 // ─── POST /comments/batch ─────────────────────────────────────────────────────
+// Accepts both { posts: [...] } and Apify wrapper { ok: true, posts: [...] }
 router.post("/batch", async (req, res) => {
-  const { posts = [], maxCards = 7 } = req.body || {};
+  const body     = req.body || {};
+  const posts    = Array.isArray(body) ? body : (body.posts || []);
+  const maxCards = body.maxCards || 7;
 
   if (!posts.length) {
     return res.status(400).json({ ok: false, error: "posts array required" });

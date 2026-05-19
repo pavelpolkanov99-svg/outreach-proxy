@@ -1,14 +1,4 @@
 // routes/apify.js
-//
-// Apify LinkedIn scraping endpoints for the daily comment cron.
-//
-// POST /apify/linkedin-posts
-//   Runs harvestapi/linkedin-post-search actor synchronously (waits for result).
-//   Returns deduplicated posts array ready for comment generation.
-//
-// POST /apify/linkedin-reactions
-//   Runs harvestapi/linkedin-post-reactions actor to check engagement on a
-//   posted comment URL. Used in the 24h watch loop.
 
 const express = require("express");
 const axios   = require("axios");
@@ -36,6 +26,20 @@ const DEFAULT_INDUSTRIES = [
   "Banking",
 ];
 
+// Build LinkedIn post URL from post id if no direct URL field available
+function buildLinkedInUrl(post) {
+  // Try all known URL fields first
+  const direct = post.url || post.postUrl || post.link || post.postLink
+    || post.shareUrl || post.permalinkUrl || post.post_url;
+  if (direct) return direct;
+
+  // Construct from id — LinkedIn activity URL format
+  const id = post.id || post.postId || post.activityId;
+  if (id) return `https://www.linkedin.com/feed/update/urn:li:activity:${id}/`;
+
+  return null;
+}
+
 // ─── POST /apify/linkedin-posts ───────────────────────────────────────────────
 router.post("/linkedin-posts", async (req, res) => {
   if (!APIFY_TOKEN) {
@@ -56,7 +60,7 @@ router.post("/linkedin-posts", async (req, res) => {
     sortBy:             "date",
     contentType:        "all",
     authorsIndustryId:  authorsIndustry,
-    profileScraperMode: "short",   // lowercase — Apify enum requirement
+    profileScraperMode: "short",
   };
 
   try {
@@ -72,24 +76,44 @@ router.post("/linkedin-posts", async (req, res) => {
 
     const raw = Array.isArray(runRes.data) ? runRes.data : [];
 
+    // Log first post keys to help debug field names
+    if (raw.length > 0) {
+      console.log("[apify] first post keys:", Object.keys(raw[0]).join(", "));
+      console.log("[apify] first post sample:", JSON.stringify({
+        id: raw[0].id,
+        postId: raw[0].postId,
+        url: raw[0].url,
+        postUrl: raw[0].postUrl,
+        link: raw[0].link,
+        shareUrl: raw[0].shareUrl,
+        permalinkUrl: raw[0].permalinkUrl,
+        authorName: raw[0].authorName,
+        author: raw[0].author,
+      }));
+    }
+
     const seen  = new Set();
     const posts = [];
     for (const post of raw) {
-      const id = post.id || post.postId || post.url;
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
+      const id = post.id || post.postId || post.activityId;
+      const dedupeKey = id || post.url || post.postUrl;
+      if (!dedupeKey || seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+
+      const url = buildLinkedInUrl(post);
+
       posts.push({
-        id:          post.id || post.postId,
-        url:         post.url || post.postUrl,
-        text:        post.text || post.content || "",
-        authorName:  post.authorName  || post.author?.name  || "",
-        authorTitle: post.authorTitle || post.author?.title || "",
-        authorUrl:   post.authorUrl   || post.author?.url   || "",
-        company:     post.companyName || post.author?.company || "",
-        postedAt:    post.postedAt || post.date || null,
-        likes:       post.numLikes    || post.likes    || 0,
-        comments:    post.numComments || post.comments || 0,
-        reposts:     post.numReposts  || post.reposts  || 0,
+        id:          id || null,
+        url,
+        text:        post.text || post.content || post.description || "",
+        authorName:  post.authorName  || post.author?.name  || post.profileName || "",
+        authorTitle: post.authorTitle || post.author?.title || post.profileTitle || "",
+        authorUrl:   post.authorUrl   || post.author?.url   || post.profileUrl  || "",
+        company:     post.companyName || post.author?.company || post.company || "",
+        postedAt:    post.postedAt || post.date || post.timestamp || null,
+        likes:       post.numLikes    || post.likes    || post.likesCount    || 0,
+        comments:    post.numComments || post.comments || post.commentsCount || 0,
+        reposts:     post.numReposts  || post.reposts  || post.repostsCount  || 0,
       });
     }
 
@@ -121,7 +145,7 @@ router.post("/linkedin-reactions", async (req, res) => {
   const input = {
     posts:              postUrls,
     maxReactionsPerPost,
-    profileScraperMode: "short",   // lowercase
+    profileScraperMode: "short",
   };
 
   try {

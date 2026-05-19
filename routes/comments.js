@@ -17,7 +17,7 @@ const router   = express.Router();
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ANTHROPIC_URL     = "https://api.anthropic.com/v1/messages";
-const MODEL             = "claude-sonnet-4-20250514";
+const MODEL             = "claude-sonnet-4-5";
 
 // ─── Plexo S4 context (hardcoded, never used promotionally in comments) ───────
 const PLEXO_S4 = `
@@ -77,18 +77,18 @@ Draft 3 — Question/Discovery: open with a reframe of the post's claim, ask one
 - Target: the space between. When in doubt, stay closer to the floor.
 
 ## TRUTH RULES
-- 🟢 Public fact + analysis: always safe. Use freely.
-- 🟡 Industry pattern: safe if widely known (UAT cycles, mobile money windows, weekend settlement gaps).
-- 🔴 Personal experience ("We've seen 3 PSPs...", "I talked to 4 banks"): ONLY if actually happened. If unsure → rephrase as 🟢 or 🟡.
-- Default to 🟢 and 🟡. The comment can be personal without being fabricated.
+- Public fact + analysis: always safe. Use freely.
+- Industry pattern: safe if widely known (UAT cycles, mobile money windows, weekend settlement gaps).
+- Personal experience ("We've seen 3 PSPs...", "I talked to 4 banks"): ONLY if actually happened. If unsure, rephrase as public fact or industry pattern.
+- Default to public facts and industry patterns. The comment can be personal without being fabricated.
 
 ## GATE CHECKS (run internally, do NOT show in output)
 Before outputting, verify each draft passes ALL 6 gates:
-G5 (Alive): ≥1 phone-voice marker (ellipsis/fragment/casual softener). Zero em dashes.
-G6 (Truth): All claims 🟢 or 🟡. No invented experience.
+G5 (Alive): at least 1 phone-voice marker (ellipsis/fragment/casual softener). Zero em dashes.
+G6 (Truth): All claims are public facts or industry patterns. No invented experience.
 G2 (Source Fidelity): Pins to THIS specific post. Would not fit a different post by same company.
 G1 (Bullshit): Delete first sentence — comment still loses info. No restatement, no triple-choice, no jargon soup.
-G3 (Value): ≥1 specific number/mechanism/named entity NOT in original post.
+G3 (Value): at least 1 specific number/mechanism/named entity NOT in original post.
 G4 (Interaction): Question specific enough that only someone with direct experience can answer. One path.
 
 If a draft fails any gate, rewrite it before outputting. Never output a failing draft.
@@ -100,7 +100,7 @@ Sin 3: Triple-choice question "which X: A, B, or C?"
 Sin 4: "From your perspective/side/view"
 Sin 5: Zero "I" or "we" in the comment
 Sin 6: Comment works equally well under a different post by same company
-Sin 7: Abstract nouns that survive the "stuff" test ("operational controls" → "stuff controls" still reads — reject)
+Sin 7: Abstract nouns that survive the "stuff" test
 Sin 8: Fabricated experience claims
 
 ## OUTPUT FORMAT
@@ -112,7 +112,7 @@ Return ONLY valid JSON. No markdown, no preamble, no explanation.
     { "n": 2, "text": "..." },
     { "n": 3, "text": "..." }
   ],
-  "source_used": "S3" | "S4" | "S3+S4",
+  "source_used": "S3 or S4 or S3+S4",
   "substance_anchor": "one line: what specific fact/mechanism was added"
 }
 `.trim();
@@ -149,9 +149,9 @@ async function generateComments(post) {
     },
     {
       headers: {
-        "Content-Type":            "application/json",
-        "x-api-key":               ANTHROPIC_API_KEY,
-        "anthropic-version":       "2023-06-01",
+        "Content-Type":      "application/json",
+        "x-api-key":         ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
       },
       timeout: 30_000,
     }
@@ -172,7 +172,7 @@ async function generateComments(post) {
   return parsed;
 }
 
-// ─── Relevance filter — basic keyword check before spending Claude tokens ─────
+// ─── Relevance filter ─────────────────────────────────────────────────────────
 const RELEVANCE_KEYWORDS = [
   "stablecoin", "usdc", "usdt", "crypto", "blockchain", "defi",
   "cross-border", "cross border", "remittance", "payment", "fintech",
@@ -184,27 +184,21 @@ const RELEVANCE_KEYWORDS = [
 
 function isRelevant(post) {
   const text = (post.text || "").toLowerCase();
-  // Must mention at least 2 keywords (or 1 strong one)
   const strong = ["stablecoin", "usdc", "usdt", "cross-border", "cbdc", "swift"];
   if (strong.some(kw => text.includes(kw))) return true;
   const matches = RELEVANCE_KEYWORDS.filter(kw => text.includes(kw));
   return matches.length >= 2;
 }
 
-// Filter out low-quality posts
 function isCommentable(post) {
   const text = (post.text || "").toLowerCase();
-  // Skip hiring posts
   if (/\bwe.re hiring\b|\bjoin our team\b|\bjob opening\b|\bapply now\b/i.test(text)) return false;
-  // Skip pure event promos with no discussion hook
   if (/\bregister now\b|\brsvp\b|\bjoin us at\b/i.test(text) && text.length < 300) return false;
-  // Skip posts with no real text
   if ((post.text || "").trim().length < 100) return false;
   return true;
 }
 
 // ─── POST /comments/generate ──────────────────────────────────────────────────
-// Body: one post object { text, authorName, authorTitle, authorUrl, company, url, id }
 router.post("/generate", async (req, res) => {
   const post = req.body;
   if (!post?.text) {
@@ -214,13 +208,13 @@ router.post("/generate", async (req, res) => {
   try {
     const result = await generateComments(post);
     return res.json({
-      ok:     true,
-      postId: post.id || null,
-      postUrl: post.url || null,
-      author: post.authorName || null,
-      company: post.company || null,
-      drafts: result.drafts,
-      source_used: result.source_used || "S4",
+      ok:               true,
+      postId:           post.id || null,
+      postUrl:          post.url || null,
+      author:           post.authorName || null,
+      company:          post.company || null,
+      drafts:           result.drafts,
+      source_used:      result.source_used || "S4",
       substance_anchor: result.substance_anchor || null,
     });
   } catch (err) {
@@ -230,8 +224,6 @@ router.post("/generate", async (req, res) => {
 });
 
 // ─── POST /comments/batch ─────────────────────────────────────────────────────
-// Body: { posts: [...], maxCards: 7 }
-// Filters posts for relevance, generates comments for top N, returns approval cards.
 router.post("/batch", async (req, res) => {
   const { posts = [], maxCards = 7 } = req.body || {};
 
@@ -239,7 +231,6 @@ router.post("/batch", async (req, res) => {
     return res.status(400).json({ ok: false, error: "posts array required" });
   }
 
-  // Filter relevant and commentable posts
   const candidates = posts
     .filter(p => isRelevant(p) && isCommentable(p))
     .slice(0, maxCards);
@@ -248,8 +239,7 @@ router.post("/batch", async (req, res) => {
     return res.json({ ok: true, total: 0, cards: [], message: "No relevant posts found after filtering" });
   }
 
-  // Generate comments for each candidate (sequential to avoid rate limits)
-  const cards = [];
+  const cards  = [];
   const errors = [];
 
   for (const post of candidates) {
@@ -258,7 +248,7 @@ router.post("/batch", async (req, res) => {
       cards.push({
         postId:           post.id || null,
         postUrl:          post.url || null,
-        postText:         (post.text || "").slice(0, 500), // preview
+        postText:         (post.text || "").slice(0, 500),
         authorName:       post.authorName || "",
         authorTitle:      post.authorTitle || "",
         authorUrl:        post.authorUrl || "",

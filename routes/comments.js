@@ -8,6 +8,8 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const ANTHROPIC_URL     = "https://api.anthropic.com/v1/messages";
 const MODEL             = "claude-sonnet-4-5";
 
+const MAX_COMMENT_CHARS = 300;
+
 const PLEXO_S4 = `
 Plexo is a stablecoin clearing network for licensed financial institutions.
 Positioning: "SWIFT for stablecoins."
@@ -34,6 +36,8 @@ Anton's voice: fast, concrete, slightly imperfect, opinionated. Like a founder w
 
 Your task: given one LinkedIn post, produce exactly 3 comment drafts using 3 different strategies.
 
+CRITICAL LENGTH CONSTRAINT: Each comment draft MUST be 300 characters or fewer (including spaces and punctuation). This is a hard limit. Count carefully before outputting.
+
 ## PLEXO OPERATOR CONTEXT (S4 — use as framing, NEVER promote by name)
 ${PLEXO_S4}
 
@@ -43,39 +47,26 @@ Draft 2 — Mechanism/Value-add: agree with direction but add one specific mecha
 Draft 3 — Question/Discovery: open with a reframe of the post's claim, ask one specific question only someone with direct experience can answer.
 
 ## ANATOMY OF A GOOD COMMENT (all 3 drafts must follow)
-- Layer 1 Hook (1 sentence): Pin to a SPECIFIC claim/number/sentence in the post. NOT a summary.
-- Layer 2 Payload (1-3 sentences): Add ONE concrete mechanism, number, or experience the post didn't say. First person ("I", "we") is natural here.
-- Layer 3 Hook-back (1 sentence): ONE specific question OR provocative observation. Never triple-choice. Never "from your perspective."
-- Total: 3-5 sentences. Dense. Every word earns its place.
+- Hook (1 sentence): Pin to a SPECIFIC claim in the post.
+- Payload (1-2 sentences): Add ONE concrete mechanism or number not in the post.
+- Close (1 sentence): ONE specific question. Never triple-choice.
+- Total: 2-3 sentences MAX. Every word earns its place. Stay under 300 chars.
 
 ## ANTON'S VOICE RULES (mandatory)
-- NO em dashes. Use commas, periods, colons, or "..."
+- NO em dashes. Use commas, periods, colons.
 - NO "from your perspective/side/view"
 - NO triple-choice questions ("which X: A, B, or C?")
 - NO Plexo mention
-- NO 7+ sentence essays
-- NO consultant English ("One might observe", "It is worth noting")
-- NO perfect native-speaker polish — slightly non-native rhythm is a feature
-- YES ellipsis for real pauses: "just a bit of controversy...", "and it just works... better than anything"
+- NO consultant English
 - YES first-person: "I think", "we see this", "curious if"
-- YES short punchy closers: "Pain first, liquidity second, regulation third."
-- Calibration ceiling: "slight pushback: OpenFX had traction before GENIUS. Regulation adds legitimacy and speed, but the initial pull came from a very real pain point: intercompany cross-border FX flows."
-- Calibration floor: "Just a bit of controversy... The traction of OpenFX has started before GENIUS popped out. It adds the legitimacy and speed up scaling, but do not power up it initially."
-- Target: the space between. When in doubt, stay closer to the floor.
-
-## TRUTH RULES
-- Public fact + analysis: always safe. Use freely.
-- Industry pattern: safe if widely known (UAT cycles, mobile money windows, weekend settlement gaps).
-- Personal experience: ONLY if actually happened. If unsure, rephrase as public fact or industry pattern.
-- Default to public facts and industry patterns.
+- YES short punchy closers
 
 ## GATE CHECKS (run internally, do NOT show in output)
 G5 (Alive): at least 1 phone-voice marker. Zero em dashes.
-G6 (Truth): All claims are public facts or industry patterns. No invented experience.
-G2 (Source Fidelity): Pins to THIS specific post. Would not fit a different post by same company.
+G6 (Truth): All claims are public facts or industry patterns.
 G1 (Bullshit): No restatement, no triple-choice, no jargon soup.
-G3 (Value): at least 1 specific number/mechanism/named entity NOT in original post.
-G4 (Interaction): Question specific enough that only someone with direct experience can answer. One path.
+G3 (Value): at least 1 specific number/mechanism NOT in original post.
+G4 (Length): Each draft is 300 characters or fewer. Count before outputting.
 
 ## OUTPUT FORMAT
 Return ONLY valid JSON. No markdown, no preamble, no explanation.
@@ -102,7 +93,7 @@ function buildPostPrompt(post) {
   lines.push("Post text:");
   lines.push(post.text || "(no text)");
   lines.push("");
-  lines.push("Now generate 3 comment drafts. Return only valid JSON as specified.");
+  lines.push(`Generate 3 comment drafts. Each must be ${MAX_COMMENT_CHARS} characters or fewer. Return only valid JSON.`);
   return lines.join("\n");
 }
 
@@ -113,7 +104,7 @@ async function generateComments(post) {
     ANTHROPIC_URL,
     {
       model:      MODEL,
-      max_tokens: 1500,
+      max_tokens: 1000,
       system:     COMMENT_SYSTEM_PROMPT,
       messages: [{ role: "user", content: buildPostPrompt(post) }],
     },
@@ -136,6 +127,17 @@ async function generateComments(post) {
   } catch (e) {
     throw new Error(`Claude returned invalid JSON: ${clean.slice(0, 200)}`);
   }
+
+  // Hard truncation failsafe — never exceed MAX_COMMENT_CHARS
+  if (Array.isArray(parsed.drafts)) {
+    parsed.drafts = parsed.drafts.map(d => ({
+      ...d,
+      text: typeof d.text === "string" && d.text.length > MAX_COMMENT_CHARS
+        ? d.text.slice(0, MAX_COMMENT_CHARS - 1).trimEnd() + "…"
+        : d.text,
+    }));
+  }
+
   return parsed;
 }
 
@@ -188,7 +190,6 @@ router.post("/generate", async (req, res) => {
 });
 
 // ─── POST /comments/batch ─────────────────────────────────────────────────────
-// Accepts both { posts: [...] } and Apify wrapper { ok: true, posts: [...] }
 router.post("/batch", async (req, res) => {
   const body     = req.body || {};
   const posts    = Array.isArray(body) ? body : (body.posts || []);

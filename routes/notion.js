@@ -6,6 +6,7 @@ const {
   NOTION_PEOPLE_DB,
   notionHeaders,
 } = require("../lib/notion");
+const { scoreDiscoveryCard } = require("../lib/discovery-fill");
 
 const router = express.Router();
 
@@ -1142,10 +1143,6 @@ router.post("/create-task", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /notion/page-blocks/:pageId
-// Returns all blocks of a Notion page, recursively fetching children.
-// Query params:
-//   depth  — max recursion depth (default 3, max 5)
-//   raw    — if "1", return raw Notion block objects; otherwise compact form
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function fetchBlocksRecursive(blockId, depth, maxDepth, headers) {
@@ -1181,18 +1178,9 @@ function compactBlock(block) {
   const text = extractRichText(data.rich_text || data.text || []);
   const compact = { id: block.id, type, text };
 
-  // Capture checkbox state
   if (type === "to_do") compact.checked = data.checked || false;
-
-  // Capture heading level
-  if (type.startsWith("heading_")) {
-    compact.level = parseInt(type.replace("heading_", ""), 10);
-  }
-
-  // Table row cells
-  if (type === "table_row") {
-    compact.cells = (data.cells || []).map(cell => extractRichText(cell));
-  }
+  if (type.startsWith("heading_")) compact.level = parseInt(type.replace("heading_", ""), 10);
+  if (type === "table_row") compact.cells = (data.cells || []).map(cell => extractRichText(cell));
 
   compact.has_children = block.has_children || false;
   return compact;
@@ -1215,165 +1203,8 @@ router.get("/page-blocks/:pageId", async (req, res) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /notion/discovery-card-fill/:pageId
-//
-// Reads a Discovery Card page and scores each section by how many
-// fields are filled vs empty (___).
-//
-// Returns:
-//   { ok, pageId, companyName, totalScore, maxScore, fillPct,
-//     sections: [ { name, filled, total, fillPct, fields: [...] } ] }
+// Uses structural scoring from lib/discovery-fill.js
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Discovery Card sections and their expected field labels.
-// Matches the actual card structure seen in screenshots.
-const DC_SECTIONS = [
-  {
-    name: "1. Partner Profile",
-    fields: [
-      "Company legal name",
-      "Country of incorporation",
-      "Website",
-      "Founded",
-      "Revenue / Size",
-      "Contact person",
-      "Title / Role",
-      "Email",
-      "Phone",
-      "Telegram / WhatsApp",
-      "Licenses held",
-      "Primary role",
-    ],
-  },
-  {
-    name: "2. Business Profile",
-    fields: [
-      "Business description",
-      "Business model",
-      "Target markets / geography",
-      "Corridors",
-      "Monthly volume (USD)",
-      "Current settlement method",
-    ],
-  },
-  {
-    name: "3. Client Mix & Volume Breakdown",
-    fields: [
-      "SME / Business Payments",
-      "Fintech / PSP Clients",
-      "OTC / Treasury Conversions",
-    ],
-  },
-  {
-    name: "4. Stablecoins & Chains",
-    fields: [
-      "Stablecoins used",
-      "Chains used",
-    ],
-  },
-  {
-    name: "5. Volumes & Sizing",
-    fields: [
-      "Monthly on-chain volume",
-      "Number of transactions",
-      "Average transaction size",
-      "Peak volume corridors",
-    ],
-  },
-  {
-    name: "6. Pain Points & Needs",
-    fields: [
-      "Current pain points",
-      "What do you need from Plexo",
-    ],
-  },
-  {
-    name: "7. Tech & Integration",
-    fields: [
-      "Current tech stack",
-      "Integration preference",
-      "API / SDK requirement",
-    ],
-  },
-];
-
-// Check if a block's text looks "empty" (just ___, dashes, or blank)
-function isEmptyValue(text) {
-  if (!text) return true;
-  const t = text.trim();
-  if (!t) return true;
-  // Common placeholder patterns: ___, —, -, N/A
-  if (/^[_\-—–]+$/.test(t)) return true;
-  if (/^n\/?a$/i.test(t)) return true;
-  return false;
-}
-
-// Given flat+nested block list, extract all text content as a single string
-function flattenBlockText(blocks) {
-  const lines = [];
-  function walk(blist) {
-    for (const b of blist) {
-      if (b.text) lines.push(b.text);
-      if (b.cells) lines.push(...b.cells);
-      if (b.children) walk(b.children);
-    }
-  }
-  walk(blocks);
-  return lines.join("\n");
-}
-
-// Score a section: look for each expected field label in the block content.
-// A field is "filled" if its label appears AND is followed by non-empty text
-// on the same line or in subsequent blocks.
-function scoreSection(sectionFields, allText, blocks) {
-  const results = [];
-  const lowerText = allText.toLowerCase();
-
-  for (const field of sectionFields) {
-    const fieldLower = field.toLowerCase();
-    const idx = lowerText.indexOf(fieldLower);
-    if (idx === -1) {
-      // Field heading not found at all — treat as empty
-      results.push({ field, filled: false, reason: "label not found" });
-      continue;
-    }
-
-    // Extract text after the field label (up to ~200 chars or next newline block)
-    const after = allText.slice(idx + field.length, idx + field.length + 300);
-
-    // Check for checkboxes: if the field is a checkbox group, check if any box is checked
-    if (["Primary role", "Business model", "Stablecoins used", "Chains used", "Integration preference"].includes(field)) {
-      // Look for checked checkboxes (✓, ✅, [x], or "checked: true" in our compact format)
-      const hasChecked = blocks.some(b => b.type === "to_do" && b.checked);
-      if (hasChecked) {
-        results.push({ field, filled: true, reason: "checkbox checked" });
-        continue;
-      }
-      // Also check raw text for check marks
-      const checkRegion = allText.slice(Math.max(0, idx - 50), idx + 500);
-      if (/✓|✅|\[x\]|☑/i.test(checkRegion)) {
-        results.push({ field, filled: true, reason: "checkbox checked (text)" });
-        continue;
-      }
-    }
-
-    // Strip colon, whitespace from start of "after"
-    const afterClean = after.replace(/^[\s:]+/, "").trim();
-
-    if (isEmptyValue(afterClean) || afterClean.length < 2) {
-      results.push({ field, filled: false, reason: "empty placeholder" });
-    } else {
-      results.push({ field, filled: true, reason: "has content" });
-    }
-  }
-
-  const filled = results.filter(r => r.filled).length;
-  return {
-    filled,
-    total: results.length,
-    fillPct: results.length > 0 ? Math.round((filled / results.length) * 100) : 0,
-    fields: results,
-  };
-}
 
 router.get("/discovery-card-fill/:pageId", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
@@ -1381,7 +1212,6 @@ router.get("/discovery-card-fill/:pageId", async (req, res) => {
   if (!pageId) return res.status(400).json({ error: "pageId required" });
 
   try {
-    // 1. Get page properties (for title/company name)
     const pageResp = await axios.get(
       `https://api.notion.com/v1/pages/${pageId}`,
       { headers: notionHeaders(), timeout: 10000 }
@@ -1390,39 +1220,12 @@ router.get("/discovery-card-fill/:pageId", async (req, res) => {
     const docTitle = extractRichText(props["Document"]?.title || []);
     const companyName = docTitle.replace(/^Discovery Card\s*\|\s*/i, "").trim();
 
-    // 2. Fetch all blocks recursively (depth 4 to get table cells)
     const blocks = await fetchBlocksRecursive(pageId, 0, 4, notionHeaders());
-    const allText = flattenBlockText(blocks);
+    const { totalFilled, totalFields, fillPct, sections } = scoreDiscoveryCard(blocks);
 
-    // 3. Score each section
-    let totalFilled = 0;
-    let totalFields = 0;
-    const sections = DC_SECTIONS.map(sec => {
-      const score = scoreSection(sec.fields, allText, blocks);
-      totalFilled += score.filled;
-      totalFields += score.total;
-      return {
-        name: sec.name,
-        filled: score.filled,
-        total: score.total,
-        fillPct: score.fillPct,
-        fields: score.fields,
-      };
-    });
+    console.log(`[discovery-card-fill] ${companyName}: ${totalFilled}/${totalFields} = ${fillPct}% (${sections.length} sections)`);
 
-    const overallFillPct = totalFields > 0 ? Math.round((totalFilled / totalFields) * 100) : 0;
-
-    console.log(`[discovery-card-fill] ${companyName}: ${totalFilled}/${totalFields} fields = ${overallFillPct}%`);
-
-    res.json({
-      ok: true,
-      pageId,
-      companyName,
-      totalFilled,
-      totalFields,
-      fillPct: overallFillPct,
-      sections,
-    });
+    res.json({ ok: true, pageId, companyName, totalFilled, totalFields, fillPct, sections });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
   }

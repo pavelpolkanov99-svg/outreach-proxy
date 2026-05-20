@@ -3,37 +3,33 @@
  * ---------------------
  * GET  /discovery/digest          — build & return digest payload
  * POST /discovery/snapshot/sync   — force snapshot refresh (no digest)
- *
- * Architecture:
- *   - Discovery Cards DB  : ec737e56-4972-4ef8-9819-1235c51582ce  (read-only)
- *   - State DB            : created on first run, ID stored in env DISCOVERY_STATE_DB_ID
- *                           or auto-detected by title "Loop OS · Discovery Snapshots"
- *
- * Snapshot DB schema (one page per Discovery Card):
- *   Name (title)          : snap_{cardId_prefix}
- *   card_id (rich_text)   : Notion page ID of the Discovery Card
- *   company (rich_text)   : company name from card title
- *   last_edited (rich_text): ISO timestamp from Notion
- *   snapshot_at (rich_text): when we last read blocks
- *   fill_score (number)   : total filled fields count
- *   sections_json (rich_text): JSON blob [{name, filled, total}]
- *   bd_score (number)     : from CRM Companies DB (for priority ranking)
  */
 
 "use strict";
 
 const express = require("express");
 const axios   = require("axios");
-const { NOTION_TOKEN, NOTION_COMPANIES_DB, notionHeaders } = require("../lib/notion");
+const { NOTION_TOKEN, notionHeaders } = require("../lib/notion");
 
 const router = express.Router();
-
-// ── Constants ─────────────────────────────────────────────────────────────────
 
 const DISCOVERY_CARDS_DB = "ec737e56-4972-4ef8-9819-1235c51582ce";
 const STATE_DB_TITLE     = "Loop OS · Discovery Snapshots";
 const PING_STALE_DAYS    = 7;
 const PING_TOP_N         = 15;
+
+// Statuses to exclude from ping list — not actionable
+const SKIP_STATUSES = new Set([
+  "Later", "later",
+  "Not Relevant", "Not relevant", "not relevant",
+  "Completed", "completed", "Done", "done",
+  "Rejected", "rejected",
+]);
+
+function shouldSkipForPing(status) {
+  if (!status) return false;
+  return SKIP_STATUSES.has(status) || /later|not.?relevant|completed|done|rejected/i.test(status);
+}
 
 // ── Notion helpers ────────────────────────────────────────────────────────────
 
@@ -190,16 +186,11 @@ function parseSectionsJson(raw) {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
-/**
- * Compare old and new section arrays.
- * Returns sections where filled count INCREASED (positive delta only).
- * Each entry: { name, oldFilled, newFilled, newTotal, fillPct }
- */
 function sectionsDelta(oldSections, newSections) {
   if (!newSections) return [];
   const result = [];
   for (const sec of newSections) {
-    if (sec.filled === 0) continue; // skip empty sections
+    if (sec.filled === 0) continue;
     const old = oldSections ? oldSections.find(s => s.name === sec.name) : null;
     const oldFilled = old?.filled ?? 0;
     if (sec.filled > oldFilled) {
@@ -249,7 +240,6 @@ async function buildDigest(stateDbId) {
       bdScore = await fetchBdScore(card.crmCompanyId);
     }
 
-    // Always re-read fill if last_edited changed vs snapshot
     const lastEditedChanged = !snapshot || snapshot.last_edited !== card.last_edited_time;
     if (lastEditedChanged) {
       fillData = await fetchFillScore(card.id);
@@ -258,29 +248,20 @@ async function buildDigest(stateDbId) {
       }
     }
 
-    // Delta: compare new sections to snapshot
     if (lastEditedChanged && fillData?.ok) {
       const oldSecs = parseSectionsJson(snapshot?.sections_json);
       const delta = sectionsDelta(oldSecs, fillData.sections);
       if (delta.length > 0) {
-        changed.push({
-          company:  card.company,
-          delta,
-          fillPct:  fillData.fillPct,
-          bdScore,
-          status:   card.status,
-        });
+        changed.push({ company: card.company, delta, fillPct: fillData.fillPct, bdScore, status: card.status });
       }
     }
 
-    // Ping list: stale > PING_STALE_DAYS, not completed
+    // Ping list: stale > PING_STALE_DAYS, skip Later / Not Relevant / Completed
     const staleDays = daysSince(card.last_edited_time);
-    const isCompleted = /completed|done/i.test(card.status || "");
-    if (!isCompleted && staleDays != null && staleDays > PING_STALE_DAYS) {
+    if (!shouldSkipForPing(card.status) && staleDays != null && staleDays > PING_STALE_DAYS) {
       pingList.push({ company: card.company, staleDays, status: card.status, bdScore });
     }
 
-    // Write updated snapshot
     await writeSnapshot(stateDbId, {
       snapshotPageId: snapshot?.snapshotPageId || null,
       cardId:         card.id,
@@ -292,10 +273,7 @@ async function buildDigest(stateDbId) {
     });
   }));
 
-  // Sort changed by bdScore desc
   changed.sort((a, b) => (b.bdScore ?? 0) - (a.bdScore ?? 0));
-
-  // Sort ping list by bdScore desc, then staleDays desc
   pingList.sort((a, b) => {
     if ((b.bdScore ?? 0) !== (a.bdScore ?? 0)) return (b.bdScore ?? 0) - (a.bdScore ?? 0);
     return (b.staleDays ?? 0) - (a.staleDays ?? 0);
@@ -320,9 +298,7 @@ function formatDigestTelegram({ asOf, totalCards, changed, pingList, pingTotal }
 
   const lines = [`📋 <b>Discovery Cards · ${dateStr}</b>`, ""];
 
-  // ── Section 1: активность (дельта) ──────────────────────────────────────────
   lines.push("━━━ 🟢 АКТИВНОСТЬ ━━━");
-
   if (changed.length === 0) {
     lines.push("<i>Изменений нет</i>");
   } else {
@@ -333,8 +309,7 @@ function formatDigestTelegram({ asOf, totalCards, changed, pingList, pingTotal }
       lines.push(`\n<b>${c.company}</b>${tierStr}${totalPct}`);
       for (const sec of c.delta) {
         const secName = sec.name.replace(/^\d+[a-z]?\.\s*/i, "");
-        const delta = sec.newFilled - sec.oldFilled;
-        const deltaStr = sec.oldFilled > 0 ? ` (+${delta})` : "";
+        const deltaStr = sec.oldFilled > 0 ? ` (+${sec.newFilled - sec.oldFilled})` : "";
         lines.push(`  ✓ ${secName} — ${sec.newFilled}/${sec.newTotal} полей${deltaStr}`);
       }
     }
@@ -345,7 +320,6 @@ function formatDigestTelegram({ asOf, totalCards, changed, pingList, pingTotal }
   lines.push(`<i>Не было активности >${PING_STALE_DAYS} дней · топ-${PING_TOP_N} по score</i>`);
   lines.push("");
 
-  // ── Section 2: ping list ─────────────────────────────────────────────────────
   if (pingList.length === 0) {
     lines.push("<i>Все карточки активны</i>");
   } else {

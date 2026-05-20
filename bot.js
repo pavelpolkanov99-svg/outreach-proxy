@@ -8,7 +8,7 @@ const conversationStore = require("./lib/conversation-store");
 
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.26.0-comments-paused";
+const VERSION      = "4.27.0-discovery-digest";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -359,6 +359,11 @@ async function fetchTodayLean() {
   catch (err) { return null; }
 }
 
+async function fetchDiscoveryDigest() {
+  try { const r = await axios.get(`${PROXY}/discovery/digest`, { timeout: 120_000 }); return r.data; }
+  catch (err) { return null; }
+}
+
 function buildCalendarSectionLean(cr) {
   if (cr?.__timeout) return `📅 <b>ВСТРЕЧИ СЕГОДНЯ</b>\n\n<i>⚠️ Календарь не ответил.</i>`;
   if (!cr || !cr.ok) return `📅 <b>ВСТРЕЧИ СЕГОДНЯ</b>\n\n<i>❌ Calendar error: ${esc(cr?.error || "unknown")}</i>`;
@@ -426,7 +431,7 @@ function buildStaleSectionLean(stale) {
   return `🟡 <b>ЗАГЛОХЛИ · решить</b>\n\n` + lines.join("\n");
 }
 
-function buildFooter() { return `<i>/details · /full · /stale · /replies</i>`; }
+function buildFooter() { return `<i>/details · /full · /stale · /replies · /discovery</i>`; }
 
 function buildTasksSectionFull(td, ct) {
   if (!td || td.__timeout) return `📋 <b>Задачи</b>\n\n<i>⚠️ Notion не ответил по задачам.</i>`;
@@ -624,9 +629,9 @@ bot.command("start", ctx => guard(ctx, () => {
     `🤖 Loop OS — Founder Command Center\n\nВерсия: ${VERSION}\n${convLine}\nКоманды:\n` +
     `/ping — health check\n/today — дайджест на сегодня\n/details — полные данные\n/full — всё\n` +
     `/yesterday — что было вчера\n/digest — отправить Anton'у\n/tasks — задачи\n/stale — заглохшие сделки\n` +
-    `/replies — ждут ответа\n/test_push — тест крона в группу прямо сейчас\n` +
+    `/replies — ждут ответа\n/discovery — Discovery Cards digest\n/test_push — тест крона в группу прямо сейчас\n` +
     (CONVERSATIONAL_MODE ? `/new — сбросить контекст\n/budget — расход\n` : "") +
-    `\nАвто:\n• Утренний дайджест 08:30 CET → личка + группа\n• CRM auto-prewarm 23:00 и 08:00 CET`,
+    `\nАвто:\n• Утренний дайджест 08:30 CET → личка + группа\n• Discovery Cards digest 09:00 CET → личка + группа\n• CRM auto-prewarm 23:00 и 08:00 CET`,
     { parse_mode: "HTML" }
   );
 }));
@@ -719,6 +724,23 @@ bot.command("replies", ctx => guard(ctx, async () => {
   } catch (err) { return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(err.message)}`); }
 }));
 
+// ── /discovery ────────────────────────────────────────────────────────────────
+bot.command("discovery", ctx => guard(ctx, async () => {
+  const loadingMsg = await ctx.reply("⏳ Сканирую Discovery Cards (~60-90s)...");
+  try {
+    const data = await withTimeout(fetchDiscoveryDigest(), 110_000, "discovery-digest");
+    if (!data || data.__timeout) {
+      return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Discovery digest не ответил (timeout). Попробуй позже.`);
+    }
+    if (!data.ok) {
+      return ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(data.error || "unknown")}`);
+    }
+    await editAndSplit(ctx, loadingMsg, data.telegram);
+  } catch (err) {
+    try { await ctx.api.editMessageText(ctx.chat.id, loadingMsg.message_id, `❌ Ошибка: ${esc(err.message)}`); } catch (_) {}
+  }
+}));
+
 bot.command("test_push", ctx => guard(ctx, async () => {
   const loadingMsg = await ctx.reply("⏳ Тестирую push в группу...", { parse_mode: "HTML" });
   try {
@@ -765,7 +787,7 @@ bot.on("message:text", ctx => guard(ctx, () => {
     return handleConversation(ctx, cleaned);
   }
   if (CONVERSATIONAL_MODE && !isSlash) return handleConversation(ctx);
-  return ctx.reply(`Команды:\n/start  /ping  /today  /details  /full  /yesterday  /digest  /tasks  /stale  /replies  /test_push` + (CONVERSATIONAL_MODE ? `  /new  /budget` : ""));
+  return ctx.reply(`Команды:\n/start  /ping  /today  /details  /full  /yesterday  /digest  /tasks  /stale  /replies  /discovery  /test_push` + (CONVERSATIONAL_MODE ? `  /new  /budget` : ""));
 }));
 
 bot.on("callback_query:data", async (ctx) => {
@@ -779,7 +801,7 @@ bot.on("callback_query:data", async (ctx) => {
 bot.catch(err => { console.error("[bot] Error:", err.message); });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Cron — только утренний дайджест 08:30 CET
+// Cron jobs
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function sendMorningPush() {
@@ -788,8 +810,27 @@ async function sendMorningPush() {
   catch (err) { console.error("[cron] morning push failed:", err.message); }
 }
 
+async function sendDiscoveryPush() {
+  console.log("[cron] discovery push start");
+  try {
+    const data = await withTimeout(fetchDiscoveryDigest(), 110_000, "discovery-cron");
+    if (!data || data.__timeout || !data.ok) {
+      console.error("[cron] discovery push: no data or error", data?.error);
+      return;
+    }
+    await sendToAllTargets(data.telegram, "discovery-push");
+    console.log("[cron] discovery push sent");
+  } catch (err) { console.error("[cron] discovery push failed:", err.message); }
+}
+
+// 08:30 CET — morning digest
 cron.schedule("30 8 * * *", sendMorningPush, { timezone: "Europe/Prague" });
 console.log("[cron] morning push registered (08:30 Europe/Prague → личка + группа)");
+
+// 09:00 CET — discovery cards digest
+cron.schedule("0 9 * * 1-5", sendDiscoveryPush, { timezone: "Europe/Prague" });
+console.log("[cron] discovery push registered (09:00 Mon-Fri Europe/Prague → личка + группа)");
+
 // NOTE: LinkedIn comments cron DISABLED — pending Playwright linkedin-poster setup
 
 console.log(`[bot] Loop OS FCC ${VERSION} starting...`);

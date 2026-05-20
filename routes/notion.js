@@ -54,24 +54,6 @@ function buildCompanyProps({
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /notion/db-schema
 // ─────────────────────────────────────────────────────────────────────────────
-//
-// Two modes:
-//
-//  1. WITH ?db_id=<uuid> — returns the schema of ANY Notion database:
-//       { ok, db_id, title, properties: [ { name, type, options? }, ... ] }
-//     For select / status / multi_select properties, `options` lists the
-//     valid option names. This lets a caller (the conversational agent) learn
-//     the EXACT property names AND valid values before building a filter —
-//     eliminating the whole "Could not find property with name or id" /
-//     "invalid option" class of errors.
-//
-//  2. WITHOUT db_id — legacy behaviour, unchanged: returns
-//       { companies: [{name,type}], people: [{name,type}] }
-//     for the two hardcoded CRM databases. Existing callers keep working.
-
-// Extract a compact, caller-friendly property list from a Notion DB object.
-// Includes option names for select/status/multi_select so the agent also
-// knows the valid VALUES, not just the property name.
 function extractSchemaProperties(db) {
   return Object.entries(db.properties || {}).map(([name, prop]) => {
     const entry = { name, type: prop.type };
@@ -91,7 +73,6 @@ router.get("/db-schema", async (req, res) => {
 
   const dbId = (req.query.db_id || "").trim();
 
-  // Mode 1 — any database by id
   if (dbId) {
     try {
       const r = await axios.get(
@@ -114,7 +95,6 @@ router.get("/db-schema", async (req, res) => {
     }
   }
 
-  // Mode 2 — legacy: the two CRM databases, original { name, type } shape
   try {
     const [companies, people] = await Promise.all([
       axios.get(`https://api.notion.com/v1/databases/${NOTION_COMPANIES_DB}`, { headers: notionHeaders() }),
@@ -437,7 +417,7 @@ router.post("/check-duplicates", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Insight cache helpers — read/write Loop's Insight field on Companies pages
+// Insight cache helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
 function formatInsightText(refreshedAt, bullets) {
@@ -586,7 +566,7 @@ router.post("/update-insight", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Stale-deals — pipeline hygiene digest
+// Stale-deals
 // ─────────────────────────────────────────────────────────────────────────────
 
 const STALE_DEFAULT_DAYS = 14;
@@ -668,20 +648,13 @@ router.get("/stale-deals", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tasks today — open tasks due today or overdue (Notion Tasks Tracker DB)
+// Tasks today
 // ─────────────────────────────────────────────────────────────────────────────
 
 const NOTION_TASKS_DB = "2fa2ac1063c8800b8a92d56de58a6358";
 
 const TASK_PRIORITY_RANK = { "High": 0, "Medium": 1, "Low": 2 };
 
-// Task assignee whitelist: only surface tasks assigned to Anton or Pavel.
-// Roman (CTO) and other teammates have their own tracker; their tasks pollute
-// the BD digest. Override via TASK_ASSIGNEE_IDS env (comma-separated UUIDs).
-//
-// Defaults:
-//   Pavel Polkanov: 2dfd872b-594c-815d-bf92-00022403aa3e
-//   Anton:          22dd872b-594c-8188-94c6-00025f066c59
 const TASK_ASSIGNEE_IDS = (
   process.env.TASK_ASSIGNEE_IDS ||
   "2dfd872b-594c-815d-bf92-00022403aa3e,22dd872b-594c-8188-94c6-00025f066c59"
@@ -695,15 +668,11 @@ const TASK_ASSIGNEE_NAME_BY_ID = {
   "22dd872b-594c-8188-94c6-00025f066c59": "Anton",
 };
 
-// Inverse map — resolve an assignee string ("anton"/"pavel", case-insensitive)
-// to a Notion user UUID. Used by POST /create-task.
 const TASK_ASSIGNEE_ID_BY_NAME = {
   "pavel": "2dfd872b-594c-815d-bf92-00022403aa3e",
   "anton": "22dd872b-594c-8188-94c6-00025f066c59",
 };
 
-// Build the assignee filter clause — `or` over each whitelisted UUID.
-// Returns null if whitelist is empty (no filtering).
 function buildAssigneeFilter() {
   if (!TASK_ASSIGNEE_IDS.length) return null;
   return {
@@ -714,7 +683,6 @@ function buildAssigneeFilter() {
   };
 }
 
-// Ymd helper — formats a Date as YYYY-MM-DD without timezone arithmetic surprises
 function toYmd(d) {
   const yyyy = d.getUTCFullYear();
   const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
@@ -722,10 +690,6 @@ function toYmd(d) {
   return `${yyyy}-${mm}-${dd}`;
 }
 
-// Strip Notion-mention markdown syntax that leaks into rich_text plain_text:
-//   [link text](https://url)         → "link text"
-//   www.example.com / bare URLs      → kept as-is (often informative)
-// Also collapses runs of whitespace and trims.
 function stripMarkdownLinks(s) {
   if (!s) return s;
   return String(s)
@@ -735,31 +699,12 @@ function stripMarkdownLinks(s) {
     .trim();
 }
 
-// Derive a "shape key" from a task name to detect repeated templates.
-//
-// Examples (input → key):
-//   "Drop discovery card follow — LeoPay"           → "drop discovery card follow"
-//   "Drop discovery card follow — Bitnob"           → "drop discovery card follow"
-//   "Drop discovery card (email +tg)"               → "drop discovery card"
-//   "Drop discovery card + create WA chat"          → "drop discovery card"
-//   "Antarctic Wallet | Create TG group..."         → "antarctic wallet"   (different — not grouped)
-//   "Agora | Patrick Chu: schedule call next week"  → "agora"
-//   "Nium | Keep CRO warm"                          → "nium"
-//
-// Rules:
-//   - Lowercase
-//   - Cut at any of: " — " | " - " | " | " | ":" | " (" | " +" | " ("
-//   - Strip trailing whitespace
-//   - Anything <3 words is too short to be considered a template
 function deriveTaskShapeKey(taskName) {
   if (!taskName) return null;
   let s = String(taskName).toLowerCase();
-  // Cut at first delimiter that signals "this is the boilerplate prefix"
   const delimiterRegex = /\s+[—–-]\s+|\s+\|\s+|:\s+|\s+\(/;
   const m = s.split(delimiterRegex);
   s = (m[0] || "").trim();
-  // Word count check — single words (e.g., "agora") aren't useful as shape keys
-  // because they only match themselves. Require at least 3 words for a "template".
   const words = s.split(/\s+/).filter(Boolean);
   if (words.length < 3) return null;
   return s;
@@ -771,11 +716,9 @@ router.get("/tasks-today", async (req, res) => {
   const limit  = Math.max(1, Math.min(50, parseInt(req.query.limit, 10) || 10));
   const noGroup = req.query.group === "0" || req.query.group === "false";
 
-  // "today" cutoff — anything with due date <= today (UTC) counts
   const todayYmd = toYmd(new Date());
 
   try {
-    // Filter: Status != "Done" AND Due date is on or before today AND Assignee in whitelist
     const filterAnd = [
       { property: "Status",   status: { does_not_equal: "Done" } },
       { property: "Due date", date:   { on_or_before: todayYmd } },
@@ -796,8 +739,6 @@ router.get("/tasks-today", async (req, res) => {
       { headers: notionHeaders() }
     );
 
-    // Extract task essentials. Capture linked Company page IDs separately so we
-    // can resolve their names with one parallel batch.
     const rawTasks = r.data.results.map(page => {
       const props = page.properties || {};
 
@@ -818,7 +759,6 @@ router.get("/tasks-today", async (req, res) => {
       const companyRel = props["🏢  CRM Companies"]?.relation || [];
       const linkedCompanyId = companyRel[0]?.id || null;
 
-      // Assignee — array of Notion user objects. We expose names only (privacy).
       const assigneeArr = props["Assignee"]?.people || [];
       const assigneeIds = assigneeArr.map(p => p.id).filter(Boolean);
       const assigneeNames = assigneeIds
@@ -849,7 +789,6 @@ router.get("/tasks-today", async (req, res) => {
       };
     });
 
-    // Resolve linked company names in one parallel batch
     const uniqueCompanyIds = [...new Set(rawTasks.map(t => t.linkedCompanyId).filter(Boolean))];
     const companyNameById = new Map();
     if (uniqueCompanyIds.length > 0) {
@@ -863,7 +802,7 @@ router.get("/tasks-today", async (req, res) => {
           const titleArr = props["Company name"]?.title || [];
           const cname = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
           if (cname) companyNameById.set(id, cname);
-        } catch (_) { /* swallow */ }
+        } catch (_) { }
       }));
     }
 
@@ -882,8 +821,6 @@ router.get("/tasks-today", async (req, res) => {
       shapeKey: deriveTaskShapeKey(t.name),
     }));
 
-    // Group tasks where shapeKey + dueDate + priority all match.
-    // Build groups; tasks without a shapeKey go straight to "single" output.
     let displayItems;
     if (noGroup) {
       displayItems = allTasks.map(t => ({ kind: "single", task: t }));
@@ -906,9 +843,7 @@ router.get("/tasks-today", async (req, res) => {
       }
       for (const [_key, members] of groupBuckets) {
         if (members.length >= 2) {
-          // Group-level fields — take from first member (all share by definition)
           const first = members[0];
-          // Use the shape phrase as the title (capitalize first letter for readability)
           const titleCased = first.shapeKey.charAt(0).toUpperCase() + first.shapeKey.slice(1);
           displayItems.push({
             kind: "group",
@@ -923,14 +858,11 @@ router.get("/tasks-today", async (req, res) => {
             })),
           });
         } else {
-          // Group of 1 → render as single
           displayItems.push({ kind: "single", task: members[0] });
         }
       }
     }
 
-    // Sort: priority asc (High first), then dueDate asc (oldest overdue first).
-    // For groups, use group-level priority/dueDate.
     const itemRank = item => {
       const p = item.kind === "single" ? item.task.priority : item.priority;
       const d = item.kind === "single" ? item.task.dueDate  : item.dueDate;
@@ -943,7 +875,6 @@ router.get("/tasks-today", async (req, res) => {
       return da.localeCompare(db);
     });
 
-    // For backwards compat: also expose a flat tasks array (ungrouped)
     const tasksFlat = allTasks
       .slice()
       .sort((a, b) => {
@@ -957,8 +888,8 @@ router.get("/tasks-today", async (req, res) => {
       ok: true,
       asOf: todayYmd,
       total: allTasks.length,
-      tasks: tasksFlat.slice(0, limit),       // flat (legacy field)
-      items: displayItems.slice(0, limit),    // grouped (preferred)
+      tasks: tasksFlat.slice(0, limit),
+      items: displayItems.slice(0, limit),
     });
   } catch (err) {
     res.status(err.response?.status || 500).json({
@@ -968,14 +899,8 @@ router.get("/tasks-today", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tasks-completed — recently-completed tasks (fallback for /today when no overdue)
+// Tasks-completed
 // ─────────────────────────────────────────────────────────────────────────────
-//
-// GET /notion/tasks-completed?days=3&limit=20
-//
-// Returns Status=Done tasks edited in the past N days. Sorted by last_edited_time
-// descending (most recent first). Used as the celebratory fallback in /today
-// when there are no overdue/today tasks left.
 
 router.get("/tasks-completed", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
@@ -1032,7 +957,6 @@ router.get("/tasks-completed", async (req, res) => {
       };
     });
 
-    // Resolve linked company names in one batch (same pattern as tasks-today)
     const uniqueCompanyIds = [...new Set(rawTasks.map(t => t.linkedCompanyId).filter(Boolean))];
     const companyNameById = new Map();
     if (uniqueCompanyIds.length > 0) {
@@ -1046,7 +970,7 @@ router.get("/tasks-completed", async (req, res) => {
           const titleArr = props["Company name"]?.title || [];
           const cname = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
           if (cname) companyNameById.set(id, cname);
-        } catch (_) { /* swallow */ }
+        } catch (_) { }
       }));
     }
 
@@ -1075,24 +999,9 @@ router.get("/tasks-completed", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POST /notion/create-task — create a task in the Tasks Tracker DB
+// POST /notion/create-task
 // ─────────────────────────────────────────────────────────────────────────────
-//
-// Body:
-//   taskName     string  required — Task name (title)
-//   description  string  optional — Description (rich_text)
-//   summary      string  optional — Summary (rich_text)
-//   dueDate      string  optional — Due date, "YYYY-MM-DD"
-//   priority     string  optional — "High" | "Medium" | "Low"
-//   status       string  optional — Status (default "Not started")
-//   assignee     string  optional — "anton" | "pavel" (case-insensitive)
-//   channel      string|string[] optional — Channel multi_select (Email/WhatsApp/...)
-//   taskType     string|string[] optional — Task type multi_select
-//   companyName  string  optional — resolved to a CRM Companies relation
-//   personName   string  optional — resolved to a CRM People relation
-//
-// Company/person resolution is best-effort: if the name isn't found, the task
-// is still created and the response flags companyResolved/personResolved=false.
+
 router.post("/create-task", async (req, res) => {
   if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
 
@@ -1107,14 +1016,11 @@ router.post("/create-task", async (req, res) => {
     return res.status(400).json({ error: "taskName required" });
   }
 
-  // Validate dueDate shape if provided (YYYY-MM-DD). Notion rejects bad dates
-  // with an opaque error; catch it early with a clear message.
   if (dueDate && !/^\d{4}-\d{2}-\d{2}$/.test(String(dueDate).trim())) {
     return res.status(400).json({ error: `dueDate must be YYYY-MM-DD, got "${dueDate}"` });
   }
 
   try {
-    // ── Resolve linked Company (best-effort title 'contains' query) ──────────
     let companyPageId   = null;
     let companyResolved = false;
     if (companyName && String(companyName).trim()) {
@@ -1128,10 +1034,9 @@ router.post("/create-task", async (req, res) => {
           companyPageId   = cq.data.results[0].id;
           companyResolved = true;
         }
-      } catch (_) { /* best-effort — leave unresolved */ }
+      } catch (_) { }
     }
 
-    // ── Resolve linked Person (best-effort title 'contains' query) ───────────
     let personPageId   = null;
     let personResolved = false;
     if (personName && String(personName).trim()) {
@@ -1145,10 +1050,9 @@ router.post("/create-task", async (req, res) => {
           personPageId   = pq.data.results[0].id;
           personResolved = true;
         }
-      } catch (_) { /* best-effort — leave unresolved */ }
+      } catch (_) { }
     }
 
-    // ── Resolve assignee string → Notion user UUID ───────────────────────────
     let assigneeId       = null;
     let assigneeResolved = false;
     if (assignee && typeof assignee === "string") {
@@ -1156,7 +1060,6 @@ router.post("/create-task", async (req, res) => {
       assigneeResolved = !!assigneeId;
     }
 
-    // ── Build the page properties ────────────────────────────────────────────
     const props = {
       "Task name": { title: [{ text: { content: taskName.trim().slice(0, 2000) } }] },
     };
@@ -1173,7 +1076,6 @@ router.post("/create-task", async (req, res) => {
     if (priority && String(priority).trim()) {
       props["Priority"] = { select: { name: String(priority).trim() } };
     }
-    // Status defaults to "Not started" if not supplied.
     props["Status"] = { status: { name: (status && String(status).trim()) || "Not started" } };
 
     if (assigneeId) {
@@ -1203,7 +1105,6 @@ router.post("/create-task", async (req, res) => {
       props["👤  CRM People"] = { relation: [{ id: personPageId }] };
     }
 
-    // ── Create the page ──────────────────────────────────────────────────────
     const created = await axios.post(
       "https://api.notion.com/v1/pages",
       { parent: { database_id: NOTION_TASKS_DB }, properties: props },
@@ -1224,7 +1125,6 @@ router.post("/create-task", async (req, res) => {
       assigneeResolved,
       companyResolved,
       personResolved,
-      // Surface unresolved references so the caller can warn the user.
       warnings: [
         (companyName && !companyResolved) ? `Company "${companyName}" not found — task created without company link` : null,
         (personName  && !personResolved)  ? `Person "${personName}" not found — task created without person link`   : null,
@@ -1237,6 +1137,294 @@ router.post("/create-task", async (req, res) => {
     res.status(err.response?.status || 500).json({
       error: detail?.message || err.message,
     });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /notion/page-blocks/:pageId
+// Returns all blocks of a Notion page, recursively fetching children.
+// Query params:
+//   depth  — max recursion depth (default 3, max 5)
+//   raw    — if "1", return raw Notion block objects; otherwise compact form
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function fetchBlocksRecursive(blockId, depth, maxDepth, headers) {
+  const blocks = [];
+  let cursor;
+  do {
+    const params = { page_size: 100 };
+    if (cursor) params.start_cursor = cursor;
+    const r = await axios.get(
+      `https://api.notion.com/v1/blocks/${blockId}/children`,
+      { headers, params, timeout: 15000 }
+    );
+    for (const block of r.data.results) {
+      const compact = compactBlock(block);
+      if (block.has_children && depth < maxDepth) {
+        compact.children = await fetchBlocksRecursive(block.id, depth + 1, maxDepth, headers);
+      }
+      blocks.push(compact);
+    }
+    cursor = r.data.has_more ? r.data.next_cursor : null;
+  } while (cursor);
+  return blocks;
+}
+
+function extractRichText(rtArr) {
+  if (!Array.isArray(rtArr)) return "";
+  return rtArr.map(t => t.plain_text || t.text?.content || "").join("").trim();
+}
+
+function compactBlock(block) {
+  const type = block.type;
+  const data = block[type] || {};
+  const text = extractRichText(data.rich_text || data.text || []);
+  const compact = { id: block.id, type, text };
+
+  // Capture checkbox state
+  if (type === "to_do") compact.checked = data.checked || false;
+
+  // Capture heading level
+  if (type.startsWith("heading_")) {
+    compact.level = parseInt(type.replace("heading_", ""), 10);
+  }
+
+  // Table row cells
+  if (type === "table_row") {
+    compact.cells = (data.cells || []).map(cell => extractRichText(cell));
+  }
+
+  compact.has_children = block.has_children || false;
+  return compact;
+}
+
+router.get("/page-blocks/:pageId", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+  const { pageId } = req.params;
+  if (!pageId) return res.status(400).json({ error: "pageId required" });
+
+  const maxDepth = Math.min(5, Math.max(1, parseInt(req.query.depth, 10) || 3));
+
+  try {
+    const blocks = await fetchBlocksRecursive(pageId, 0, maxDepth, notionHeaders());
+    res.json({ ok: true, pageId, total: blocks.length, blocks });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /notion/discovery-card-fill/:pageId
+//
+// Reads a Discovery Card page and scores each section by how many
+// fields are filled vs empty (___).
+//
+// Returns:
+//   { ok, pageId, companyName, totalScore, maxScore, fillPct,
+//     sections: [ { name, filled, total, fillPct, fields: [...] } ] }
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Discovery Card sections and their expected field labels.
+// Matches the actual card structure seen in screenshots.
+const DC_SECTIONS = [
+  {
+    name: "1. Partner Profile",
+    fields: [
+      "Company legal name",
+      "Country of incorporation",
+      "Website",
+      "Founded",
+      "Revenue / Size",
+      "Contact person",
+      "Title / Role",
+      "Email",
+      "Phone",
+      "Telegram / WhatsApp",
+      "Licenses held",
+      "Primary role",
+    ],
+  },
+  {
+    name: "2. Business Profile",
+    fields: [
+      "Business description",
+      "Business model",
+      "Target markets / geography",
+      "Corridors",
+      "Monthly volume (USD)",
+      "Current settlement method",
+    ],
+  },
+  {
+    name: "3. Client Mix & Volume Breakdown",
+    fields: [
+      "SME / Business Payments",
+      "Fintech / PSP Clients",
+      "OTC / Treasury Conversions",
+    ],
+  },
+  {
+    name: "4. Stablecoins & Chains",
+    fields: [
+      "Stablecoins used",
+      "Chains used",
+    ],
+  },
+  {
+    name: "5. Volumes & Sizing",
+    fields: [
+      "Monthly on-chain volume",
+      "Number of transactions",
+      "Average transaction size",
+      "Peak volume corridors",
+    ],
+  },
+  {
+    name: "6. Pain Points & Needs",
+    fields: [
+      "Current pain points",
+      "What do you need from Plexo",
+    ],
+  },
+  {
+    name: "7. Tech & Integration",
+    fields: [
+      "Current tech stack",
+      "Integration preference",
+      "API / SDK requirement",
+    ],
+  },
+];
+
+// Check if a block's text looks "empty" (just ___, dashes, or blank)
+function isEmptyValue(text) {
+  if (!text) return true;
+  const t = text.trim();
+  if (!t) return true;
+  // Common placeholder patterns: ___, —, -, N/A
+  if (/^[_\-—–]+$/.test(t)) return true;
+  if (/^n\/?a$/i.test(t)) return true;
+  return false;
+}
+
+// Given flat+nested block list, extract all text content as a single string
+function flattenBlockText(blocks) {
+  const lines = [];
+  function walk(blist) {
+    for (const b of blist) {
+      if (b.text) lines.push(b.text);
+      if (b.cells) lines.push(...b.cells);
+      if (b.children) walk(b.children);
+    }
+  }
+  walk(blocks);
+  return lines.join("\n");
+}
+
+// Score a section: look for each expected field label in the block content.
+// A field is "filled" if its label appears AND is followed by non-empty text
+// on the same line or in subsequent blocks.
+function scoreSection(sectionFields, allText, blocks) {
+  const results = [];
+  const lowerText = allText.toLowerCase();
+
+  for (const field of sectionFields) {
+    const fieldLower = field.toLowerCase();
+    const idx = lowerText.indexOf(fieldLower);
+    if (idx === -1) {
+      // Field heading not found at all — treat as empty
+      results.push({ field, filled: false, reason: "label not found" });
+      continue;
+    }
+
+    // Extract text after the field label (up to ~200 chars or next newline block)
+    const after = allText.slice(idx + field.length, idx + field.length + 300);
+
+    // Check for checkboxes: if the field is a checkbox group, check if any box is checked
+    if (["Primary role", "Business model", "Stablecoins used", "Chains used", "Integration preference"].includes(field)) {
+      // Look for checked checkboxes (✓, ✅, [x], or "checked: true" in our compact format)
+      const hasChecked = blocks.some(b => b.type === "to_do" && b.checked);
+      if (hasChecked) {
+        results.push({ field, filled: true, reason: "checkbox checked" });
+        continue;
+      }
+      // Also check raw text for check marks
+      const checkRegion = allText.slice(Math.max(0, idx - 50), idx + 500);
+      if (/✓|✅|\[x\]|☑/i.test(checkRegion)) {
+        results.push({ field, filled: true, reason: "checkbox checked (text)" });
+        continue;
+      }
+    }
+
+    // Strip colon, whitespace from start of "after"
+    const afterClean = after.replace(/^[\s:]+/, "").trim();
+
+    if (isEmptyValue(afterClean) || afterClean.length < 2) {
+      results.push({ field, filled: false, reason: "empty placeholder" });
+    } else {
+      results.push({ field, filled: true, reason: "has content" });
+    }
+  }
+
+  const filled = results.filter(r => r.filled).length;
+  return {
+    filled,
+    total: results.length,
+    fillPct: results.length > 0 ? Math.round((filled / results.length) * 100) : 0,
+    fields: results,
+  };
+}
+
+router.get("/discovery-card-fill/:pageId", async (req, res) => {
+  if (!NOTION_TOKEN) return res.status(500).json({ error: "NOTION_TOKEN not set" });
+  const { pageId } = req.params;
+  if (!pageId) return res.status(400).json({ error: "pageId required" });
+
+  try {
+    // 1. Get page properties (for title/company name)
+    const pageResp = await axios.get(
+      `https://api.notion.com/v1/pages/${pageId}`,
+      { headers: notionHeaders(), timeout: 10000 }
+    );
+    const props = pageResp.data.properties || {};
+    const docTitle = extractRichText(props["Document"]?.title || []);
+    const companyName = docTitle.replace(/^Discovery Card\s*\|\s*/i, "").trim();
+
+    // 2. Fetch all blocks recursively (depth 4 to get table cells)
+    const blocks = await fetchBlocksRecursive(pageId, 0, 4, notionHeaders());
+    const allText = flattenBlockText(blocks);
+
+    // 3. Score each section
+    let totalFilled = 0;
+    let totalFields = 0;
+    const sections = DC_SECTIONS.map(sec => {
+      const score = scoreSection(sec.fields, allText, blocks);
+      totalFilled += score.filled;
+      totalFields += score.total;
+      return {
+        name: sec.name,
+        filled: score.filled,
+        total: score.total,
+        fillPct: score.fillPct,
+        fields: score.fields,
+      };
+    });
+
+    const overallFillPct = totalFields > 0 ? Math.round((totalFilled / totalFields) * 100) : 0;
+
+    console.log(`[discovery-card-fill] ${companyName}: ${totalFilled}/${totalFields} fields = ${overallFillPct}%`);
+
+    res.json({
+      ok: true,
+      pageId,
+      companyName,
+      totalFilled,
+      totalFields,
+      fillPct: overallFillPct,
+      sections,
+    });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.message || err.message });
   }
 });
 

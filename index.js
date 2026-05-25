@@ -25,6 +25,7 @@ const GOOGLE_OAUTH  = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIE
 app.use("/apollo",         require("./routes/apollo"));
 app.use("/heyreach",       require("./routes/heyreach"));
 app.use("/notion",         require("./routes/notion"));
+app.use("/notion",         require("./routes/notion-update-page")); // ← v3.27 update-page-props
 app.use("/notion",         require("./routes/stale-enrich")); // ← /notion/stale-deals-enriched
 app.use("/parallel",       require("./routes/parallel"));
 app.use("/beeper/oauth",   require("./routes/beeper-oauth")); // ← v3.21 OAuth PKCE flow
@@ -68,10 +69,10 @@ app.get("/health", (_, res) => {
     comments: !!process.env.ANTHROPIC_API_KEY,
     linkedin: !!process.env.LINKEDIN_POSTER_URL,
     mcp:      true,
-    version:  "3.26.0",
+    version:  "3.27.0",
   });
 });
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.26.0", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.27.0", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

@@ -153,14 +153,19 @@ router.post("/org-enrich", async (req, res) => {
 
 // ── POST /apollo/people-search ────────────────────────────────────────────────
 // Find people at a company filtered by title (e.g. "General Partner", "Partner",
-// "Managing Partner"). Apollo's people-search endpoints require an organization_id
+// "Managing Partner"). Apollo's people-search endpoint requires an organization_id
 // scope rather than a free-text company name, so this resolves the org first:
 //   1. If `domain` given → organizations/enrich (exact match by domain).
 //   2. Else if `organizationName` given → organizations/search (best text match).
-// Then calls mixed_people/search scoped to that organization_id with person_titles.
+// Then calls mixed_people/api_search scoped to that organization_id with
+// person_titles. api_search is the current (non-deprecated) search endpoint, but
+// it returns lightweight records only: id + first_name + title, with an obfuscated
+// last name and NO email / NO linkedin_url. To return HeyReach-ready contacts we
+// enrich each hit by id via people/match (about 1 Apollo credit per person), which
+// fills in last_name, email and linkedin_url.
 //
 // Body: { apolloKey?, organizationName?, domain?, titles?: string[], perPage? }
-// Returns: { ok, organizationId, organizationResolved, total, people: filteredPerson[] }
+// Returns: { ok, organizationId, organizationResolved, total, enriched, people: filteredPerson[] }
 router.post("/people-search", async (req, res) => {
   const apolloKey = resolveKey(req);
   const { organizationName, domain, titles, perPage } = req.body;
@@ -201,8 +206,8 @@ router.post("/people-search", async (req, res) => {
     }
 
     const defaultTitles = ["General Partner", "Managing Partner", "Partner", "Founder", "Co-Founder"];
-    const peopleR = await axios.post(
-      "https://api.apollo.io/api/v1/mixed_people/search",
+    const searchR = await axios.post(
+      "https://api.apollo.io/api/v1/mixed_people/api_search",
       {
         organization_ids: [organizationId],
         person_titles: Array.isArray(titles) && titles.length ? titles : defaultTitles,
@@ -212,8 +217,33 @@ router.post("/people-search", async (req, res) => {
       { headers: { "Content-Type": "application/json", "X-Api-Key": apolloKey }, timeout: 20000 }
     );
 
-    const people = (peopleR.data?.people || []).map(filterPerson);
-    res.json({ ok: true, organizationId, organizationResolved: true, total: people.length, people });
+    const hits = searchR.data?.people || [];
+    if (hits.length === 0) {
+      return res.json({ ok: true, organizationId, organizationResolved: true, total: 0, enriched: 0, people: [] });
+    }
+
+    // api_search returns obfuscated, email-less records. Enrich each hit by id
+    // via people/match to get full name, email and linkedin_url. Runs in
+    // parallel. On a per-person enrich failure we fall back to the lightweight
+    // search record so the caller still gets id + first name + title.
+    const enrichOne = async (hit) => {
+      try {
+        const r = await axios.post(
+          "https://api.apollo.io/api/v1/people/match",
+          { id: hit.id },
+          { headers: { "Content-Type": "application/json", "X-Api-Key": apolloKey }, timeout: 20000 }
+        );
+        const p = r.data?.person;
+        return p ? filterPerson(p) : filterPerson(hit);
+      } catch (err) {
+        return filterPerson(hit);
+      }
+    };
+
+    const people = await Promise.all(hits.map(enrichOne));
+    const enriched = people.filter((p) => p.linkedin || p.email).length;
+
+    res.json({ ok: true, organizationId, organizationResolved: true, total: people.length, enriched, people });
   } catch (err) {
     res.status(err.response?.status || 500).json({ error: err.response?.data?.error || err.message });
   }

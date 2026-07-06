@@ -151,4 +151,72 @@ router.post("/org-enrich", async (req, res) => {
   }
 });
 
+// ── POST /apollo/people-search ────────────────────────────────────────────────
+// Find people at a company filtered by title (e.g. "General Partner", "Partner",
+// "Managing Partner"). Apollo's people-search endpoints require an organization_id
+// scope rather than a free-text company name, so this resolves the org first:
+//   1. If `domain` given → organizations/enrich (exact match by domain).
+//   2. Else if `organizationName` given → organizations/search (best text match).
+// Then calls mixed_people/search scoped to that organization_id with person_titles.
+//
+// Body: { apolloKey?, organizationName?, domain?, titles?: string[], perPage? }
+// Returns: { ok, organizationId, organizationResolved, total, people: filteredPerson[] }
+router.post("/people-search", async (req, res) => {
+  const apolloKey = resolveKey(req);
+  const { organizationName, domain, titles, perPage } = req.body;
+  if (!apolloKey) return res.status(400).json({ error: "apolloKey required (pass in body or set APOLLO_KEY env)" });
+  if (!organizationName && !domain) {
+    return res.status(400).json({ error: "organizationName or domain required" });
+  }
+
+  try {
+    let organizationId = null;
+
+    if (domain) {
+      const cleanDomain = String(domain)
+        .toLowerCase()
+        .trim()
+        .replace(/^https?:\/\//, "")
+        .replace(/^www\./, "")
+        .split("/")[0]
+        .split("?")[0];
+      const orgR = await axios.get(
+        "https://api.apollo.io/api/v1/organizations/enrich",
+        { params: { domain: cleanDomain }, headers: { "X-Api-Key": apolloKey }, timeout: 15000 }
+      );
+      organizationId = orgR.data?.organization?.id || null;
+    }
+
+    if (!organizationId && organizationName) {
+      const orgSearchR = await axios.post(
+        "https://api.apollo.io/api/v1/organizations/search",
+        { q_organization_name: organizationName, page: 1, per_page: 3 },
+        { headers: { "Content-Type": "application/json", "X-Api-Key": apolloKey }, timeout: 15000 }
+      );
+      organizationId = orgSearchR.data?.organizations?.[0]?.id || null;
+    }
+
+    if (!organizationId) {
+      return res.json({ ok: true, organizationResolved: false, people: [] });
+    }
+
+    const defaultTitles = ["General Partner", "Managing Partner", "Partner", "Founder", "Co-Founder"];
+    const peopleR = await axios.post(
+      "https://api.apollo.io/api/v1/mixed_people/search",
+      {
+        organization_ids: [organizationId],
+        person_titles: Array.isArray(titles) && titles.length ? titles : defaultTitles,
+        page: 1,
+        per_page: Math.min(Number(perPage) || 10, 25),
+      },
+      { headers: { "Content-Type": "application/json", "X-Api-Key": apolloKey }, timeout: 20000 }
+    );
+
+    const people = (peopleR.data?.people || []).map(filterPerson);
+    res.json({ ok: true, organizationId, organizationResolved: true, total: people.length, people });
+  } catch (err) {
+    res.status(err.response?.status || 500).json({ error: err.response?.data?.error || err.message });
+  }
+});
+
 module.exports = router;

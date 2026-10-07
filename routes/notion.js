@@ -5,6 +5,9 @@ const {
   NOTION_COMPANIES_DB,
   NOTION_PEOPLE_DB,
   notionHeaders,
+  companyPriorityProp,
+  readPriority,
+  PRIORITY_TOP_FILTER,
 } = require("../lib/notion");
 const { scoreDiscoveryCard } = require("../lib/discovery-fill");
 
@@ -25,7 +28,7 @@ function buildCompanyProps({
 }, existingPage) {
   const props = {};
   if (industry)                  props["Industry"]              = { select: { name: industry } };
-  if (priority)                  props["Priority"]              = { select: { name: priority } };
+  if (priority && companyPriorityProp(priority)) props["Priority"] = companyPriorityProp(priority);
   if (bd_score !== undefined)    props["BD Score"]              = { number: parseFloat(bd_score) };
   if (corridors?.length)         props["Corridors"]             = { multi_select: corridors.map(c => ({ name: c })) };
   if (description)               props["Company description"]   = { rich_text: [{ text: { content: description.slice(0, 2000) } }] };
@@ -473,7 +476,7 @@ function extractCompanyDigest(page) {
     description,
     bdScore: props["BD Score"]?.number ?? null,
     stage: props["Stage"]?.status?.name || null,
-    priority: props["Priority"]?.select?.name || null,
+    priority: readPriority(props["Priority"]),
     industry: props["Industry"]?.select?.name || null,
     location: (props["Location"]?.rich_text || []).map(rt => rt.plain_text || rt.text?.content || "").join("") || null,
     tags,
@@ -604,12 +607,7 @@ router.get("/stale-deals", async (req, res) => {
           timestamp: "last_edited_time",
           last_edited_time: { before: cutoffISO },
         },
-        {
-          or: [
-            { property: "Priority", select: { equals: "High" } },
-            { property: "Priority", select: { equals: "Mid"  } },
-          ],
-        },
+        PRIORITY_TOP_FILTER,
       ],
     };
 

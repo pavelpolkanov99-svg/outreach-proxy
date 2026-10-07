@@ -1,7 +1,7 @@
 // Run: node --test test/hub-enrich.test.js
 const test = require("node:test");
 const assert = require("node:assert");
-const { nextStage, sanitizeClassification, domainOf, parseJsonLoose } = require("../lib/hub-enrich");
+const { nextStage, sanitizeClassification, domainOf, parseJsonLoose, shouldRunStagePass } = require("../lib/hub-enrich");
 
 test("stage: empty company gets default Opened Conversation", () => {
   assert.strictEqual(nextStage(null, null, null), "Opened Conversation");
@@ -64,4 +64,11 @@ test("classification: invalid email / linkedin are dropped so Notion writes don'
   assert.strictEqual(c.people[0].linkedin, null);
   assert.strictEqual(c.people[1].email, "john@acme.io");
   assert.strictEqual(c.people[1].linkedin, "https://www.linkedin.com/in/johnroe");
+});
+test("stage pass: skipped for Staff / Personal / Spam rows in the Hub", () => {
+  assert.strictEqual(shouldRunStagePass(["Staff"]), false);
+  assert.strictEqual(shouldRunStagePass(["Personal"]), false);
+  assert.strictEqual(shouldRunStagePass(["Spam / Noise"]), false);
+  assert.strictEqual(shouldRunStagePass(["Investor / VC"]), true);
+  assert.strictEqual(shouldRunStagePass(["Partnership", "Client"]), true);
 });

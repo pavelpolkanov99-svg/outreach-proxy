@@ -70,10 +70,10 @@ app.get("/health", (_, res) => {
     comments: !!process.env.ANTHROPIC_API_KEY,
     linkedin: !!process.env.LINKEDIN_POSTER_URL,
     mcp:      true,
-    version:  "3.32.0",
+    version:  "3.33.0",
   });
 });
-app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.32.0", status: "ok" }));
+app.get("/", (_, res) => res.json({ service: "outreach-proxy", version: "3.33.0", status: "ok" }));
 
 // ── Listen ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;

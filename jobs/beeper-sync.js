@@ -22,7 +22,9 @@ const {
   findNotionCompany,
   findNotionPeopleByNames,
   findHubByRemoteId,
+  findHubPageByRemoteId,
 } = require("../lib/notion");
+const { enrichHubChat, progressHubChatStage, isEnabled: hubEnrichEnabled } = require("../lib/hub-enrich");
 
 const router = express.Router();
 
@@ -57,8 +59,16 @@ async function getChatParticipantNames(chatID) {
   } catch (_) { return []; }
 }
 
-async function checkLinksInChat(chatID) {
+async function checkLinksInChat(chatID, preloadedItems = null) {
   const result = { discoveryCard: false, calendly: false };
+  if (Array.isArray(preloadedItems)) {
+    for (const msg of preloadedItems) {
+      const text = msg.text || "";
+      if (!result.discoveryCard && DISCOVERY_CARD_PATTERN.test(text)) result.discoveryCard = true;
+      if (!result.calendly      && CALENDLY_PATTERN.test(text))       result.calendly = true;
+    }
+    return result;
+  }
   try {
     const rpc = { jsonrpc: "2.0", id: Date.now(), method: "tools/call",
       params: { name: "list_messages", arguments: { chatID } } };
@@ -79,13 +89,18 @@ async function checkLinksInChat(chatID) {
 }
 
 async function upsertChatToHub(chatInfo) {
-  const { chatName, chatID, accountID, lastMsg, lastActiveDate } = chatInfo;
+  const { chatName, chatID, accountID, lastMsg, lastActiveDate, items = null, since = null } = chatInfo;
+  // Beeper's chat list often has no activity timestamp, so the sync loop may
+  // revisit every chat each hour. Only spend LLM calls when the chat actually
+  // has a message newer than this sync window.
+  const newestTs  = items?.[0]?.timestamp ? new Date(items[0].timestamp) : null;
+  const hasNewMsg = !since || (newestTs && newestTs > new Date(since));
   const net                = networkFromAccountID(accountID);
   const companyName        = extractCompanyName(chatName);
   const companyId          = await findNotionCompany(companyName);
   const participantNames   = await getChatParticipantNames(chatID);
   const personIds          = await findNotionPeopleByNames(participantNames);
-  const links              = await checkLinksInChat(chatID);
+  const links              = await checkLinksInChat(chatID, items);
 
   let lastMsgText = "", rawSender = "", lastDate = lastActiveDate || null;
   if (lastMsg) {
@@ -112,12 +127,31 @@ async function upsertChatToHub(chatInfo) {
   if (links.discoveryCard)   props["DiscoveryCard"] = { checkbox: true };
   if (links.calendly)        props["Calendly"]      = { checkbox: true };
 
-  const existingId = await findHubByRemoteId(chatID);
-  if (existingId) {
-    await notionUpdatePage(existingId, props);
+  const existing = await findHubPageByRemoteId(chatID);
+  if (existing) {
+    // Never overwrite relations that are already set (they may have been
+    // curated by hand or by hub-enrich) with the fuzzy chat-name guesses above.
+    const ep = existing.properties || {};
+    if ((ep["Link: Companies"]?.relation || []).length) delete props["Link: Companies"];
+    if ((ep["Link: People"]?.relation || []).length)    delete props["Link: People"];
+    await notionUpdatePage(existing.id, props);
+
+    if (hubEnrichEnabled() && items && hasNewMsg) {
+      const status   = ep["Enrichment Status"]?.select?.name || null;
+      const hasCat   = (ep["Category"]?.multi_select || []).length > 0;
+      const coIds    = (ep["Link: Companies"]?.relation || []).map(r => r.id);
+      if (!hasCat && status !== "Done" && status !== "Skipped") {
+        await enrichHubChat({ hubPageId: existing.id, chatName, network: net, messages: items });
+      } else if (coIds.length) {
+        await progressHubChatStage({ chatName, companyIds: coIds, messages: items });
+      }
+    }
     return { action: "updated", chatName };
   } else {
-    await notionCreatePage(MESSAGES_HUB_DB, props);
+    const created = await notionCreatePage(MESSAGES_HUB_DB, props);
+    if (hubEnrichEnabled() && items && created?.id) {
+      await enrichHubChat({ hubPageId: created.id, chatName, network: net, messages: items });
+    }
     return { action: "created", chatName };
   }
 }
@@ -148,9 +182,10 @@ async function runBeeperSync(opts = {}) {
         { headers: beeperMcpHeaders(), timeout: 15000, responseType: "text" });
       const msgResult = parseMcpSse(mr.data);
       const msgText = msgResult?.content?.[0]?.text || "";
-      let lastMsg = "", lastActiveDate = null;
+      let lastMsg = "", lastActiveDate = null, items = null;
       try {
         const parsed = JSON.parse(msgText);
+        items = Array.isArray(parsed.items) ? parsed.items : null;
         const first = parsed.items?.[0];
         if (first) {
           const t = new Date(first.timestamp);
@@ -162,7 +197,7 @@ async function runBeeperSync(opts = {}) {
       const r = await upsertChatToHub({
         chatName: c.title || c.name || "Unknown",
         chatID: c.id, accountID: c.accountID,
-        lastMsg, lastActiveDate,
+        lastMsg, lastActiveDate, items, since,
       });
       if (r.action === "created") results.created++;
       else                        results.updated++;

@@ -86,14 +86,18 @@ test("Apollo phone webhook parsing prefers valid mobile numbers", () => {
   assert.deepStrictEqual(lookup.extractPhones({}), []);
 });
 
-test("person fully in CRM → answered from Notion, zero Apollo calls", async () => {
+const WITH_PHOTO = p => ({ ...p, properties: { ...p.properties, photo: { files: [{ type: "file", file: { url: "https://notion-files/p1.jpg" } }] } } });
+
+test("person fully in CRM incl. photo → answered from Notion, zero Apollo calls", async () => {
   calls.length = 0;
-  fake = notionFake({ people: [PERSON_FULL], companies: [COMPANY()] });
+  fake = notionFake({ people: [WITH_PHOTO(PERSON_FULL)], companies: [COMPANY({ "BD Score": { number: 7.9 } })] });
   const r = await lookup.ask({ text: "Ivan Petrov из Bitso", hint: "person" });
   assert.strictEqual(r.source, "crm");
+  assert.strictEqual(r.scoreJobId, null);
   assert.strictEqual(apolloCalls().length, 0);
   assert.match(r.telegram, /ivan@bitso\.com/);
   assert.match(r.telegram, /0 кредитов/);
+  assert.deepStrictEqual(r.photo, { url: "https://notion-files/p1.jpg", source: "notion", confident: true });
 });
 
 test("person not in CRM and no company → no Apollo spend, asks for company", async () => {
@@ -116,7 +120,7 @@ test("phone asked for a CRM person → exactly one Apollo call with webhook, nev
   assert.strictEqual(ap[0].body.reveal_phone_number, true);
   assert.match(ap[0].body.webhook_url, /\/lookup\/apollo-phone\/[0-9a-f]+\?k=[0-9a-f]+$/);
   assert.ok(r.phoneJobId);
-  assert.match(r.telegram, /пришлю отдельным сообщением/);
+  assert.match(r.telegram, /пришлю отдельно/);
 });
 
 test("company already scored in CRM → no Apollo, no Parallel", async () => {
@@ -148,4 +152,100 @@ test("person not in CRM, company given → one Apollo match (no phone reveal), c
   assert.ok(createCall, "person page created");
   assert.strictEqual(createCall.body.properties.Phone, undefined);
   assert.match(r.telegram, /добавил в CRM/);
+});
+
+test("person card shows company mini-scoring, website and a grounded verdict", async () => {
+  calls.length = 0;
+  fake = notionFake({ people: [WITH_PHOTO(PERSON_FULL)], companies: [COMPANY({
+    "BD Score": { number: 4.7 },
+    "Company description": { rich_text: [{ plain_text: "Matches licensed EMIs with banks via a unified KYB profile. Also runs a stablecoin bridge." }] },
+    Insight: { rich_text: [{ plain_text: "P3 4.7, floor rule G-1 (license < 3). Overlaps with Plexo KYB positioning." }] },
+    Tags: { multi_select: [] },
+  })] });
+  fake.post = (orig => async (url, body) => url.includes("anthropic.com")
+    ? { data: { content: [{ text: "Скорее партнёр-канал, чем узел сети: своей лицензии почти нет." }] } }
+    : orig(url, body))(fake.post);
+  const r = await lookup.ask({ text: "Ivan Petrov из Bitso", hint: "person" });
+  assert.strictEqual(apolloCalls().length, 0);
+  assert.match(r.telegram, /🌐 <a href="https:\/\/bitso\.com">bitso\.com<\/a>/);
+  assert.match(r.telegram, /🟡 P3 · 4\.7 · Hard Kill нет/);
+  assert.match(r.telegram, /stablecoin bridge/);
+  assert.match(r.telegram, /→ Скорее партнёр-канал/);
+});
+
+test("hard kill tag is shown in red", async () => {
+  calls.length = 0;
+  fake = notionFake({ people: [WITH_PHOTO(PERSON_FULL)], companies: [COMPANY({
+    "BD Score": { number: 2.1 },
+    Tags: { multi_select: [{ name: "Hard Kill - HK-7 Pure fiat BaaS" }] },
+  })] });
+  const r = await lookup.ask({ text: "Ivan Petrov из Bitso", hint: "person" });
+  assert.match(r.telegram, /🔴 Skip · 2\.1 · 🔴 Hard Kill: HK-7 Pure fiat BaaS/);
+});
+
+test("LinkedIn photo trusted only when the profile ties the person to the asked company", () => {
+  const ap = { orgName: "Stripe", title: "Head of Partnerships", headline: null,
+    employment: [{ org: "Visa Inc.", title: "Director", current: false }] };
+  assert.strictEqual(lookup.profileMatchesCompany(ap, "Visa"), true);     // ex-Visa in experience
+  assert.strictEqual(lookup.profileMatchesCompany(ap, "Stripe"), true);   // current org
+  assert.strictEqual(lookup.profileMatchesCompany(ap, "Bitso"), false);   // unrelated
+  assert.strictEqual(lookup.profileMatchesCompany({ orgName: "Bankstore", employment: [] }, "bankstore.ai"), true);
+  assert.strictEqual(lookup.profileMatchesCompany({ orgName: "Visionary Labs", employment: [] }, "Visa"), false);
+  assert.strictEqual(lookup.realPhoto("https://static.licdn.com/aero-v1/sc/h/ghost.png"), null);
+});
+
+test("CRM person without photo → one Apollo call; matching profile photo is used without disclaimer", async () => {
+  calls.length = 0;
+  const p2 = { ...PERSON_FULL, id: "p2" };
+  fake = notionFake({ people: [p2], companies: [COMPANY()] });
+  fake.post = (orig => async (url, body) => url.includes("apollo.io")
+    ? { data: { person: { id: "ap9", title: "CEO", organization_name: "Bitso", photo_url: "https://media.licdn.com/dms/image/abc.jpg", employment_history: [] } } }
+    : orig(url, body))(fake.post);
+  const r = await lookup.ask({ text: "Ivan Petrov из Bitso", hint: "person" });
+  assert.strictEqual(apolloCalls().length, 1);
+  assert.strictEqual(r.photo.source, "linkedin");
+  assert.strictEqual(r.photo.confident, true);
+  assert.doesNotMatch(r.telegram, /может быть не он/);
+  // second lookup in the same process does not spend again
+  calls.length = 0;
+  await lookup.ask({ text: "Ivan Petrov из Bitso", hint: "person" });
+  assert.strictEqual(apolloCalls().length, 0);
+});
+
+test("Apollo photo of someone not tied to the company is not trusted", async () => {
+  calls.length = 0;
+  const p3 = { ...PERSON_FULL, id: "p3" };
+  fake = notionFake({ people: [p3], companies: [COMPANY()] });
+  fake.post = (orig => async (url, body) => url.includes("apollo.io")
+    ? { data: { person: { id: "ap10", title: "Teacher", organization_name: "School 5", photo_url: "https://media.licdn.com/dms/image/zzz.jpg", employment_history: [] } } }
+    : orig(url, body))(fake.post);
+  const r = await lookup.ask({ text: "Ivan Petrov из Bitso", hint: "person" });
+  assert.strictEqual(r.photo.source, "linkedin-unverified");
+  assert.strictEqual(r.photo.confident, false);
+  assert.match(r.telegram, /может быть не он/);
+});
+
+test("unscored company of a looked-up person → scoring starts once, blurb filled from Apollo", async () => {
+  calls.length = 0;
+  const p4 = { ...PERSON_FULL, id: "p4" };
+  fake = notionFake({ people: [p4], companies: [COMPANY()] });
+  fake.post = (orig => async (url, body) => url.includes("apollo.io")
+    ? { data: { person: { id: "ap4", title: "CEO", organization_name: "Bitso", employment_history: [],
+        organization: { short_description: "Bitso is a crypto exchange in LatAm. It runs payouts in MXN and ARS. It has 9M users." } } } }
+    : orig(url, body))(fake.post);
+  const r = await lookup.ask({ text: "Ivan Petrov из Bitso", hint: "person" });
+  assert.ok(r.scoreJobId);
+  assert.match(r.telegram, /Bitso is a crypto exchange in LatAm\. It runs payouts in MXN and ARS\./);
+  assert.doesNotMatch(r.telegram, /9M users/);
+  assert.match(r.telegram, /запустил/);
+  assert.ok(calls.some(c => c.m === "PATCH" && c.body?.properties?.["Company description"]), "blurb saved to Notion");
+});
+
+test("namesake in CRM at another company is not used for the asked-about company", async () => {
+  calls.length = 0;
+  const other = { ...PERSON_FULL, id: "p5", properties: { ...PERSON_FULL.properties, Company: { relation: [{ id: "c-other" }] } } };
+  fake = notionFake({ people: [other], companies: [COMPANY()] });
+  const r = await lookup.ask({ text: "Ivan Petrov из Bitso", hint: "person" });
+  assert.strictEqual(apolloCalls().length, 1);           // went to Apollo for the Bitso person
+  assert.notStrictEqual(r.person?.pageId, "p5");
 });

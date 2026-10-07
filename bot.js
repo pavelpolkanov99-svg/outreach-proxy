@@ -8,7 +8,7 @@ const conversationStore = require("./lib/conversation-store");
 
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.29.0-crm-lookup";
+const VERSION      = "4.30.0-crm-lookup-photo";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -844,6 +844,24 @@ async function pollLookupJob(chatId, replyToId, jobId) {
   await bot.api.sendMessage(chatId, "⏱ Фоновая задача не ответила за 12 минут. Проверь Notion позже или повтори запрос.");
 }
 
+// Card with the person's photo when we have one. Telegram captions are capped
+// at 1024 chars: short cards go as the photo caption, long ones as photo + text.
+// If Telegram can't fetch the image, the card still goes out as plain text.
+async function replyCard(ctx, html, photo) {
+  const reply_parameters = { message_id: ctx.message.message_id, allow_sending_without_reply: true };
+  const textOpts = { parse_mode: "HTML", link_preview_options: { is_disabled: true }, reply_parameters };
+  for (const url of [photo?.url, photo?.fallbackUrl].filter(Boolean)) {
+    try {
+      if (html.length <= 1000) return await ctx.replyWithPhoto(url, { caption: html, parse_mode: "HTML", reply_parameters });
+      await ctx.replyWithPhoto(url, { reply_parameters });
+      return await ctx.reply(html, textOpts);
+    } catch (err) {
+      console.error(`[lookup] photo send failed (${photo.source}): ${err.message}`);
+    }
+  }
+  return ctx.reply(html, textOpts);
+}
+
 async function handleLookup(ctx, text, hint = null) {
   let res;
   try {
@@ -854,10 +872,7 @@ async function handleLookup(ctx, text, hint = null) {
   }
   const data = res.data || {};
   if (data.intent === "other") return false;
-  const msg = await ctx.reply(data.telegram || "❌ Пустой ответ", {
-    parse_mode: "HTML", link_preview_options: { is_disabled: true },
-    reply_parameters: { message_id: ctx.message.message_id, allow_sending_without_reply: true },
-  });
+  const msg = await replyCard(ctx, data.telegram || "❌ Пустой ответ", data.photo);
   for (const jobId of [data.phoneJobId, data.scoreJobId].filter(Boolean)) {
     pollLookupJob(ctx.chat.id, msg.message_id, jobId).catch(e => console.error("[lookup] poll failed:", e.message));
   }

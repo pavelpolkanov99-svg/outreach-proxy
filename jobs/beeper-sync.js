@@ -24,7 +24,7 @@ const {
   findHubByRemoteId,
   findHubPageByRemoteId,
 } = require("../lib/notion");
-const { enrichHubChat, progressHubChatStage, isEnabled: hubEnrichEnabled } = require("../lib/hub-enrich");
+const { enrichHubChat, progressHubChatStage, shouldRunStagePass, isEnabled: hubEnrichEnabled } = require("../lib/hub-enrich");
 
 const router = express.Router();
 
@@ -138,11 +138,12 @@ async function upsertChatToHub(chatInfo) {
 
     if (hubEnrichEnabled() && items && hasNewMsg) {
       const status   = ep["Enrichment Status"]?.select?.name || null;
-      const hasCat   = (ep["Category"]?.multi_select || []).length > 0;
+      const hubCats  = (ep["Category"]?.multi_select || []).map(o => o.name);
+      const hasCat   = hubCats.length > 0;
       const coIds    = (ep["Link: Companies"]?.relation || []).map(r => r.id);
       if (!hasCat && status !== "Done" && status !== "Skipped") {
         await enrichHubChat({ hubPageId: existing.id, chatName, network: net, messages: items });
-      } else if (coIds.length) {
+      } else if (coIds.length && shouldRunStagePass(hubCats)) {
         await progressHubChatStage({ chatName, companyIds: coIds, messages: items });
       }
     }

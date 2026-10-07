@@ -3,6 +3,7 @@ const axios   = require("axios");
 const {
   NOTION_TOKEN,
   notionHeaders,
+  readPriority,
 } = require("../lib/notion");
 
 const router = express.Router();
@@ -90,7 +91,7 @@ async function resolveLinkedCompany(relationArr) {
     const name = titleArr.map(t => t.plain_text || t.text?.content || "").join("");
     const stage = props["Stage"]?.status?.name || null;
     const bdScore = props["BD Score"]?.number ?? null;
-    const priority = props["Priority"]?.select?.name || null;
+    const priority = readPriority(props["Priority"]);
 
     // NEW v3.18.5: pull first attached person's contacts
     let personContacts = null;

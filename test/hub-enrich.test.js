@@ -28,9 +28,10 @@ test("stage: legacy options are ranked, unknown ones left alone", () => {
   assert.strictEqual(nextStage("Communication Started", "Warm discussions", null), "Warm discussions");
   assert.strictEqual(nextStage("Something Custom", "Onboarding", null), null);
 });
-test("stage: Outreach Started for unanswered outreach on an empty company", () => {
-  assert.strictEqual(nextStage(null, "Outreach Started", null), "Outreach Started");
-  assert.strictEqual(nextStage("To Contact", "Outreach Started", null), "Outreach Started");
+test("stage: unanswered outreach still starts at Opened Conversation", () => {
+  assert.strictEqual(nextStage(null, "Outreach Started", null), "Opened Conversation");
+  assert.strictEqual(nextStage("To Contact", "Outreach Started", null), "Opened Conversation");
+  assert.strictEqual(nextStage("Warm discussions", "Outreach Started", null), null);
 });
 test("classification: drops internal people, bad categories and invents nothing", () => {
   const c = sanitizeClassification({

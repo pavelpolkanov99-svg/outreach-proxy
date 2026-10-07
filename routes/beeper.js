@@ -20,6 +20,7 @@ const {
   NOTION_COMPANIES_DB,
   NOTION_PEOPLE_DB,
   notionHeaders,
+  readPriority,
 } = require("../lib/notion");
 
 const router = express.Router();
@@ -333,7 +334,7 @@ async function lookupCompanyByName(name) {
       url:    page.url,
       name:   page.properties["Company name"]?.title?.[0]?.text?.content || candidate,
       stage:  page.properties["Stage"]?.status?.name || null,
-      priority: page.properties["Priority"]?.select?.name || null,
+      priority: readPriority(page.properties["Priority"]),
       bdScore: page.properties["BD Score"]?.number ?? null,
     };
 

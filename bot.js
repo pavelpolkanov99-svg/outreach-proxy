@@ -8,7 +8,7 @@ const conversationStore = require("./lib/conversation-store");
 
 const BOT_TOKEN    = process.env.TELEGRAM_BOT_TOKEN;
 const PROXY        = process.env.PROXY_URL || "https://outreach-proxy-production-eb03.up.railway.app";
-const VERSION      = "4.28.0-task-detector";
+const VERSION      = "4.29.0-crm-lookup";
 const STARTED_AT   = new Date();
 
 if (!BOT_TOKEN) throw new Error("TELEGRAM_BOT_TOKEN is required");
@@ -812,6 +812,59 @@ async function handleApprovalCallback(ctx) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CRM lookup (v4.29): "@bot Иван Петров из Bitso [телефон]", "@bot скоринг Bitso"
+// Notion first, Apollo / scoring only for what is missing (see lib/crm-lookup.js
+// on the proxy). Returns true when the message was a lookup and was answered.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const LOOKUP_POLL_MS   = 15_000;
+const LOOKUP_POLL_MAX  = 12 * 60_000;
+
+async function pollLookupJob(chatId, replyToId, jobId) {
+  const started = Date.now();
+  while (Date.now() - started < LOOKUP_POLL_MAX) {
+    await new Promise(r => setTimeout(r, LOOKUP_POLL_MS));
+    try {
+      const r = await axios.get(`${PROXY}/lookup/job/${jobId}`, { timeout: 15_000 });
+      if (r.data?.job?.status === "running") continue;
+      if (r.data?.telegram) {
+        await bot.api.sendMessage(chatId, r.data.telegram, {
+          parse_mode: "HTML", link_preview_options: { is_disabled: true },
+          reply_parameters: replyToId ? { message_id: replyToId, allow_sending_without_reply: true } : undefined,
+        });
+      }
+      return;
+    } catch (err) {
+      if (err.response?.status === 404) {
+        await bot.api.sendMessage(chatId, "⚠️ Потерял фоновую задачу (прокси перезапускался). Повтори запрос — данные, которые успели записаться в Notion, повторно кредиты не потратят.");
+        return;
+      }
+    }
+  }
+  await bot.api.sendMessage(chatId, "⏱ Фоновая задача не ответила за 12 минут. Проверь Notion позже или повтори запрос.");
+}
+
+async function handleLookup(ctx, text, hint = null) {
+  let res;
+  try {
+    res = await axios.post(`${PROXY}/lookup/ask`, { text, hint }, { timeout: 60_000 });
+  } catch (err) {
+    if (hint) await ctx.reply(`❌ Lookup не сработал: ${esc(err.response?.data?.error || err.message)}`);
+    return !!hint;
+  }
+  const data = res.data || {};
+  if (data.intent === "other") return false;
+  const msg = await ctx.reply(data.telegram || "❌ Пустой ответ", {
+    parse_mode: "HTML", link_preview_options: { is_disabled: true },
+    reply_parameters: { message_id: ctx.message.message_id, allow_sending_without_reply: true },
+  });
+  for (const jobId of [data.phoneJobId, data.scoreJobId].filter(Boolean)) {
+    pollLookupJob(ctx.chat.id, msg.message_id, jobId).catch(e => console.error("[lookup] poll failed:", e.message));
+  }
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Commands
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -823,6 +876,7 @@ bot.command("start", ctx => guard(ctx, () => {
     `/yesterday — что было вчера\n/digest — отправить Anton'у\n/tasks — задачи\n/stale — заглохшие сделки\n` +
     `/replies — ждут ответа\n/discovery — Discovery Cards digest\n/test_push — тест крона в группу прямо сейчас\n` +
     `/test_tasks — тест дайджеста задач Антона прямо сейчас\n` +
+    `/who Имя Фамилия из Компании [телефон] — человек из CRM / Apollo\n/score Компания — скоринг (из CRM или новый)\n` +
     (CONVERSATIONAL_MODE ? `/new — сбросить контекст\n/budget — расход\n` : "") +
     `\nАвто:\n• Утренний дайджест 08:30 CET → личка + группа\n• Дайджест задач Антона 08:00 CET → личка\n• Discovery Cards digest 09:00 CET → личка + группа\n• CRM auto-prewarm 23:00 и 08:00 CET`,
     { parse_mode: "HTML" }
@@ -979,19 +1033,34 @@ bot.command("budget", ctx => guard(ctx, () => {
   } catch (err) { return ctx.reply(`❌ Ошибка: ${esc(err.message)}`); }
 }));
 
+bot.command("who", ctx => guard(ctx, async () => {
+  const q = String(ctx.match || "").trim();
+  if (!q) return ctx.reply("Формат: /who Имя Фамилия из Компании [телефон]");
+  await handleLookup(ctx, q, "person");
+}));
+
+bot.command("score", ctx => guard(ctx, async () => {
+  const q = String(ctx.match || "").trim();
+  if (!q) return ctx.reply("Формат: /score Компания");
+  await handleLookup(ctx, q, "company");
+}));
+
 bot.on("message:text", ctx => guard(ctx, () => {
   const text = ctx.message?.text || "";
   const isSlash = text.trim().startsWith("/");
   if (isGroupChat(ctx)) {
     if (isSlash) return;
     if (!isAddressedToBotInGroup(ctx, BOT_USERNAME, BOT_ID)) return;
-    if (!CONVERSATIONAL_MODE) return ctx.reply("Чат-режим выключен — отвечаю только на команды (/today, /ping, ...).");
     const { text: cleaned } = stripBotMention(text, BOT_USERNAME);
-    if (!cleaned) return ctx.reply("Да? Напиши что нужно.");
-    return handleConversation(ctx, cleaned);
+    if (!cleaned) return ctx.reply("Да? Напиши имя человека (можно с компанией) или «скоринг Компания».");
+    return (async () => {
+      if (await handleLookup(ctx, cleaned)) return;
+      if (!CONVERSATIONAL_MODE) return ctx.reply("Могу найти человека или компанию: «@бот Имя Фамилия из Компании», «@бот скоринг Компания». Остальное — только команды (/today, /ping, ...).");
+      return handleConversation(ctx, cleaned);
+    })();
   }
   if (CONVERSATIONAL_MODE && !isSlash) return handleConversation(ctx);
-  return ctx.reply(`Команды:\n/start  /ping  /today  /details  /full  /yesterday  /digest  /tasks  /stale  /replies  /discovery  /test_push  /test_tasks` + (CONVERSATIONAL_MODE ? `  /new  /budget` : ""));
+  return ctx.reply(`Команды:\n/start  /ping  /today  /details  /full  /yesterday  /digest  /tasks  /stale  /replies  /discovery  /who  /score  /test_push  /test_tasks` + (CONVERSATIONAL_MODE ? `  /new  /budget` : ""));
 }));
 
 bot.on("callback_query:data", async (ctx) => {

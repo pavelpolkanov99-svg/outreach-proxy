@@ -4,6 +4,8 @@ const {
   NOTION_TOKEN,
   NOTION_COMPANIES_DB,
   notionHeaders,
+  readPriority,
+  PRIORITY_TOP_FILTER,
 } = require("../lib/notion");
 
 const router = express.Router();
@@ -128,12 +130,7 @@ router.get("/stale-deals-enriched", async (req, res) => {
           timestamp: "last_edited_time",
           last_edited_time: { before: cutoffISO },
         },
-        {
-          or: [
-            { property: "Priority", select: { equals: "High" } },
-            { property: "Priority", select: { equals: "Mid"  } },
-          ],
-        },
+        PRIORITY_TOP_FILTER,
       ],
     };
 
@@ -173,7 +170,7 @@ router.get("/stale-deals-enriched", async (req, res) => {
         name,
         bdScore: props["BD Score"]?.number ?? null,
         stage: props["Stage"]?.status?.name || null,
-        priority: props["Priority"]?.select?.name || null,
+        priority: readPriority(props["Priority"]),
         pipeline: props["Pipeline"]?.select?.name || null,
         tags,
         lastContact: props["Last Contact"]?.date?.start || null,

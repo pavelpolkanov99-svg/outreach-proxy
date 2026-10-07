@@ -53,11 +53,12 @@ let lastRunStats = null;
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Companies "Priority" options are 1 | 2 | 3 | HK.
 function tierToPriority(tier) {
-  if (tier === "MH") return "High";
-  if (tier === "P1") return "High";
-  if (tier === "P2") return "Mid";
-  if (tier === "P3") return "Low";
+  if (tier === "MH") return "1";
+  if (tier === "P1") return "1";
+  if (tier === "P2") return "2";
+  if (tier === "P3") return "3";
   return null;
 }
 

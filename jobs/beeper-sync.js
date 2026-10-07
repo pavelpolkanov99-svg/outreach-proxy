@@ -32,6 +32,7 @@ const DISCOVERY_CARD_PATTERN = /notion\.so\/plex0\/Discovery-Card/i;
 const CALENDLY_PATTERN       = /calendly\.com\/plex0\//i;
 
 let lastSyncAt = null;
+let syncInFlight = null; // single-flight: a run never overlaps another (cron, startup or manual)
 
 function extractCompanyName(chatName = "") {
   return chatName
@@ -157,9 +158,26 @@ async function upsertChatToHub(chatInfo) {
   }
 }
 
+// Single-flight wrapper. If a sync is already running (a long run after a busy
+// conference day, or a manual trigger during the hourly cron), the caller waits
+// for that run instead of starting a second one: no duplicate CRM records, no
+// double load on Beeper through the tunnel. The next run then starts from the
+// finished run's start time, so nothing that arrived meanwhile is skipped.
 async function runBeeperSync(opts = {}) {
+  if (syncInFlight) {
+    console.log("[sync] already running — joining the in-flight run");
+    return syncInFlight;
+  }
+  syncInFlight = runBeeperSyncOnce(opts).finally(() => { syncInFlight = null; });
+  return syncInFlight;
+}
+
+async function runBeeperSyncOnce(opts = {}) {
   const { since, limit = 100 } = opts;
   if (!BEEPER_TOKEN) throw new Error("BEEPER_TOKEN not set");
+  // Watermark = when this run STARTED. Messages that land while the run is
+  // going are newer than this, so the next run still picks them up.
+  const startedAt = new Date().toISOString();
   const results = { created: 0, updated: 0, skipped: 0, errors: [] };
 
   const chatsRes = await axios.get(`${BEEPER_URL}/v1/chats?limit=${limit}`,
@@ -212,7 +230,8 @@ async function runBeeperSync(opts = {}) {
     }
   }
 
-  lastSyncAt = new Date().toISOString();
+  lastSyncAt = startedAt;
+  console.log(`[sync] done in ${Math.round((Date.now() - new Date(startedAt)) / 1000)}s: ${results.created} created, ${results.updated} updated, ${results.skipped} skipped`);
   return results;
 }
 
